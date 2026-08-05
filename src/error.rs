@@ -11,6 +11,11 @@ pub enum Error {
     NotFound(PathBuf),
     NotDirectory(PathBuf),
     IsDirectory(PathBuf),
+    InvalidObjectId(String),
+    InvalidReferenceName(String),
+    InvalidReference(String),
+    ReferenceConflict(String),
+    SymbolicReferenceLoop(String),
     InvalidRepository(String),
 }
 
@@ -23,6 +28,18 @@ impl fmt::Display for Error {
             Self::NotFound(path) => write!(f, "path not found: {}", path.display()),
             Self::NotDirectory(path) => write!(f, "not a directory: {}", path.display()),
             Self::IsDirectory(path) => write!(f, "is a directory: {}", path.display()),
+            Self::InvalidObjectId(value) => write!(f, "invalid object ID: {value}"),
+            Self::InvalidReferenceName(name) => write!(f, "invalid reference name: {name}"),
+            Self::InvalidReference(message) => write!(f, "invalid reference: {message}"),
+            Self::ReferenceConflict(name) => {
+                write!(f, "reference changed concurrently: {name}")
+            }
+            Self::SymbolicReferenceLoop(name) => {
+                write!(
+                    f,
+                    "symbolic reference depth exceeded while resolving {name}"
+                )
+            }
             Self::InvalidRepository(message) => write!(f, "invalid repository: {message}"),
         }
     }

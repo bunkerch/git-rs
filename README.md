@@ -19,6 +19,8 @@ assert_eq!(repository.read_git_file("HEAD")?, b"ref: refs/heads/main\n");
 
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/filesystems.md`](docs/filesystems.md) for the design and adapter contract.
+Reference and branch APIs are covered in
+[`docs/references.md`](docs/references.md).
 
 To create a host-backed repository with the included example:
 

@@ -26,6 +26,44 @@ pub struct Repository {
 }
 
 impl Repository {
+    /// Open an existing bare or non-bare repository.
+    ///
+    /// A path containing `.git/HEAD` is treated as a working tree. Otherwise,
+    /// the path itself is treated as a bare Git directory.
+    ///
+    /// # Errors
+    /// Returns an error when neither layout contains a valid `HEAD` file or a
+    /// storage operation fails.
+    pub fn open<F: FileSystem>(fs: F, path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_shared(Arc::new(fs), path)
+    }
+
+    /// Open an existing repository using shared, dynamically dispatched storage.
+    ///
+    /// # Errors
+    /// Returns an error when the repository layout is invalid or storage fails.
+    pub fn open_shared(fs: Arc<dyn FileSystem>, path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let non_bare = path.join(".git");
+        let (git_dir, work_tree) = if fs.exists(&non_bare.join("HEAD"))? {
+            (non_bare, Some(path.to_path_buf()))
+        } else if fs.exists(&path.join("HEAD"))? {
+            (path.to_path_buf(), None)
+        } else {
+            return Err(crate::Error::InvalidRepository(format!(
+                "{} has no Git HEAD",
+                path.display()
+            )));
+        };
+        let repository = Self {
+            fs,
+            git_dir,
+            work_tree,
+        };
+        repository.read_reference("HEAD")?;
+        Ok(repository)
+    }
+
     /// Initialize a repository in `fs`.
     ///
     /// # Errors
@@ -99,6 +137,11 @@ impl Repository {
         self.fs.as_ref()
     }
 
+    #[must_use]
+    pub(crate) fn git_path(&self, path: impl AsRef<Path>) -> PathBuf {
+        self.git_dir.join(path)
+    }
+
     /// Read a file relative to the repository's Git directory.
     ///
     /// # Errors
@@ -136,18 +179,7 @@ fn config(bare: bool) -> String {
 // Git's ref grammar specifies the lowercase byte suffix exactly.
 #[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn validate_branch_name(name: &str) -> Result<()> {
-    let invalid = name.is_empty()
-        || name.starts_with('.')
-        || name.ends_with('.')
-        || name.ends_with('/')
-        || name.contains("..")
-        || name.contains("@{")
-        || name.contains([' ', '~', '^', ':', '?', '*', '[', '\\'])
-        || name.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
-        || name
-            .split('/')
-            .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"));
-    if invalid {
+    if crate::refs::ReferenceName::branch(name).is_err() {
         return Err(crate::Error::InvalidRepository(format!(
             "invalid initial branch name `{name}`"
         )));
@@ -208,5 +240,26 @@ mod tests {
         };
         assert!(Repository::init(fs.clone(), Path::new("project"), &options).is_err());
         assert!(!fs.exists(Path::new("project")).unwrap());
+    }
+
+    #[test]
+    fn reopens_bare_and_non_bare_repositories() {
+        let fs = MemoryFileSystem::new();
+        Repository::init(fs.clone(), "work", &InitOptions::default()).unwrap();
+        Repository::init(
+            fs.clone(),
+            "bare.git",
+            &InitOptions {
+                bare: true,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            Repository::open(fs.clone(), "work").unwrap().work_tree(),
+            Some(Path::new("work"))
+        );
+        assert_eq!(Repository::open(fs, "bare.git").unwrap().work_tree(), None);
     }
 }
