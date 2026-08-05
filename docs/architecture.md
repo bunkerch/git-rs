@@ -20,5 +20,6 @@ Behavior is compared against the Git source checkout, not copied from it:
 - repository layout and templates: `builtin/init-db.c` and `setup.c`
 - ref-name restrictions: `refs.c` (`check_refname_format`)
 - lock-and-rename publication: `lockfile.c` and `refs/files-backend.c`
+- loose object framing and storage: `object-file.c`
 
 Tests state the behavior being compared so changes remain reviewable.

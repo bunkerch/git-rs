@@ -12,6 +12,9 @@ pub enum Error {
     NotDirectory(PathBuf),
     IsDirectory(PathBuf),
     InvalidObjectId(String),
+    InvalidObject(String),
+    ObjectTooLarge { declared: u64, limit: usize },
+    Compression(String),
     InvalidReferenceName(String),
     InvalidReference(String),
     ReferenceConflict(String),
@@ -29,6 +32,14 @@ impl fmt::Display for Error {
             Self::NotDirectory(path) => write!(f, "not a directory: {}", path.display()),
             Self::IsDirectory(path) => write!(f, "is a directory: {}", path.display()),
             Self::InvalidObjectId(value) => write!(f, "invalid object ID: {value}"),
+            Self::InvalidObject(message) => write!(f, "invalid Git object: {message}"),
+            Self::ObjectTooLarge { declared, limit } => {
+                write!(
+                    f,
+                    "object declares {declared} bytes, exceeding limit {limit}"
+                )
+            }
+            Self::Compression(message) => write!(f, "zlib error: {message}"),
             Self::InvalidReferenceName(name) => write!(f, "invalid reference name: {name}"),
             Self::InvalidReference(message) => write!(f, "invalid reference: {message}"),
             Self::ReferenceConflict(name) => {

@@ -11,6 +11,7 @@ name = "git_rs"
 path = "src/lib.rs"
 
 [dependencies]
+miniz_oxide = { version = "0.9.1", default-features = true }
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -18,4 +19,3 @@ unsafe_code = "forbid"
 [lints.clippy]
 all = "warn"
 pedantic = "warn"
-
