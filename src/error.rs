@@ -1,0 +1,44 @@
+use std::fmt;
+use std::path::PathBuf;
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug)]
+pub enum Error {
+    Io(std::io::Error),
+    InvalidPath(PathBuf),
+    AlreadyExists(PathBuf),
+    NotFound(PathBuf),
+    NotDirectory(PathBuf),
+    IsDirectory(PathBuf),
+    InvalidRepository(String),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "I/O error: {error}"),
+            Self::InvalidPath(path) => write!(f, "invalid repository path: {}", path.display()),
+            Self::AlreadyExists(path) => write!(f, "path already exists: {}", path.display()),
+            Self::NotFound(path) => write!(f, "path not found: {}", path.display()),
+            Self::NotDirectory(path) => write!(f, "not a directory: {}", path.display()),
+            Self::IsDirectory(path) => write!(f, "is a directory: {}", path.display()),
+            Self::InvalidRepository(message) => write!(f, "invalid repository: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}

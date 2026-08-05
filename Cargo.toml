@@ -1,0 +1,21 @@
+[package]
+name = "git-rs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A memory-safe, storage-agnostic implementation of Git in Rust"
+repository = "https://github.com/Manaf941/git-rs"
+
+[lib]
+name = "git_rs"
+path = "src/lib.rs"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
