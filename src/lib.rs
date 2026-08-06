@@ -36,6 +36,7 @@ pub mod pack;
 pub mod pack_refs;
 pub mod protocol;
 pub mod prune;
+pub mod pull;
 pub mod push;
 pub mod rebase;
 pub mod receive_pack;
@@ -108,6 +109,7 @@ pub use pack::{
 pub use pack_refs::{PackRefsOptions, PackRefsResult};
 pub use protocol::{Capability, PktLine, PktLineDecoder, Sideband};
 pub use prune::{PruneEntry, PruneOptions, PruneReason};
+pub use pull::{PullIntegration, PullMode, PullOptions, PullResult};
 pub use push::{
     InProcessReceivePackTransport, PushOptions, PushResult, PushStatus, PushUpdate,
     ReceivePackTransport,

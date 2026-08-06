@@ -47,6 +47,8 @@ Server-side push ingestion is documented in
 [`docs/receive-pack.md`](docs/receive-pack.md).
 Transport-neutral cloning and fetching are documented in
 [`docs/fetch-clone.md`](docs/fetch-clone.md).
+Transport-neutral fetch-and-integrate pull policy is documented in
+[`docs/pull.md`](docs/pull.md).
 In-memory Git bundle v2/v3 creation, parsing, verification, and import are
 documented in [`docs/bundles.md`](docs/bundles.md).
 Transport-neutral push orchestration is documented in
