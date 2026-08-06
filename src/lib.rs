@@ -159,7 +159,7 @@ pub use repack::{RepackOptions, RepackResult};
 pub use replace::Replacement;
 pub use repository::{InitOptions, Repository};
 pub use restore::{RestoreOptions, RestoreTarget};
-pub use revision::{GraphOptions, Revision, RevisionWalkOptions};
+pub use revision::{ForkPointOptions, GraphOptions, Revision, RevisionWalkOptions};
 pub use revparse::{ResolvedObject, RevisionOptions};
 pub use server_info::{ServerInfoOptions, ServerInfoReport};
 pub use shallow::ShallowOptions;
