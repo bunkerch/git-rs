@@ -54,6 +54,17 @@ impl Default for RemoveOptions {
     }
 }
 
+/// Collision, sparse-index, and mutation policy for a tracked move.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MoveOptions {
+    /// Replace an existing regular file/symlink destination and its index entry.
+    pub force: bool,
+    /// Include source entries marked `skip-worktree`.
+    pub include_sparse: bool,
+    /// Perform full validation without changing the worktree or index.
+    pub dry_run: bool,
+}
+
 impl Default for CheckoutOptions {
     fn default() -> Self {
         Self {
@@ -305,6 +316,184 @@ impl Repository {
             return Err(error);
         }
         Ok(removed)
+    }
+
+    /// Move one literal tracked file, gitlink, or directory prefix.
+    ///
+    /// Staged object IDs, stat data, stages, and extended index flags are
+    /// preserved under the destination path. Local worktree modifications and
+    /// untracked files inside a moved directory travel with it. The destination
+    /// is interpreted literally (not as the CLI's multi-source directory form).
+    ///
+    /// # Errors
+    /// Returns an error for unsafe paths, a missing/untracked source, unresolved
+    /// stages, sparse entries without opt-in, self-nesting, file/directory or
+    /// index collisions, unavailable destination parents, transfer failure, or
+    /// index publication failure.
+    #[allow(clippy::too_many_lines)]
+    pub fn move_path(
+        &self,
+        source: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+        options: &MoveOptions,
+    ) -> Result<usize> {
+        let work_tree = self.work_tree().ok_or_else(|| {
+            Error::InvalidRepository("moving paths requires a non-bare repository".into())
+        })?;
+        let source = normalize_relative(source.as_ref())?;
+        let destination = normalize_relative(destination.as_ref())?;
+        let source_index = index_path(&source)?;
+        let destination_index = index_path(&destination)?;
+        if source_index.is_empty()
+            || destination_index.is_empty()
+            || source_index == destination_index
+        {
+            return Err(Error::InvalidPath(destination));
+        }
+        let index = self.read_index()?;
+        let selected = index
+            .entries()
+            .iter()
+            .filter(|entry| path_is_selected(entry.path(), &source_index))
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            return Err(Error::NotFound(source));
+        }
+        if selected.iter().any(|entry| entry.stage() != 0) {
+            return Err(Error::InvalidRepository(format!(
+                "cannot move unresolved path `{}`",
+                String::from_utf8_lossy(&source_index)
+            )));
+        }
+        if selected.iter().any(|entry| entry.skip_worktree()) && !options.include_sparse {
+            return Err(Error::InvalidRepository(format!(
+                "path `{}` is outside the sparse worktree",
+                String::from_utf8_lossy(&source_index)
+            )));
+        }
+        let exact = selected.iter().find(|entry| entry.path() == source_index);
+        let source_path = work_tree.join(&source);
+        let source_metadata = match self.filesystem().metadata(&source_path) {
+            Ok(metadata) => Some(metadata),
+            Err(Error::NotFound(_))
+                if options.include_sparse && selected.iter().all(|entry| entry.skip_worktree()) =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let directory = source_metadata.is_some_and(crate::Metadata::is_dir)
+            || (source_metadata.is_none() && exact.is_none());
+        if source_metadata.is_some_and(crate::Metadata::is_dir)
+            && exact.is_some_and(|entry| entry.mode() != 0o160_000)
+        {
+            return Err(Error::InvalidRepository(
+                "tracked file source was replaced by a directory".into(),
+            ));
+        }
+        if directory
+            && destination_index.starts_with(&source_index)
+            && destination_index.get(source_index.len()) == Some(&b'/')
+        {
+            return Err(Error::InvalidRepository(
+                "cannot move a directory into itself".into(),
+            ));
+        }
+        if !directory && selected.len() != 1 {
+            return Err(Error::InvalidRepository(
+                "file source also has tracked descendants".into(),
+            ));
+        }
+
+        let destination_path = work_tree.join(&destination);
+        let destination_metadata = match self.filesystem().metadata(&destination_path) {
+            Ok(metadata) => Some(metadata),
+            Err(Error::NotFound(_)) => None,
+            Err(error) => return Err(error),
+        };
+        if directory && destination_metadata.is_some() {
+            return Err(Error::AlreadyExists(destination));
+        }
+        if !directory {
+            if destination_metadata.is_some_and(crate::Metadata::is_dir) {
+                return Err(Error::IsDirectory(destination));
+            }
+            if destination_metadata.is_some() && !options.force {
+                return Err(Error::AlreadyExists(destination));
+            }
+        }
+        if source_metadata.is_some() {
+            let parent = destination_path
+                .parent()
+                .ok_or_else(|| Error::InvalidPath(destination.clone()))?;
+            if !self.filesystem().metadata(parent)?.is_dir() {
+                return Err(Error::NotDirectory(parent.to_path_buf()));
+            }
+        }
+
+        let selected_paths = selected
+            .iter()
+            .map(|entry| entry.path().to_vec())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mappings = selected
+            .iter()
+            .map(|entry| {
+                let suffix = entry
+                    .path()
+                    .strip_prefix(source_index.as_slice())
+                    .ok_or_else(|| {
+                        Error::InvalidRepository("selected path escaped source prefix".into())
+                    })?;
+                let mut path = destination_index.clone();
+                path.extend_from_slice(suffix);
+                Ok((entry.path().to_vec(), path))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut replace_destination = false;
+        for entry in index
+            .entries()
+            .iter()
+            .filter(|entry| !selected_paths.contains(entry.path()))
+        {
+            for (_, new_path) in &mappings {
+                if entry.path() == new_path && !directory && options.force {
+                    if entry.stage() != 0 {
+                        return Err(Error::InvalidRepository(
+                            "cannot overwrite an unresolved destination".into(),
+                        ));
+                    }
+                    replace_destination = true;
+                    continue;
+                }
+                if paths_collide(entry.path(), new_path) {
+                    return Err(Error::AlreadyExists(worktree_path(new_path)?));
+                }
+            }
+        }
+        if options.dry_run {
+            return Ok(mappings.len());
+        }
+
+        if source_metadata.is_some() {
+            if directory {
+                move_worktree_tree(self, &source_path, &destination_path)?;
+            } else {
+                self.filesystem().rename(&source_path, &destination_path)?;
+            }
+            self.prune_empty_parents(work_tree, source.parent())?;
+        }
+        let mapping = mappings.into_iter().collect::<BTreeMap<_, _>>();
+        let mut entries = Vec::with_capacity(index.entries().len());
+        for entry in index.entries() {
+            if let Some(path) = mapping.get(entry.path()) {
+                entries.push(entry.clone().with_path(path.clone())?);
+            } else if !(replace_destination && entry.path() == destination_index) {
+                entries.push(entry.clone());
+            }
+        }
+        let moved = mapping.len();
+        self.write_index(&Index::new(index.version(), entries)?)?;
+        Ok(moved)
     }
 
     /// Write the stage-zero index as a hierarchy of tree objects.
@@ -745,6 +934,84 @@ fn path_is_selected(candidate: &[u8], prefix: &[u8]) -> bool {
     prefix.is_empty()
         || candidate == prefix
         || (candidate.starts_with(prefix) && candidate.get(prefix.len()) == Some(&b'/'))
+}
+
+fn paths_collide(left: &[u8], right: &[u8]) -> bool {
+    path_is_selected(left, right) || path_is_selected(right, left)
+}
+
+fn move_worktree_tree(repository: &Repository, source: &Path, destination: &Path) -> Result<()> {
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+    collect_worktree_move(
+        repository,
+        source,
+        destination,
+        &mut directories,
+        &mut files,
+    )?;
+    let mut created: Vec<PathBuf> = Vec::new();
+    for (_, directory) in &directories {
+        if let Err(error) = repository.filesystem().create_dir_all(directory) {
+            for path in created.iter().rev() {
+                let _ = repository.filesystem().remove_dir(path);
+            }
+            return Err(error);
+        }
+        created.push(directory.clone());
+    }
+    let mut moved = Vec::new();
+    for (from, to) in &files {
+        if let Err(error) = repository.filesystem().rename(from, to) {
+            rollback_worktree_move(repository, &directories, &moved, &created);
+            return Err(error);
+        }
+        moved.push((from.clone(), to.clone()));
+    }
+    for (directory, _) in directories.iter().rev() {
+        if let Err(error) = repository.filesystem().remove_dir(directory) {
+            rollback_worktree_move(repository, &directories, &moved, &created);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn collect_worktree_move(
+    repository: &Repository,
+    source: &Path,
+    destination: &Path,
+    directories: &mut Vec<(PathBuf, PathBuf)>,
+    files: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<()> {
+    directories.push((source.to_path_buf(), destination.to_path_buf()));
+    for child in repository.filesystem().read_dir(source)? {
+        let from = source.join(&child);
+        let to = destination.join(child);
+        if repository.filesystem().metadata(&from)?.is_dir() {
+            collect_worktree_move(repository, &from, &to, directories, files)?;
+        } else {
+            files.push((from, to));
+        }
+    }
+    Ok(())
+}
+
+fn rollback_worktree_move(
+    repository: &Repository,
+    directories: &[(PathBuf, PathBuf)],
+    moved: &[(PathBuf, PathBuf)],
+    created: &[PathBuf],
+) {
+    for (source, _) in directories {
+        let _ = repository.filesystem().create_dir_all(source);
+    }
+    for (from, to) in moved.iter().rev() {
+        let _ = repository.filesystem().rename(to, from);
+    }
+    for path in created.iter().rev() {
+        let _ = repository.filesystem().remove_dir(path);
+    }
 }
 
 fn remove_worktree_tree(repository: &Repository, path: &Path, force: bool) -> Result<()> {
@@ -1342,5 +1609,205 @@ mod tests {
             )
             .unwrap();
         assert!(fs.exists(Path::new("repo/root")).unwrap());
+    }
+
+    #[test]
+    fn moves_file_with_staged_and_local_layers_intact() {
+        let (repository, fs) = removal_fixture();
+        fs.write(Path::new("repo/root"), b"staged").unwrap();
+        repository.add("root").unwrap();
+        let staged = repository
+            .read_index()
+            .unwrap()
+            .entries()
+            .iter()
+            .find(|entry| entry.path() == b"root")
+            .unwrap()
+            .id();
+        fs.write(Path::new("repo/root"), b"local").unwrap();
+        assert_eq!(
+            repository
+                .move_path("root", "renamed", &MoveOptions::default())
+                .unwrap(),
+            1
+        );
+        assert!(!fs.exists(Path::new("repo/root")).unwrap());
+        assert_eq!(fs.read(Path::new("repo/renamed")).unwrap(), b"local");
+        let entry = repository
+            .read_index()
+            .unwrap()
+            .entries()
+            .iter()
+            .find(|entry| entry.path() == b"renamed")
+            .unwrap()
+            .clone();
+        assert_eq!(entry.id(), staged);
+    }
+
+    #[test]
+    fn moves_directory_with_tracked_and_untracked_contents() {
+        let (repository, fs) = removal_fixture();
+        fs.write(Path::new("repo/dir/untracked"), b"extra").unwrap();
+        assert_eq!(
+            repository
+                .move_path("dir", "moved", &MoveOptions::default())
+                .unwrap(),
+            2
+        );
+        assert!(!fs.exists(Path::new("repo/dir")).unwrap());
+        assert_eq!(fs.read(Path::new("repo/moved/one")).unwrap(), b"one");
+        assert_eq!(
+            fs.read(Path::new("repo/moved/untracked")).unwrap(),
+            b"extra"
+        );
+        assert_eq!(
+            repository
+                .read_index()
+                .unwrap()
+                .entries()
+                .iter()
+                .map(|entry| entry.path().to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                b"moved/one".to_vec(),
+                b"moved/two".to_vec(),
+                b"root".to_vec()
+            ]
+        );
+        assert!(
+            repository
+                .move_path("moved", "moved/inside", &MoveOptions::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn force_replaces_only_file_destinations_and_dry_run_is_immutable() {
+        let (repository, fs) = removal_fixture();
+        assert!(
+            repository
+                .move_path("root", "dir/one", &MoveOptions::default())
+                .is_err()
+        );
+        assert_eq!(fs.read(Path::new("repo/root")).unwrap(), b"root");
+        let before = repository.read_index().unwrap();
+        assert_eq!(
+            repository
+                .move_path(
+                    "root",
+                    "dir/one",
+                    &MoveOptions {
+                        force: true,
+                        dry_run: true,
+                        ..MoveOptions::default()
+                    }
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(repository.read_index().unwrap(), before);
+        repository
+            .move_path(
+                "root",
+                "dir/one",
+                &MoveOptions {
+                    force: true,
+                    ..MoveOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(fs.read(Path::new("repo/dir/one")).unwrap(), b"root");
+        assert!(
+            !repository
+                .read_index()
+                .unwrap()
+                .entries()
+                .iter()
+                .any(|entry| entry.path() == b"root")
+        );
+
+        let (repository, fs) = removal_fixture();
+        fs.write(Path::new("repo/untracked"), b"occupied").unwrap();
+        assert!(
+            repository
+                .move_path("root", "untracked", &MoveOptions::default())
+                .is_err()
+        );
+        repository
+            .move_path(
+                "root",
+                "untracked",
+                &MoveOptions {
+                    force: true,
+                    ..MoveOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(fs.read(Path::new("repo/untracked")).unwrap(), b"root");
+    }
+
+    #[test]
+    fn rejects_unresolved_and_handles_opted_in_sparse_index_only_move() {
+        let (repository, fs) = removal_fixture();
+        let blob = repository
+            .write_object(ObjectKind::Blob, b"conflict")
+            .unwrap();
+        let mut entries = repository.read_index().unwrap().entries().to_vec();
+        entries.push(
+            IndexEntry::with_stage("conflict", 0o100_644, blob, StatData::default(), 2).unwrap(),
+        );
+        repository
+            .write_index(&Index::new(IndexVersion::V3, entries).unwrap())
+            .unwrap();
+        assert!(
+            repository
+                .move_path("conflict", "resolved", &MoveOptions::default())
+                .is_err()
+        );
+
+        let entries = repository
+            .read_index()
+            .unwrap()
+            .entries()
+            .iter()
+            .filter(|entry| entry.path() != b"conflict")
+            .cloned()
+            .map(|entry| {
+                if entry.path() == b"root" {
+                    entry.with_skip_worktree(true)
+                } else {
+                    entry
+                }
+            })
+            .collect::<Vec<_>>();
+        repository
+            .write_index(&Index::new(IndexVersion::V3, entries).unwrap())
+            .unwrap();
+        fs.remove_file(Path::new("repo/root")).unwrap();
+        assert!(
+            repository
+                .move_path("root", "renamed", &MoveOptions::default())
+                .is_err()
+        );
+        repository
+            .move_path(
+                "root",
+                "renamed",
+                &MoveOptions {
+                    include_sparse: true,
+                    ..MoveOptions::default()
+                },
+            )
+            .unwrap();
+        let renamed = repository
+            .read_index()
+            .unwrap()
+            .entries()
+            .iter()
+            .find(|entry| entry.path() == b"renamed")
+            .unwrap()
+            .clone();
+        assert!(renamed.skip_worktree());
+        assert!(!fs.exists(Path::new("repo/renamed")).unwrap());
     }
 }

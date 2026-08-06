@@ -80,6 +80,46 @@ cargo run --example rm -- /path/to/repository generated --recursive
 cargo run --example rm -- /path/to/repository path/to/file --cached
 ```
 
+## Moving tracked paths
+
+`Repository::move_path` moves a single literal file, gitlink, or tracked
+directory prefix and rewrites all selected index paths in one index
+transaction. Unlike removal, a move preserves local and staged changes: file
+bytes move as they exist in the worktree, while each index entry keeps its
+object ID, mode, stat data, stage, and extended flags at the new path.
+
+```rust
+# use git_rs::{MoveOptions, Repository};
+# fn example(repository: &Repository) -> git_rs::Result<()> {
+repository.move_path("old/module", "new/module", &MoveOptions::default())?;
+# Ok(())
+# }
+```
+
+Directory moves include untracked and ignored files contained below the source,
+matching filesystem rename behavior. Because custom adapters are only required
+to atomically rename files, git-rs enumerates directories in stable order,
+creates the destination hierarchy, and renames each leaf. A leaf-transfer
+failure rolls completed leaves back before returning. The source directories
+are removed only after all leaves move.
+
+The complete preflight rejects unresolved source entries, a directory moved
+inside itself, nonexistent destination parents, file/directory obstructions,
+and index prefix collisions. `force` may replace only a regular file or symlink
+destination and its exact stage-zero index entry; it cannot merge directories
+or erase unresolved stages. `include_sparse` permits an index-only move when
+all selected missing entries are marked `skip-worktree`. `dry_run` performs the
+same checks without mutation.
+
+The destination is literal. It does not use the CLI convenience that appends a
+source basename when the destination names an existing directory; callers can
+construct that explicit destination without filesystem-dependent ambiguity.
+
+```console
+cargo run --example mv -- /path/to/repository old/path new/path
+cargo run --example mv -- /path/to/repository old/path new/path --force
+```
+
 ## Linked worktrees
 
 `Repository::add_worktree` creates Git's linked-worktree layout without
@@ -142,6 +182,11 @@ provide stat identity enable Git's fast unchanged-file checks.
   matrix, missing-file behavior, and cached-removal exception.
 - `builtin/rm.c:cmd_rm` defines all-path preflight, recursive selection,
   unmerged removal, sparse-entry policy, and index publication ordering.
+- `builtin/mv.c:cmd_mv` defines controlled-source checks, directory-prefix
+  expansion, self-nesting and destination collision rules, sparse handling,
+  worktree movement, and index path rewriting.
+- `read-cache.c:rename_index_entry_at` defines preservation of index entry
+  metadata while changing its path.
 - `worktree.c:get_worktrees`, `write_worktree_linking_files`, and
   `builtin/worktree.c:add_worktree` define common-directory routing, relative
   linking files, registration, checkout exclusivity, and removal safety.

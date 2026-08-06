@@ -161,6 +161,18 @@ impl IndexEntry {
         self
     }
 
+    /// Replace the repository path while preserving object, mode, stat, stage,
+    /// and extended flags.
+    ///
+    /// # Errors
+    /// Returns an error when the new path is not index-safe.
+    pub fn with_path(mut self, path: impl Into<Vec<u8>>) -> Result<Self> {
+        let path = path.into();
+        validate_path(&path)?;
+        self.path = path;
+        Ok(self)
+    }
+
     fn has_extended_flags(&self) -> bool {
         self.intent_to_add || self.skip_worktree
     }
