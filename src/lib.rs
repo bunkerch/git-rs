@@ -20,6 +20,7 @@ pub mod receive_pack;
 pub mod refs;
 pub mod repository;
 pub mod revision;
+pub mod revparse;
 pub mod status;
 pub mod tag;
 pub mod tree;
@@ -61,6 +62,7 @@ pub use refs::{
 };
 pub use repository::{InitOptions, Repository};
 pub use revision::{GraphOptions, Revision, RevisionWalkOptions};
+pub use revparse::{ResolvedObject, RevisionOptions};
 pub use status::{ChangeKind, RepositoryStatus, StatusEntry, StatusOptions};
 pub use tag::{AnnotatedTag, PeeledObject, TagBuilder};
 pub use tree::{EntryMode, Tree, TreeEntry};

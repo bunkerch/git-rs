@@ -1,5 +1,34 @@
 # Revision graph
 
+## Revision expressions
+
+`Repository::resolve_revision` turns common Git revision expressions into a
+verified `ResolvedObject { id, kind }`. Supported base names include full
+object IDs, unique hexadecimal abbreviations, `@`/`HEAD`, operation pseudorefs,
+fully-qualified references, and DWIM tag, local-branch, and remote names.
+
+```rust
+# use git_rs::{Repository, RevisionOptions};
+# fn example(repository: &Repository) -> git_rs::Result<()> {
+let options = RevisionOptions::default();
+let parent = repository.resolve_revision("main^", &options)?;
+let file = repository.resolve_revision("v1.0^{tree}:src/lib.rs", &options)?;
+# Ok(())
+# }
+```
+
+Suffixes include `^`, `^N`, `~N`, recursive tag peeling with `^{}`, explicit
+`^{object|commit|tree|blob|tag}` type assertions, and byte-exact tree traversal
+with `:path`. Parent and ancestry counts, tag depth, object size, abbreviation
+candidates, and total suffix work all have caller-configurable bounds.
+
+Abbreviation discovery reads only the matching loose-object fanout directory
+and binary-searches each sorted version-2 pack index. Duplicate loose/packed IDs
+are deduplicated, while genuinely ambiguous prefixes and DWIM ref names return
+`Error::AmbiguousRevision` instead of silently selecting an object.
+
+## Graph queries
+
 `Repository::walk_revisions` walks commits reachable from one or more included
 tips while hiding commits reachable from excluded tips. Output is topological:
 every descendant appears before its parents. Commits that are simultaneously
@@ -34,6 +63,10 @@ with every filesystem adapter.
 
 ## Git source comparisons
 
+- `object-name.c:get_oid_1`, `get_oid_basic`, `get_parent`,
+  `get_nth_ancestor`, and `peel_onion` define DWIM bases and suffix evaluation.
+- `object-name.c:get_short_oid` and pack-index ordering define unique
+  abbreviation lookup and ambiguity handling.
 - `revision.c` and `list-objects.c` define include/exclude traversal and
   first-parent behavior.
 - `commit-reach.c:paint_down_to_common` and `get_merge_bases_many_0` define

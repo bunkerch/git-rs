@@ -22,6 +22,8 @@ pub enum Error {
     EmptyReplay,
     InvalidReferenceName(String),
     InvalidReference(String),
+    InvalidRevision(String),
+    AmbiguousRevision(String),
     ReferenceConflict(String),
     CheckoutConflict(Vec<String>),
     IgnoredPath(PathBuf),
@@ -56,6 +58,8 @@ impl fmt::Display for Error {
             Self::EmptyReplay => write!(f, "replayed commit would be empty"),
             Self::InvalidReferenceName(name) => write!(f, "invalid reference name: {name}"),
             Self::InvalidReference(message) => write!(f, "invalid reference: {message}"),
+            Self::InvalidRevision(message) => write!(f, "invalid revision: {message}"),
+            Self::AmbiguousRevision(value) => write!(f, "ambiguous revision: {value}"),
             Self::ReferenceConflict(name) => {
                 write!(f, "reference changed concurrently: {name}")
             }
