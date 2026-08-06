@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use crate::{Error, Index, ObjectId, ObjectKind, Repository, Result};
+use crate::{Error, Index, ObjectId, ObjectKind, Repository, Result, object::sha1};
 
 /// Classification of one path-level difference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,6 +93,40 @@ struct Value {
 }
 
 impl Repository {
+    /// Compute Git's stable patch identity for a root or single-parent commit.
+    ///
+    /// The identity ignores whitespace and commit metadata, disables rename
+    /// detection, and adds independent per-file hashes so file ordering does
+    /// not change the result. Merge commits do not have a patch identity.
+    ///
+    /// # Errors
+    /// Returns an error for missing or malformed commits, trees, or blobs and
+    /// when a configured diff resource limit is exceeded.
+    pub fn commit_patch_id(
+        &self,
+        commit_id: ObjectId,
+        options: &DiffOptions,
+    ) -> Result<Option<ObjectId>> {
+        let commit = self.read_commit(commit_id, options.max_object_size)?;
+        if commit.parents().len() > 1 {
+            return Ok(None);
+        }
+        let old_tree = commit
+            .parents()
+            .first()
+            .map(|parent| self.read_commit(*parent, options.max_object_size))
+            .transpose()?
+            .map(|parent| parent.tree());
+        let mut identity = [0_u8; ObjectId::LENGTH];
+        let mut diff_options = options.clone();
+        diff_options.detect_exact_renames = false;
+        for entry in self.diff_trees(old_tree, Some(commit.tree()), &diff_options)? {
+            let file_hash = self.patch_id_file_hash(&entry, &diff_options)?;
+            add_hash(&mut identity, file_hash);
+        }
+        Ok(Some(ObjectId::from_bytes(identity)))
+    }
+
     /// Compare two trees. `None` represents the empty tree.
     ///
     /// # Errors
@@ -277,6 +311,110 @@ impl Repository {
             )));
         }
         Ok(Some(object.data().to_vec()))
+    }
+
+    fn patch_id_file_hash(
+        &self,
+        entry: &DiffEntry,
+        options: &DiffOptions,
+    ) -> Result<[u8; ObjectId::LENGTH]> {
+        let old_path = entry
+            .old_path()
+            .or(entry.new_path())
+            .ok_or_else(|| Error::InvalidRepository("diff entry has no path".into()))?;
+        let new_path = entry.new_path().unwrap_or(old_path);
+        let mut input = Vec::new();
+        append_without_whitespace(&mut input, b"diff--git");
+        append_without_whitespace(&mut input, b"a/");
+        append_without_whitespace(&mut input, old_path);
+        append_without_whitespace(&mut input, b"b/");
+        append_without_whitespace(&mut input, new_path);
+        match (entry.old_mode(), entry.new_mode()) {
+            (None, Some(mode)) => {
+                append_without_whitespace(&mut input, b"newfilemode");
+                append_without_whitespace(&mut input, format!("{mode:06o}").as_bytes());
+            }
+            (Some(mode), None) => {
+                append_without_whitespace(&mut input, b"deletedfilemode");
+                append_without_whitespace(&mut input, format!("{mode:06o}").as_bytes());
+            }
+            (Some(old), Some(new)) if old != new => {
+                append_without_whitespace(&mut input, b"oldmode");
+                append_without_whitespace(&mut input, format!("{old:06o}").as_bytes());
+                append_without_whitespace(&mut input, b"newmode");
+                append_without_whitespace(&mut input, format!("{new:06o}").as_bytes());
+            }
+            _ => {}
+        }
+
+        let old_data = self.diff_blob(entry.old_id(), entry.old_mode(), options.max_object_size)?;
+        let new_data = self.diff_blob(entry.new_id(), entry.new_mode(), options.max_object_size)?;
+        let binary = old_data.as_ref().is_none_or(|data| data.contains(&0))
+            || new_data.as_ref().is_none_or(|data| data.contains(&0));
+        if binary {
+            append_without_whitespace(
+                &mut input,
+                entry
+                    .old_id()
+                    .unwrap_or_else(ObjectId::null)
+                    .to_string()
+                    .as_bytes(),
+            );
+            append_without_whitespace(
+                &mut input,
+                entry
+                    .new_id()
+                    .unwrap_or_else(ObjectId::null)
+                    .to_string()
+                    .as_bytes(),
+            );
+            return Ok(sha1::digest(&input));
+        }
+
+        if entry.old_id().is_none() {
+            append_without_whitespace(&mut input, b"---/dev/null");
+        } else {
+            append_without_whitespace(&mut input, b"---a/");
+            append_without_whitespace(&mut input, old_path);
+        }
+        if entry.new_id().is_none() {
+            append_without_whitespace(&mut input, b"+++/dev/null");
+        } else {
+            append_without_whitespace(&mut input, b"+++b/");
+            append_without_whitespace(&mut input, new_path);
+        }
+        let old_data = old_data.expect("binary and gitlink cases returned above");
+        let new_data = new_data.expect("binary and gitlink cases returned above");
+        let old_lines = split_lines(&old_data);
+        let new_lines = split_lines(&new_data);
+        if old_lines.len().max(new_lines.len()) > options.max_lines {
+            return Err(Error::InvalidRepository(format!(
+                "diff exceeds {} lines",
+                options.max_lines
+            )));
+        }
+        let mut edits = myers(&old_lines, &new_lines, options.max_trace_cells)?;
+        compact_patch_edits(&mut edits);
+        append_patch_id_hunks(&mut input, &edits, 3);
+        Ok(sha1::digest(&input))
+    }
+}
+
+fn append_without_whitespace(output: &mut Vec<u8>, value: &[u8]) {
+    output.extend(
+        value
+            .iter()
+            .copied()
+            .filter(|byte| !byte.is_ascii_whitespace()),
+    );
+}
+
+fn add_hash(total: &mut [u8; ObjectId::LENGTH], hash: [u8; ObjectId::LENGTH]) {
+    let mut carry = 0_u16;
+    for (slot, value) in total.iter_mut().zip(hash) {
+        carry += u16::from(*slot) + u16::from(value);
+        *slot = carry.to_le_bytes()[0];
+        carry >>= 8;
     }
 }
 
@@ -786,32 +924,7 @@ fn backtrack<'a>(
 }
 
 fn render_hunks(output: &mut Vec<u8>, edits: &[Edit<'_>], context: usize) {
-    let changes = edits
-        .iter()
-        .enumerate()
-        .filter_map(|(index, edit)| (!matches!(edit, Edit::Equal(_))).then_some(index))
-        .collect::<Vec<_>>();
-    if changes.is_empty() {
-        return;
-    }
-    let mut groups = Vec::new();
-    let mut start = changes[0];
-    let mut end = changes[0];
-    for change in changes.into_iter().skip(1) {
-        if change.saturating_sub(end) > context.saturating_mul(2).saturating_add(1) {
-            groups.push((
-                start.saturating_sub(context),
-                (end + context + 1).min(edits.len()),
-            ));
-            start = change;
-        }
-        end = change;
-    }
-    groups.push((
-        start.saturating_sub(context),
-        (end + context + 1).min(edits.len()),
-    ));
-    for (start, end) in groups {
+    for (start, end) in hunk_ranges(edits, context) {
         let old_start = 1 + edits[..start]
             .iter()
             .filter(|edit| !matches!(edit, Edit::Insert(_)))
@@ -861,6 +974,209 @@ fn render_hunks(output: &mut Vec<u8>, edits: &[Edit<'_>], context: usize) {
     }
 }
 
+fn append_patch_id_hunks(output: &mut Vec<u8>, edits: &[Edit<'_>], context: usize) {
+    for (start, end) in hunk_ranges(edits, context) {
+        for edit in &edits[start..end] {
+            let (prefix, line) = match edit {
+                Edit::Equal(line) => (None, *line),
+                Edit::Delete(line) => (Some(b'-'), *line),
+                Edit::Insert(line) => (Some(b'+'), *line),
+            };
+            output.extend(prefix);
+            append_without_whitespace(output, line);
+        }
+    }
+}
+
+fn compact_patch_edits(edits: &mut Vec<Edit<'_>>) {
+    let old = edits
+        .iter()
+        .filter_map(|edit| match edit {
+            Edit::Equal(line) | Edit::Delete(line) => Some(*line),
+            Edit::Insert(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let new = edits
+        .iter()
+        .filter_map(|edit| match edit {
+            Edit::Equal(line) | Edit::Insert(line) => Some(*line),
+            Edit::Delete(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let mut old_changed = edits
+        .iter()
+        .filter_map(|edit| match edit {
+            Edit::Equal(_) => Some(false),
+            Edit::Delete(_) => Some(true),
+            Edit::Insert(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let mut new_changed = edits
+        .iter()
+        .filter_map(|edit| match edit {
+            Edit::Equal(_) => Some(false),
+            Edit::Insert(_) => Some(true),
+            Edit::Delete(_) => None,
+        })
+        .collect::<Vec<_>>();
+    compact_changes(&old, &mut old_changed, &mut new_changed);
+    compact_changes(&new, &mut new_changed, &mut old_changed);
+
+    edits.clear();
+    let (mut old_index, mut new_index) = (0, 0);
+    while old_index < old.len() || new_index < new.len() {
+        if old_index < old.len() && old_changed[old_index] {
+            edits.push(Edit::Delete(old[old_index]));
+            old_index += 1;
+        } else if new_index < new.len() && new_changed[new_index] {
+            edits.push(Edit::Insert(new[new_index]));
+            new_index += 1;
+        } else {
+            debug_assert_eq!(old[old_index], new[new_index]);
+            edits.push(Edit::Equal(old[old_index]));
+            old_index += 1;
+            new_index += 1;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ChangeGroup {
+    start: usize,
+    end: usize,
+}
+
+fn first_group(changed: &[bool]) -> ChangeGroup {
+    let mut end = 0;
+    while end < changed.len() && changed[end] {
+        end += 1;
+    }
+    ChangeGroup { start: 0, end }
+}
+
+fn next_group(changed: &[bool], group: &mut ChangeGroup) -> bool {
+    if group.end == changed.len() {
+        return false;
+    }
+    group.start = group.end + 1;
+    group.end = group.start;
+    while group.end < changed.len() && changed[group.end] {
+        group.end += 1;
+    }
+    true
+}
+
+fn previous_group(changed: &[bool], group: &mut ChangeGroup) -> bool {
+    if group.start == 0 {
+        return false;
+    }
+    group.end = group.start - 1;
+    group.start = group.end;
+    while group.start > 0 && changed[group.start - 1] {
+        group.start -= 1;
+    }
+    true
+}
+
+fn slide_group_up(lines: &[&[u8]], changed: &mut [bool], group: &mut ChangeGroup) -> bool {
+    if group.start == 0 || lines[group.start - 1] != lines[group.end - 1] {
+        return false;
+    }
+    group.start -= 1;
+    group.end -= 1;
+    changed[group.start] = true;
+    changed[group.end] = false;
+    while group.start > 0 && changed[group.start - 1] {
+        group.start -= 1;
+    }
+    true
+}
+
+fn slide_group_down(lines: &[&[u8]], changed: &mut [bool], group: &mut ChangeGroup) -> bool {
+    if group.end == lines.len() || lines[group.start] != lines[group.end] {
+        return false;
+    }
+    changed[group.start] = false;
+    group.start += 1;
+    changed[group.end] = true;
+    group.end += 1;
+    while group.end < changed.len() && changed[group.end] {
+        group.end += 1;
+    }
+    true
+}
+
+fn compact_changes(lines: &[&[u8]], changed: &mut [bool], other_changed: &mut [bool]) {
+    let mut group = first_group(changed);
+    let mut other = first_group(other_changed);
+    loop {
+        if group.end != group.start {
+            let mut earliest_end;
+            let mut end_matching_other;
+            loop {
+                let size = group.end - group.start;
+                end_matching_other = None;
+                while slide_group_up(lines, changed, &mut group) {
+                    assert!(previous_group(other_changed, &mut other));
+                }
+                earliest_end = group.end;
+                if other.end > other.start {
+                    end_matching_other = Some(group.end);
+                }
+                while slide_group_down(lines, changed, &mut group) {
+                    assert!(next_group(other_changed, &mut other));
+                    if other.end > other.start {
+                        end_matching_other = Some(group.end);
+                    }
+                }
+                if size == group.end - group.start {
+                    break;
+                }
+            }
+            if group.end != earliest_end && end_matching_other.is_some() {
+                while other.end == other.start {
+                    assert!(slide_group_up(lines, changed, &mut group));
+                    assert!(previous_group(other_changed, &mut other));
+                }
+            }
+        }
+        if !next_group(changed, &mut group) {
+            break;
+        }
+        assert!(next_group(other_changed, &mut other));
+    }
+    debug_assert!(!next_group(other_changed, &mut other));
+}
+
+fn hunk_ranges(edits: &[Edit<'_>], context: usize) -> Vec<(usize, usize)> {
+    let changes = edits
+        .iter()
+        .enumerate()
+        .filter_map(|(index, edit)| (!matches!(edit, Edit::Equal(_))).then_some(index))
+        .collect::<Vec<_>>();
+    if changes.is_empty() {
+        return Vec::new();
+    }
+    let mut groups = Vec::new();
+    let mut start = changes[0];
+    let mut end = changes[0];
+    for change in changes.into_iter().skip(1) {
+        if change.saturating_sub(end) > context.saturating_mul(2).saturating_add(1) {
+            groups.push((
+                start.saturating_sub(context),
+                (end + context + 1).min(edits.len()),
+            ));
+            start = change;
+        }
+        end = change;
+    }
+    groups.push((
+        start.saturating_sub(context),
+        (end + context + 1).min(edits.len()),
+    ));
+    groups
+}
+
 fn format_range(start: usize, count: usize) -> String {
     if count == 1 {
         start.to_string()
@@ -904,10 +1220,61 @@ fn quoted_path(prefix: &[u8], path: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiffKind, DiffOptions, Edit, merge_text, myers, split_lines};
+    use super::{DiffKind, DiffOptions, Edit, compact_patch_edits, merge_text, myers, split_lines};
     use crate::{
-        EntryMode, InitOptions, MemoryFileSystem, ObjectKind, Repository, Tree, TreeEntry,
+        CommitBuilder, EntryMode, InitOptions, MemoryFileSystem, ObjectKind, Repository, Signature,
+        Tree, TreeEntry,
     };
+
+    #[test]
+    fn patch_identity_ignores_metadata_and_whitespace_but_rejects_merges() {
+        let repository = repository();
+        let base_blob = repository
+            .write_object(ObjectKind::Blob, b"one\ntwo\n")
+            .unwrap();
+        let base_tree = tree(&repository, &[(EntryMode::Blob, b"file", base_blob)]);
+        let base = commit(&repository, base_tree, &[], 1);
+        let compact_blob = repository
+            .write_object(ObjectKind::Blob, b"one\nchanged value\n")
+            .unwrap();
+        let spaced_blob = repository
+            .write_object(ObjectKind::Blob, b"one\nchanged   value\n")
+            .unwrap();
+        let compact = commit(
+            &repository,
+            tree(&repository, &[(EntryMode::Blob, b"file", compact_blob)]),
+            &[base],
+            2,
+        );
+        let spaced = commit(
+            &repository,
+            tree(&repository, &[(EntryMode::Blob, b"file", spaced_blob)]),
+            &[base],
+            3,
+        );
+        assert_ne!(compact, spaced);
+        let compact_id = repository
+            .commit_patch_id(compact, &DiffOptions::default())
+            .unwrap();
+        assert_eq!(
+            compact_id.as_ref().map(ToString::to_string).as_deref(),
+            Some("6e8112e9a7c9d9b3e2b880090043e6540b448abe")
+        );
+        assert_eq!(
+            compact_id,
+            repository
+                .commit_patch_id(spaced, &DiffOptions::default())
+                .unwrap()
+        );
+
+        let merge = commit(&repository, base_tree, &[compact, spaced], 4);
+        assert_eq!(
+            repository
+                .commit_patch_id(merge, &DiffOptions::default())
+                .unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn three_way_text_merge_combines_regions_and_marks_overlaps() {
@@ -1076,6 +1443,29 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert_eq!(&reconstructed_old, old);
                 assert_eq!(&reconstructed_new, new);
+
+                let mut compacted = edits;
+                compact_patch_edits(&mut compacted);
+                assert_eq!(
+                    compacted
+                        .iter()
+                        .filter_map(|edit| match edit {
+                            Edit::Equal(line) | Edit::Delete(line) => Some(*line),
+                            Edit::Insert(_) => None,
+                        })
+                        .collect::<Vec<_>>(),
+                    *old
+                );
+                assert_eq!(
+                    compacted
+                        .iter()
+                        .filter_map(|edit| match edit {
+                            Edit::Equal(line) | Edit::Insert(line) => Some(*line),
+                            Edit::Delete(_) => None,
+                        })
+                        .collect::<Vec<_>>(),
+                    *new
+                );
             }
         }
         assert_eq!(split_lines(b"a\nb").len(), 2);
@@ -1100,5 +1490,20 @@ mod tests {
                 .unwrap(),
             )
             .unwrap()
+    }
+
+    fn commit(
+        repository: &Repository,
+        tree: crate::ObjectId,
+        parents: &[crate::ObjectId],
+        timestamp: i64,
+    ) -> crate::ObjectId {
+        let identity = Signature::new("A", "a@example.com", timestamp, 0).unwrap();
+        let mut builder =
+            CommitBuilder::new(tree, identity.clone(), identity).message(b"m\n".to_vec());
+        for parent in parents {
+            builder = builder.parent(*parent);
+        }
+        repository.write_commit(&builder.build()).unwrap()
     }
 }

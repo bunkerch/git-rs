@@ -7,6 +7,7 @@ pub mod bisect;
 pub mod blame;
 pub mod branch;
 pub mod bundle;
+pub mod cherry;
 pub mod clean;
 pub mod commit;
 pub mod commit_graph;
@@ -75,6 +76,7 @@ pub use bundle::{
     BundleCreateOptions, BundleParseOptions, BundlePrerequisite, BundleReference, BundleVersion,
     GitBundle,
 };
+pub use cherry::{CherryCommit, CherryOptions};
 pub use clean::{CleanEntry, CleanIgnoredMode, CleanOptions};
 pub use commit::{Commit, CommitBuilder, ExtraHeader, Signature};
 pub use commit_graph::{CommitGraph, CommitGraphEntry, CommitGraphOptions, CommitGraphReport};

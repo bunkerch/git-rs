@@ -118,6 +118,8 @@ Bounded nearest-tag/reference naming is documented in
 [`docs/describe.md`](docs/describe.md).
 Bounded line attribution across history and exact renames is documented in
 [`docs/blame.md`](docs/blame.md).
+Stable patch identity and patch-equivalent cherry classification are documented
+in [`docs/patch-id-cherry.md`](docs/patch-id-cherry.md).
 Git-compatible configuration parsing and atomic editing are documented in
 [`docs/config.md`](docs/config.md).
 Ignore matching and its integration with status and staging are documented in
