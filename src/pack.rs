@@ -1777,7 +1777,11 @@ mod tests {
             )
             .unwrap();
         assert!(validated.contains(target));
-        repository.publish_validated_pack(&validated).unwrap();
+        let unpacked = repository
+            .unpack_objects(&pack, &crate::UnpackObjectsOptions::default())
+            .unwrap();
+        assert_eq!(unpacked.written, vec![target]);
+        assert!(repository.contains_loose_object(target).unwrap());
         assert_eq!(
             repository.read_object(target, 1024).unwrap().data(),
             b"hello rust"
