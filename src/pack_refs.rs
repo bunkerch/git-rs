@@ -19,6 +19,8 @@ pub struct PackRefsOptions {
     pub max_object_size: usize,
     pub max_tag_depth: usize,
     pub max_refs: usize,
+    /// Validate and report selected loose refs without locks or publication.
+    pub dry_run: bool,
 }
 
 impl Default for PackRefsOptions {
@@ -31,6 +33,7 @@ impl Default for PackRefsOptions {
             max_object_size: 1024 * 1024 * 1024,
             max_tag_depth: 64,
             max_refs: 10_000_000,
+            dry_run: false,
         }
     }
 }
@@ -83,6 +86,23 @@ impl Repository {
             });
         }
         loose.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        if options.dry_run {
+            let existing = read_packed_values(self, &self.git_path("packed-refs"))?;
+            if existing.len().saturating_add(loose.len()) > options.max_refs {
+                return Err(Error::InvalidRepository(
+                    "packed reference limit exceeded".into(),
+                ));
+            }
+            for item in &loose {
+                if item.kind == ObjectKind::Tag {
+                    self.peel_tag(item.id, options.max_tag_depth, options.max_object_size)?;
+                }
+            }
+            return Ok(PackRefsResult {
+                packed: loose.into_iter().map(|item| item.name).collect(),
+                pruned: 0,
+            });
+        }
         let mut locked = Vec::with_capacity(loose.len());
         for item in loose {
             if let Err(error) = self.filesystem().write_new(&item.lock, b"") {

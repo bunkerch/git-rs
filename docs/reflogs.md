@@ -36,6 +36,9 @@ direct reference selects Git's expire-all policy.
 complete parent, tree, and blob closure. Null endpoints are valid; non-commit,
 missing, corrupt, or wrongly typed endpoints are pruned. Successfully proven
 objects are cached across entries and the total verified set is bounded.
+`expire_reflog_with_policy` applies total-age and unreachable-age rules in one
+rewrite. An entry matching both is selected once, so dry-run and mutating counts
+are identical; repository GC uses this combined policy.
 
 `reflogs` discovers `HEAD` and `refs/*` log files in bytewise order with count
 and directory-depth limits. `drop_reflog` removes one whole log under its

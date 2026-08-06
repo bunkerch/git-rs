@@ -33,6 +33,8 @@ Verified pack consolidation and safe pruning are documented in
 [`docs/repack.md`](docs/repack.md).
 Expiry-controlled loose-object pruning is documented in
 [`docs/prune.md`](docs/prune.md).
+Repository-wide lock-scoped garbage collection is documented in
+[`docs/gc.md`](docs/gc.md).
 Full object and connectivity verification is documented in
 [`docs/fsck.md`](docs/fsck.md).
 Bounded loose, packed, duplicate, size, and garbage inventory is documented in

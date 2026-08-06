@@ -87,6 +87,46 @@ impl Repository {
     /// Returns an error for unsafe mutation options, failed verification,
     /// maintenance lock contention, storage metadata, or deletion failure.
     pub fn prune(&self, options: &PruneOptions) -> Result<Vec<PruneEntry>> {
+        self.validate_prune_options(options)?;
+        if options.dry_run {
+            return self.prune_discover(options);
+        }
+        let lock = self.git_path("gc.pid");
+        self.filesystem().write_new(&lock, b"git-rs prune\n")?;
+        let result = self.prune_under_maintenance_lock(options);
+        let cleanup = self.filesystem().remove_file(&lock);
+        match (result, cleanup) {
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+            (Ok(entries), Ok(())) => Ok(entries),
+        }
+    }
+
+    pub(crate) fn prune_under_maintenance_lock(
+        &self,
+        options: &PruneOptions,
+    ) -> Result<Vec<PruneEntry>> {
+        self.validate_prune_options(options)?;
+        let entries = self.prune_discover(options)?;
+        if options.dry_run {
+            return Ok(entries);
+        }
+        for entry in &entries {
+            if entry.directory {
+                remove_prune_tree(self, &entry.path)?;
+            } else {
+                self.filesystem().remove_file(&entry.path)?;
+            }
+            if let Some(parent) = entry.path.parent() {
+                match self.filesystem().remove_dir(parent) {
+                    Ok(()) | Err(Error::DirectoryNotEmpty(_) | Error::NotFound(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    fn validate_prune_options(&self, options: &PruneOptions) -> Result<()> {
         let config = self.read_config()?;
         if config.get("extensions.preciousobjects")?.is_some()
             && config.get_bool("extensions.preciousobjects")?
@@ -100,32 +140,7 @@ impl Repository {
                 "prune mutation requires force=true and an explicit expiration".into(),
             ));
         }
-        if options.dry_run {
-            return self.prune_discover(options);
-        }
-        let lock = self.git_path("gc.pid");
-        self.filesystem().write_new(&lock, b"git-rs prune\n")?;
-        let result = self.prune_discover(options).and_then(|entries| {
-            for entry in &entries {
-                if entry.directory {
-                    remove_prune_tree(self, &entry.path)?;
-                } else {
-                    self.filesystem().remove_file(&entry.path)?;
-                }
-                if let Some(parent) = entry.path.parent() {
-                    match self.filesystem().remove_dir(parent) {
-                        Ok(()) | Err(Error::DirectoryNotEmpty(_) | Error::NotFound(_)) => {}
-                        Err(error) => return Err(error),
-                    }
-                }
-            }
-            Ok(entries)
-        });
-        let cleanup = self.filesystem().remove_file(&lock);
-        match (result, cleanup) {
-            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
-            (Ok(entries), Ok(())) => Ok(entries),
-        }
+        Ok(())
     }
 
     fn prune_discover(&self, options: &PruneOptions) -> Result<Vec<PruneEntry>> {

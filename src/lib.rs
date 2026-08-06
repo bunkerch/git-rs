@@ -17,6 +17,7 @@ pub mod error;
 pub mod fetch;
 pub mod fs;
 pub mod fsck;
+pub mod gc;
 pub mod grep;
 pub mod ignore;
 pub mod index;
@@ -77,6 +78,7 @@ pub use fetch::{
 };
 pub use fs::{FileStat, FileSystem, HostFileSystem, MemoryFileSystem, Metadata};
 pub use fsck::{FsckOptions, FsckReport};
+pub use gc::{GcOptions, GcReport};
 pub use grep::{GrepBinaryMode, GrepMatch, GrepOptions, GrepTarget};
 pub use ignore::{IgnoreMatcher, IgnoreRule};
 pub use index::{Index, IndexEntry, IndexExtension, IndexVersion, StatData};

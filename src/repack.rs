@@ -274,6 +274,15 @@ impl Repository {
     /// construction/publication/verification, or storage mutation failure.
     pub fn repack(&self, options: &RepackOptions) -> Result<RepackResult> {
         validate_repack_options(options)?;
+        let config = self.read_config()?;
+        if (options.prune_loose || options.delete_redundant_packs)
+            && config.get("extensions.preciousobjects")?.is_some()
+            && config.get_bool("extensions.preciousobjects")?
+        {
+            return Err(Error::InvalidRepository(
+                "cannot delete objects in a precious-objects repository".into(),
+            ));
+        }
         let report = self.fsck(&FsckOptions {
             max_object_size: options.pack.max_object_size,
             max_objects: options.max_objects,

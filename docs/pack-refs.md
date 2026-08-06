@@ -36,6 +36,11 @@ A cleanup failure can leave a redundant loose ref, but the packed value is
 already durable. `prune: false` publishes the packed values and retains all
 loose copies.
 
+`dry_run` performs selection, existing-file parsing, object lookup, tag peeling,
+and count checks without acquiring locks or publishing. `packed()` lists the
+refs which would be selected and `pruned` remains zero. Repository GC uses this
+mode for a mutation-free complete preview.
+
 ```console
 cargo run --example pack_refs -- /path/to/repository --all
 cargo run --example pack_refs -- /path/to/repository \

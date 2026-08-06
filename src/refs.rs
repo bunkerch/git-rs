@@ -1021,6 +1021,56 @@ impl Repository {
         )
     }
 
+    /// Expire the union of total-age and unreachable-age reflog policies in
+    /// one rewrite, so entries matching both policies are removed once.
+    ///
+    /// # Errors
+    /// Returns an error for malformed references/objects, graph or storage
+    /// failures, exceeded limits, or lock contention.
+    pub fn expire_reflog_with_policy(
+        &self,
+        name: &str,
+        total_before: Option<i64>,
+        unreachable_before: Option<i64>,
+        graph: &crate::GraphOptions,
+        options: &ReflogRewriteOptions,
+    ) -> Result<ReflogRewriteResult> {
+        let reachability = unreachable_before
+            .map(|_| self.reflog_reachable_commits(name, graph, options))
+            .transpose()?;
+        self.rewrite_reflog(
+            name,
+            options,
+            |_, _, entry| {
+                if total_before.is_some_and(|expiry| entry.committer.timestamp() < expiry) {
+                    return Ok(true);
+                }
+                let Some(expiry) = unreachable_before else {
+                    return Ok(false);
+                };
+                if entry.committer.timestamp() >= expiry {
+                    return Ok(false);
+                }
+                let Some((reachable, expire_all)) = reachability.as_ref() else {
+                    return Ok(false);
+                };
+                if *expire_all {
+                    return Ok(true);
+                }
+                Ok(self.reflog_commit_is_unreachable(
+                    entry.old,
+                    reachable,
+                    graph.max_object_size,
+                )? || self.reflog_commit_is_unreachable(
+                    entry.new,
+                    reachable,
+                    graph.max_object_size,
+                )?)
+            },
+            None,
+        )
+    }
+
     /// Remove entries whose old or new commit has an incomplete object closure.
     ///
     /// Null endpoints are valid. Non-commit endpoints, missing/corrupt parents,
