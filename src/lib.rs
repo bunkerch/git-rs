@@ -148,8 +148,9 @@ pub use sparse_checkout::{SparseCheckoutOptions, SparseCheckoutReport, SparseChe
 pub use stash::{StashApplyOptions, StashApplyResult, StashEntry, StashPushOptions};
 pub use status::{ChangeKind, RepositoryStatus, StatusEntry, StatusOptions};
 pub use submodule::{
-    Submodule, SubmoduleAddOptions, SubmoduleAddReport, SubmoduleOptions, SubmoduleStatus,
-    SubmoduleStatusKind, SubmoduleUpdateOptions, SubmoduleUpdateReport,
+    Submodule, SubmoduleAddOptions, SubmoduleAddReport, SubmoduleDeinitOptions,
+    SubmoduleDeinitReport, SubmoduleOptions, SubmoduleStatus, SubmoduleStatusKind,
+    SubmoduleUpdateOptions, SubmoduleUpdateReport,
 };
 pub use tag::{AnnotatedTag, PeeledObject, TagBuilder};
 pub use tree::{EntryMode, Tree, TreeEntry};

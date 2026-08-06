@@ -38,6 +38,17 @@ branch, records local activation, and stages both `.gitmodules` and the
 gitlink. This absorbed layout keeps object history outside the disposable
 worktree and is directly usable by native Git.
 
+`deinit_submodule` refuses tracked, staged, or untracked nested changes unless
+forced, clears the selected worktree with explicit entry/depth bounds, removes
+its local registration, unsets `core.worktree`, and preserves the absorbed
+object store. A later initialized update reconnects and repopulates that same
+store. Legacy embedded `.git` directories are absorbed before clearing.
+
+`sync_submodules` updates only initialized modules. It copies current
+`.gitmodules` URLs into superproject config and the nested default remote,
+including Git-compatible resolution of relative filesystem, URL, and SCP-style
+locations.
+
 ```rust
 use git_rs::{Repository, SubmoduleUpdateOptions, UploadPackTransport};
 
@@ -56,6 +67,8 @@ spawning Git:
 
 ```console
 cargo run --example submodule_add_local -- superproject child deps/child
+cargo run --example submodule_manage -- superproject deinit deps/child
+cargo run --example submodule_manage -- superproject sync
 ```
 
 The update rejects conflicted or non-gitlink index entries, corrupt existing
