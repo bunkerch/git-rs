@@ -263,6 +263,16 @@ impl Repository {
         max_size: usize,
         ignore_missing_roots: bool,
     ) -> Result<Vec<ObjectId>> {
+        self.reachable_objects_bounded(roots, max_size, ignore_missing_roots, usize::MAX)
+    }
+
+    pub(crate) fn reachable_objects_bounded(
+        &self,
+        roots: &[ObjectId],
+        max_size: usize,
+        ignore_missing_roots: bool,
+        max_objects: usize,
+    ) -> Result<Vec<ObjectId>> {
         let mut seen = BTreeSet::new();
         let mut ordered = Vec::new();
         let mut stack = roots.iter().rev().copied().collect::<Vec<_>>();
@@ -276,6 +286,11 @@ impl Repository {
                 Err(error) => return Err(error),
             };
             seen.insert(id);
+            if seen.len() > max_objects {
+                return Err(Error::InvalidObject(
+                    "reachable object traversal exceeds limit".into(),
+                ));
+            }
             ordered.push(id);
             match object.kind() {
                 ObjectKind::Commit => {

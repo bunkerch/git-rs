@@ -2,6 +2,7 @@
 
 pub mod archive;
 pub mod branch;
+pub mod bundle;
 pub mod clean;
 pub mod commit;
 pub mod commit_operation;
@@ -44,6 +45,10 @@ pub mod worktree;
 
 pub use archive::{ArchiveFormat, ArchiveOptions};
 pub use branch::{DeleteBranchOptions, RenameBranchOptions};
+pub use bundle::{
+    BundleCreateOptions, BundleParseOptions, BundlePrerequisite, BundleReference, BundleVersion,
+    GitBundle,
+};
 pub use clean::{CleanEntry, CleanIgnoredMode, CleanOptions};
 pub use commit::{Commit, CommitBuilder, ExtraHeader, Signature};
 pub use commit_operation::CommitOptions;
