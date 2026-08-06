@@ -47,7 +47,28 @@ impl Repository {
         committer: &Signature,
         options: &CommitOptions,
     ) -> Result<ObjectId> {
-        self.ensure_commit_state_is_safe()?;
+        self.commit_index_inner(message, author, committer, options, false)
+    }
+
+    pub(crate) fn commit_index_during_am(
+        &self,
+        message: &[u8],
+        author: &Signature,
+        committer: &Signature,
+        options: &CommitOptions,
+    ) -> Result<ObjectId> {
+        self.commit_index_inner(message, author, committer, options, true)
+    }
+
+    fn commit_index_inner(
+        &self,
+        message: &[u8],
+        author: &Signature,
+        committer: &Signature,
+        options: &CommitOptions,
+        during_am: bool,
+    ) -> Result<ObjectId> {
+        self.ensure_commit_state_is_safe(during_am)?;
         let head = self.read_reference("HEAD")?;
         let expected_head = head.target().clone();
         let current = match head.target() {
@@ -123,7 +144,7 @@ impl Repository {
         Ok(commit)
     }
 
-    fn ensure_commit_state_is_safe(&self) -> Result<()> {
+    fn ensure_commit_state_is_safe(&self, during_am: bool) -> Result<()> {
         for name in ["CHERRY_PICK_HEAD", "REVERT_HEAD"] {
             if self.filesystem().exists(&self.git_path(name))? {
                 return Err(Error::InvalidRepository(format!(
@@ -132,6 +153,9 @@ impl Repository {
             }
         }
         for name in ["rebase-merge", "rebase-apply"] {
+            if during_am && name == "rebase-apply" {
+                continue;
+            }
             if self.filesystem().exists(&self.git_path(name))? {
                 return Err(Error::InvalidRepository(
                     "a rebase is active; use continue_rebase".into(),

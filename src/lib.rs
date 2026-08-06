@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+pub mod am;
 pub mod apply;
 pub mod archive;
 pub mod bisect;
@@ -55,6 +56,7 @@ pub mod tree;
 pub mod upload_pack;
 pub mod worktree;
 
+pub use am::{AmOptions, AmProgress, AmState};
 pub use apply::{ApplyOptions, ApplyReport};
 pub use archive::{ArchiveFormat, ArchiveOptions};
 pub use bisect::{BisectMark, BisectOptions, BisectOutcome, BisectState};
