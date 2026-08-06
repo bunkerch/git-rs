@@ -42,6 +42,8 @@ Worktree staging and index-to-tree writing are documented in
 [`docs/worktree.md`](docs/worktree.md).
 Path-level index/worktree restoration is documented in
 [`docs/restore.md`](docs/restore.md).
+Safe discovery and removal of untracked worktree content is documented in
+[`docs/clean.md`](docs/clean.md).
 Staged, unstaged, unmerged, and untracked reporting is documented in
 [`docs/status.md`](docs/status.md).
 Ref-moving operations and their logs are documented in

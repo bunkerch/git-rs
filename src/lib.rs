@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 pub mod branch;
+pub mod clean;
 pub mod commit;
 pub mod commit_operation;
 pub mod config;
@@ -34,6 +35,7 @@ pub mod upload_pack;
 pub mod worktree;
 
 pub use branch::{DeleteBranchOptions, RenameBranchOptions};
+pub use clean::{CleanEntry, CleanIgnoredMode, CleanOptions};
 pub use commit::{Commit, CommitBuilder, ExtraHeader, Signature};
 pub use commit_operation::CommitOptions;
 pub use config::{Config, ConfigEntry};

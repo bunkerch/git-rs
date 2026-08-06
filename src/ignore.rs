@@ -79,9 +79,6 @@ impl IgnoreMatcher {
 
 impl IgnoreRule {
     fn matches(&self, path: &[u8], is_directory: bool) -> bool {
-        if self.directory_only && !is_directory {
-            return false;
-        }
         let relative = if self.base.is_empty() {
             path
         } else if path.starts_with(&self.base) && path.get(self.base.len()) == Some(&b'/') {
@@ -89,6 +86,22 @@ impl IgnoreRule {
         } else {
             return false;
         };
+        if self.directory_only {
+            let components = relative.split(|byte| *byte == b'/').collect::<Vec<_>>();
+            let directory_components = components.len().saturating_sub(usize::from(!is_directory));
+            if self.basename_only {
+                return components
+                    .iter()
+                    .take(directory_components)
+                    .any(|component| wildmatch(&self.pattern, component));
+            }
+            return relative
+                .iter()
+                .enumerate()
+                .filter_map(|(index, byte)| (*byte == b'/').then_some(&relative[..index]))
+                .chain(is_directory.then_some(relative))
+                .any(|directory| wildmatch(&self.pattern, directory));
+        }
         if self.basename_only {
             relative
                 .split(|byte| *byte == b'/')
@@ -415,5 +428,16 @@ mod tests {
         matcher.add_patterns(b"generated", b"!keep.tmp\n").unwrap();
         assert!(matcher.is_ignored(b"generated/drop.tmp", false));
         assert!(!matcher.is_ignored(b"generated/keep.tmp", false));
+    }
+
+    #[test]
+    fn directory_only_rules_apply_to_all_descendants() {
+        let mut matcher = IgnoreMatcher::default();
+        matcher.add_patterns(b"", b"build/\nfoo/bar/\n").unwrap();
+        assert!(matcher.is_ignored(b"build", true));
+        assert!(matcher.is_ignored(b"build/output.o", false));
+        assert!(matcher.is_ignored(b"nested/build/output.o", false));
+        assert!(matcher.is_ignored(b"foo/bar/result", false));
+        assert!(!matcher.is_ignored(b"foo/other/result", false));
     }
 }
