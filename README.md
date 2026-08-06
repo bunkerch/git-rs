@@ -64,6 +64,8 @@ DWIM revision names, abbreviations, ancestry, peeling, and tree paths are
 documented in [`docs/revisions.md`](docs/revisions.md).
 Named remotes and typed fetch/push refspecs are documented in
 [`docs/remotes.md`](docs/remotes.md).
+Git-compatible stash topology, application, conflicts, untracked capture, and
+reflog management are documented in [`docs/stash.md`](docs/stash.md).
 
 To create a host-backed repository with the included example:
 

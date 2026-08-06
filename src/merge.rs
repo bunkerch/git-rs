@@ -157,7 +157,7 @@ impl Repository {
             ..MergeOptions::default()
         };
         let merged = self.merge_trees(base, ours_commit.tree(), theirs, target, &merge_options)?;
-        let (tree, paths) = self.materialize_merge(&merged, options.max_object_size)?;
+        let (tree, paths) = self.materialize_merge(&merged, options.max_object_size, false)?;
         let message = replay_message(kind, target, &picked, options.mainline);
         if !paths.is_empty() {
             self.write_atomic(Path::new("ORIG_HEAD"), format!("{ours}\n").as_bytes())?;
@@ -322,7 +322,8 @@ impl Repository {
             .read_commit(target, options.graph.max_object_size)?
             .tree();
         let merged = self.merge_trees(base_tree, ours_tree, theirs_tree, target, options)?;
-        let (tree, paths) = self.materialize_merge(&merged, options.graph.max_object_size)?;
+        let (tree, paths) =
+            self.materialize_merge(&merged, options.graph.max_object_size, false)?;
         self.write_atomic(Path::new("ORIG_HEAD"), format!("{ours}\n").as_bytes())?;
         self.write_merge_state(target, &options.message)?;
         if !paths.is_empty() {
@@ -542,10 +543,59 @@ impl Repository {
             .collect::<BTreeMap<_, _>>())
     }
 
+    pub(crate) fn merge_tree_states(
+        &self,
+        base: ObjectId,
+        ours: ObjectId,
+        theirs: ObjectId,
+        target: ObjectId,
+        max_object_size: usize,
+        force_checkout: bool,
+    ) -> Result<(ObjectId, Vec<Vec<u8>>)> {
+        let options = MergeOptions {
+            graph: GraphOptions {
+                max_object_size,
+                ..GraphOptions::default()
+            },
+            ..MergeOptions::default()
+        };
+        let merged = self.merge_trees(base, ours, theirs, target, &options)?;
+        self.materialize_merge(&merged, max_object_size, force_checkout)
+    }
+
+    pub(crate) fn merge_tree_states_clean(
+        &self,
+        base: ObjectId,
+        ours: ObjectId,
+        theirs: ObjectId,
+        target: ObjectId,
+        max_object_size: usize,
+    ) -> Result<ObjectId> {
+        let options = MergeOptions {
+            graph: GraphOptions {
+                max_object_size,
+                ..GraphOptions::default()
+            },
+            ..MergeOptions::default()
+        };
+        let merged = self.merge_trees(base, ours, theirs, target, &options)?;
+        if !merged.conflicts.is_empty() {
+            return Err(Error::CheckoutConflict(
+                merged
+                    .conflicts
+                    .iter()
+                    .map(|conflict| String::from_utf8_lossy(&conflict.path).into_owned())
+                    .collect(),
+            ));
+        }
+        self.write_merge_result_tree(&merged)
+    }
+
     fn materialize_merge(
         &self,
         merged: &TreeMerge,
         max_object_size: usize,
+        force_checkout: bool,
     ) -> Result<(ObjectId, Vec<Vec<u8>>)> {
         let mut material = merged.resolved.clone();
         for conflict in &merged.conflicts {
@@ -555,7 +605,7 @@ impl Repository {
         self.checkout_tree(
             material_tree,
             &CheckoutOptions {
-                force: false,
+                force: force_checkout,
                 max_object_size,
             },
         )?;
