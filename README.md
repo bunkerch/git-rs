@@ -23,6 +23,8 @@ Reference and branch APIs are covered in
 [`docs/references.md`](docs/references.md).
 Loose objects are documented in [`docs/objects.md`](docs/objects.md), and packed
 object reads in [`docs/packfiles.md`](docs/packfiles.md).
+Verified pack consolidation and safe pruning are documented in
+[`docs/repack.md`](docs/repack.md).
 Full object and connectivity verification is documented in
 [`docs/fsck.md`](docs/fsck.md).
 Wire-format primitives are documented in

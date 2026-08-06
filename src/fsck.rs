@@ -36,11 +36,17 @@ pub struct FsckReport {
     pub trees: usize,
     pub commits: usize,
     pub tags: usize,
+    reachable_objects: Vec<ObjectId>,
     unreachable: Vec<ObjectId>,
     dangling: Vec<ObjectId>,
 }
 
 impl FsckReport {
+    #[must_use]
+    pub fn reachable_objects(&self) -> &[ObjectId] {
+        &self.reachable_objects
+    }
+
     #[must_use]
     pub fn unreachable(&self) -> &[ObjectId] {
         &self.unreachable
@@ -156,6 +162,7 @@ impl Repository {
             trees: counts[1],
             commits: counts[2],
             tags: counts[3],
+            reachable_objects: reachable.iter().copied().collect(),
             unreachable,
             dangling,
         })

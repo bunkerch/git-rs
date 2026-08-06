@@ -24,6 +24,7 @@ pub mod receive_pack;
 pub mod refs;
 pub mod refspec;
 pub mod remote;
+pub mod repack;
 pub mod repository;
 pub mod restore;
 pub mod revision;
@@ -74,6 +75,7 @@ pub use refs::{
 };
 pub use refspec::{RefSpec, RefSpecKind};
 pub use remote::{Remote, RemoveRemoteResult};
+pub use repack::{RepackOptions, RepackResult};
 pub use repository::{InitOptions, Repository};
 pub use restore::{RestoreOptions, RestoreTarget};
 pub use revision::{GraphOptions, Revision, RevisionWalkOptions};
