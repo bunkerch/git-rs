@@ -472,6 +472,8 @@ fn parse_patch(data: &[u8], options: &ApplyOptions) -> Result<Vec<FilePatch>> {
                     if current.starts_with(b"diff --git ") || current.starts_with(b"@@ ") {
                         break;
                     }
+                    let (old_lines, new_lines) = hunk_line_counts(&hunk);
+                    let complete = old_lines == hunk.old_count && new_lines == hunk.new_count;
                     if current.starts_with(b"\\ No newline at end of file") {
                         let previous = hunk.lines.last_mut().ok_or_else(|| {
                             Error::InvalidRepository("orphan no-newline marker".into())
@@ -479,6 +481,8 @@ fn parse_patch(data: &[u8], options: &ApplyOptions) -> Result<Vec<FilePatch>> {
                         if previous.data.last() == Some(&b'\n') {
                             previous.data.pop();
                         }
+                    } else if complete {
+                        break;
                     } else if matches!(current.first(), Some(b' ' | b'+' | b'-')) {
                         hunk.lines.push(PatchLine {
                             kind: current[0],
@@ -606,13 +610,19 @@ fn parse_range(value: &str) -> Result<(usize, usize)> {
 }
 
 fn validate_hunk_counts(hunk: &Hunk) -> Result<()> {
-    let old = hunk.lines.iter().filter(|line| line.kind != b'+').count();
-    let new = hunk.lines.iter().filter(|line| line.kind != b'-').count();
+    let (old, new) = hunk_line_counts(hunk);
     if old != hunk.old_count || new != hunk.new_count {
         return invalid_patch("hunk line counts do not match header");
     }
     let _ = hunk.new_start;
     Ok(())
+}
+
+fn hunk_line_counts(hunk: &Hunk) -> (usize, usize) {
+    (
+        hunk.lines.iter().filter(|line| line.kind != b'+').count(),
+        hunk.lines.iter().filter(|line| line.kind != b'-').count(),
+    )
 }
 
 fn reverse_patch(patch: &mut FilePatch) {

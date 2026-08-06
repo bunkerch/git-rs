@@ -16,6 +16,7 @@ pub mod describe;
 pub mod diff;
 pub mod error;
 pub mod fetch;
+pub mod format_patch;
 pub mod fs;
 pub mod fsck;
 pub mod gc;
@@ -78,6 +79,7 @@ pub use fetch::{
     CloneOptions, FetchOptions, FetchResult, RemoteAdvertisement, RemoteRef, RepositoryTransport,
     UploadPackTransport,
 };
+pub use format_patch::{FormatPatch, FormatPatchNumbering, FormatPatchOptions};
 pub use fs::{FileStat, FileSystem, HostFileSystem, MemoryFileSystem, Metadata};
 pub use fsck::{FsckOptions, FsckReport};
 pub use gc::{GcOptions, GcReport};

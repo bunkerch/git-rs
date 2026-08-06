@@ -90,6 +90,8 @@ Typed tree/index differences and unified patches are documented in
 [`docs/diff.md`](docs/diff.md).
 Bounded validation and application of unified patches is documented in
 [`docs/apply.md`](docs/apply.md).
+Oldest-first Git-compatible email patch-series generation is documented in
+[`docs/format-patch.md`](docs/format-patch.md).
 Lightweight and annotated tag operations are documented in
 [`docs/tags.md`](docs/tags.md).
 Bounded nearest-tag/reference naming is documented in
