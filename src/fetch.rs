@@ -9,6 +9,7 @@ use crate::{
     Capability, CheckoutOptions, Error, FileSystem, GraphOptions, IncomingPackOptions, InitOptions,
     ObjectId, ObjectKind, PktLine, PreviousValue, RefSpec, ReferenceEdit, ReferenceName,
     ReferenceTarget, Remote, Repository, Result, Sideband, UploadPackOptions, UploadPackRequest,
+    UploadPackV2Limits, UploadPackV2Request,
 };
 
 /// Byte exchange required from an upload-pack transport.
@@ -49,6 +50,54 @@ impl UploadPackTransport for RepositoryTransport<'_> {
     fn request(&mut self, request: &[u8]) -> Result<Vec<u8>> {
         let request = UploadPackRequest::parse(request)?;
         self.repository.respond_upload_pack(&request, &self.options)
+    }
+}
+
+/// Byte exchange required from a protocol-v2 upload-pack transport.
+pub trait UploadPackV2Transport {
+    /// Obtain the protocol-v2 capability advertisement.
+    ///
+    /// # Errors
+    /// Returns transport, remote, or framing errors.
+    fn advertise_v2(&mut self) -> Result<Vec<u8>>;
+    /// Send one complete protocol-v2 command and receive its full response.
+    ///
+    /// # Errors
+    /// Returns transport, remote service, or framing errors.
+    fn request_v2(&mut self, request: &[u8]) -> Result<Vec<u8>>;
+}
+
+/// In-process protocol-v2 transport for repository embedding and tests.
+pub struct RepositoryV2Transport<'a> {
+    repository: &'a Repository,
+    options: UploadPackOptions,
+    limits: UploadPackV2Limits,
+}
+
+impl<'a> RepositoryV2Transport<'a> {
+    #[must_use]
+    pub const fn new(
+        repository: &'a Repository,
+        options: UploadPackOptions,
+        limits: UploadPackV2Limits,
+    ) -> Self {
+        Self {
+            repository,
+            options,
+            limits,
+        }
+    }
+}
+
+impl UploadPackV2Transport for RepositoryV2Transport<'_> {
+    fn advertise_v2(&mut self) -> Result<Vec<u8>> {
+        self.repository.advertise_upload_pack_v2()
+    }
+
+    fn request_v2(&mut self, request: &[u8]) -> Result<Vec<u8>> {
+        let request = UploadPackV2Request::parse(request, &self.limits)?;
+        self.repository
+            .respond_upload_pack_v2(&request, &self.options, &self.limits)
     }
 }
 
@@ -264,6 +313,29 @@ impl Repository {
         self.fetch_advertisement(transport, advertisement, options, false, None)
     }
 
+    /// Fetch all advertised branches and optional tags over Git protocol v2.
+    ///
+    /// # Errors
+    /// Returns an error for capability, `ls-refs`, transport, pack, shallow,
+    /// reference transaction, or resource-limit failures.
+    pub fn fetch_v2<T: UploadPackV2Transport>(
+        &self,
+        transport: &mut T,
+        options: &FetchOptions,
+    ) -> Result<FetchResult> {
+        let capabilities = parse_v2_capabilities(&transport.advertise_v2()?)?;
+        let advertisement = discover_refs_v2(transport, &capabilities)?;
+        self.fetch_advertisement_with(
+            advertisement,
+            options,
+            false,
+            None,
+            |repository, selected, options, _| {
+                exchange_fetch_v2(repository, transport, selected, options, &capabilities)
+            },
+        )
+    }
+
     /// Fetch using one named remote's configured positive and negative
     /// refspecs. The caller supplies the transport corresponding to its URL.
     ///
@@ -281,6 +353,33 @@ impl Repository {
         let mut configured = options.clone();
         name.clone_into(&mut configured.remote_name);
         self.fetch_advertisement(transport, advertisement, &configured, false, Some(&remote))
+    }
+
+    /// Fetch one configured remote over Git protocol v2.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::fetch_v2`] plus malformed remote
+    /// configuration or refspec failures.
+    pub fn fetch_remote_v2<T: UploadPackV2Transport>(
+        &self,
+        name: &str,
+        transport: &mut T,
+        options: &FetchOptions,
+    ) -> Result<FetchResult> {
+        let remote = self.remote(name)?;
+        let capabilities = parse_v2_capabilities(&transport.advertise_v2()?)?;
+        let advertisement = discover_refs_v2(transport, &capabilities)?;
+        let mut configured = options.clone();
+        name.clone_into(&mut configured.remote_name);
+        self.fetch_advertisement_with(
+            advertisement,
+            &configured,
+            false,
+            Some(&remote),
+            |repository, selected, options, _| {
+                exchange_fetch_v2(repository, transport, selected, options, &capabilities)
+            },
+        )
     }
 
     /// Initialize, fetch, configure, and optionally check out a clone.
@@ -312,9 +411,81 @@ impl Repository {
     ) -> Result<(Self, FetchResult)> {
         validate_remote_name(&options.remote_name)?;
         let advertisement = RemoteAdvertisement::parse(&transport.advertise()?)?;
+        Self::clone_from_advertisement(
+            filesystem,
+            path,
+            advertisement,
+            options,
+            |repository, advertisement, fetch_options, bare| {
+                repository.fetch_advertisement(transport, advertisement, fetch_options, bare, None)
+            },
+        )
+    }
+
+    /// Initialize, fetch over protocol v2, configure, and optionally check out.
+    ///
+    /// # Errors
+    /// Returns capability, `ls-refs`, transport, initialization, pack,
+    /// reference, checkout, shallow, or resource-limit errors.
+    pub fn clone_from_v2<F: FileSystem, T: UploadPackV2Transport>(
+        filesystem: F,
+        path: impl AsRef<Path>,
+        transport: &mut T,
+        options: &CloneOptions,
+    ) -> Result<(Self, FetchResult)> {
+        Self::clone_from_shared_v2(Arc::new(filesystem), path, transport, options)
+    }
+
+    /// Protocol-v2 clone using a shared dynamically dispatched storage adapter.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::clone_from_v2`].
+    pub fn clone_from_shared_v2<T: UploadPackV2Transport>(
+        filesystem: Arc<dyn FileSystem>,
+        path: impl AsRef<Path>,
+        transport: &mut T,
+        options: &CloneOptions,
+    ) -> Result<(Self, FetchResult)> {
+        validate_remote_name(&options.remote_name)?;
+        let capabilities = parse_v2_capabilities(&transport.advertise_v2()?)?;
+        let advertisement = discover_refs_v2(transport, &capabilities)?;
+        Self::clone_from_advertisement(
+            filesystem,
+            path,
+            advertisement,
+            options,
+            |repository, advertisement, fetch_options, bare| {
+                repository.fetch_advertisement_with(
+                    advertisement,
+                    fetch_options,
+                    bare,
+                    None,
+                    |repository, selected, options, _| {
+                        exchange_fetch_v2(repository, transport, selected, options, &capabilities)
+                    },
+                )
+            },
+        )
+    }
+
+    fn clone_from_advertisement<E>(
+        filesystem: Arc<dyn FileSystem>,
+        path: impl AsRef<Path>,
+        advertisement: RemoteAdvertisement,
+        options: &CloneOptions,
+        fetch: E,
+    ) -> Result<(Self, FetchResult)>
+    where
+        E: FnOnce(&Repository, RemoteAdvertisement, &FetchOptions, bool) -> Result<FetchResult>,
+    {
         let default = advertisement.default_branch();
         let initial_branch = default
             .and_then(|reference| reference.name.strip_prefix("refs/heads/"))
+            .or_else(|| {
+                advertisement
+                    .head_target()
+                    .and_then(|target| target.strip_prefix("refs/heads/"))
+            })
             .unwrap_or("main")
             .to_owned();
         let repository = Self::init_shared(
@@ -325,8 +496,8 @@ impl Repository {
                 initial_branch: initial_branch.clone(),
             },
         )?;
-        let result = repository.fetch_advertisement(
-            transport,
+        let result = fetch(
+            &repository,
             advertisement,
             &FetchOptions {
                 remote_name: options.remote_name.clone(),
@@ -339,7 +510,6 @@ impl Repository {
                 max_shallow_commits: options.max_shallow_commits,
             },
             options.bare,
-            None,
         )?;
         repository.write_clone_config(options, &initial_branch)?;
         if let Some(remote_head) = result.advertisement.default_branch() {
@@ -369,6 +539,38 @@ impl Repository {
         bare_mapping: bool,
         remote: Option<&Remote>,
     ) -> Result<FetchResult> {
+        self.fetch_advertisement_with(
+            advertisement,
+            options,
+            bare_mapping,
+            remote,
+            |repository, selected, options, advertisement| {
+                let request = repository.build_fetch_request(selected, options, advertisement)?;
+                let response = transport.request(&request)?;
+                parse_fetch_response(
+                    &response,
+                    options.depth.is_some() || options.deepen.is_some(),
+                )
+            },
+        )
+    }
+
+    fn fetch_advertisement_with<E>(
+        &self,
+        advertisement: RemoteAdvertisement,
+        options: &FetchOptions,
+        bare_mapping: bool,
+        remote: Option<&Remote>,
+        exchange: E,
+    ) -> Result<FetchResult>
+    where
+        E: FnOnce(
+            &Repository,
+            &[&RemoteRef],
+            &FetchOptions,
+            &RemoteAdvertisement,
+        ) -> Result<ParsedFetchResponse>,
+    {
         validate_remote_name(&options.remote_name)?;
         validate_sha1_advertisement(&advertisement)?;
         let selected = advertisement
@@ -399,12 +601,7 @@ impl Repository {
                 })?,
             });
         }
-        let request = self.build_fetch_request(&selected, options, &advertisement)?;
-        let response = transport.request(&request)?;
-        let parsed = parse_fetch_response(
-            &response,
-            options.depth.is_some() || options.deepen.is_some(),
-        )?;
+        let parsed = exchange(self, &selected, options, &advertisement)?;
         let validated = self.validate_incoming_pack(
             &parsed.pack,
             &IncomingPackOptions {
@@ -676,6 +873,369 @@ struct ParsedFetchResponse {
     unshallow: BTreeSet<ObjectId>,
 }
 
+#[derive(Clone, Debug)]
+struct V2Capabilities {
+    shallow: bool,
+    object_format: bool,
+}
+
+fn parse_v2_capabilities(input: &[u8]) -> Result<V2Capabilities> {
+    let packets = decode_all_packets(input)?;
+    if packets.first() != Some(&PktLine::Data(b"version 2\n".to_vec()))
+        || packets.last() != Some(&PktLine::Flush)
+    {
+        return protocol_error("invalid protocol v2 capability advertisement");
+    }
+    let mut object_format = None;
+    let mut fetch = None;
+    for packet in &packets[1..packets.len() - 1] {
+        let PktLine::Data(line) = packet else {
+            return protocol_error("control packet in v2 capability advertisement");
+        };
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        if let Some(value) = line.strip_prefix(b"object-format=") {
+            if object_format.replace(value).is_some() {
+                return protocol_error("duplicate v2 object-format capability");
+            }
+        } else if (line == b"fetch" || line.starts_with(b"fetch="))
+            && fetch
+                .replace(line.strip_prefix(b"fetch=").unwrap_or_default())
+                .is_some()
+        {
+            return protocol_error("duplicate v2 fetch capability");
+        }
+    }
+    if object_format.is_some_and(|format| format != b"sha1") {
+        return protocol_error("protocol v2 remote does not use SHA-1");
+    }
+    let fetch =
+        fetch.ok_or_else(|| Error::Protocol("remote does not advertise v2 fetch".into()))?;
+    Ok(V2Capabilities {
+        shallow: fetch
+            .split(|byte| *byte == b' ')
+            .any(|value| value == b"shallow"),
+        object_format: object_format.is_some(),
+    })
+}
+
+fn discover_refs_v2<T: UploadPackV2Transport>(
+    transport: &mut T,
+    capabilities: &V2Capabilities,
+) -> Result<RemoteAdvertisement> {
+    let mut request = Vec::new();
+    append_packet(&mut request, b"command=ls-refs\n")?;
+    if capabilities.object_format {
+        append_packet(&mut request, b"object-format=sha1\n")?;
+    }
+    request.extend(PktLine::Delimiter.encode()?);
+    for argument in [
+        b"symrefs\n".as_slice(),
+        b"peel\n",
+        b"unborn\n",
+        b"ref-prefix HEAD\n",
+        b"ref-prefix refs/heads/\n",
+        b"ref-prefix refs/tags/\n",
+    ] {
+        append_packet(&mut request, argument)?;
+    }
+    request.extend(PktLine::Flush.encode()?);
+    parse_ls_refs_v2(&transport.request_v2(&request)?, capabilities)
+}
+
+fn parse_ls_refs_v2(input: &[u8], capabilities: &V2Capabilities) -> Result<RemoteAdvertisement> {
+    let packets = decode_all_packets(input)?;
+    if packets.last() != Some(&PktLine::Flush) {
+        return protocol_error("ls-refs response has no terminating flush");
+    }
+    let mut refs = Vec::new();
+    let mut names = BTreeSet::new();
+    let mut head_target = None;
+    for packet in &packets[..packets.len() - 1] {
+        let PktLine::Data(line) = packet else {
+            return protocol_error("control packet in ls-refs response");
+        };
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        if let Some(rest) = line.strip_prefix(b"unborn ") {
+            let (name, attributes) = split_v2_ref_fields(rest)?;
+            validate_v2_ref_name(name)?;
+            validate_v2_ref_attributes(attributes)?;
+            if !names.insert(name.to_vec()) {
+                return protocol_error("duplicate ls-refs name");
+            }
+            if name == b"HEAD" {
+                head_target = parse_symref_target(attributes)?;
+            }
+            continue;
+        }
+        if line.len() < ObjectId::HEX_LENGTH + 2 || line[ObjectId::HEX_LENGTH] != b' ' {
+            return protocol_error("malformed ls-refs line");
+        }
+        let id = parse_wire_id(&line[..ObjectId::HEX_LENGTH], "ls-refs")?;
+        let (name, attributes) = split_v2_ref_fields(&line[ObjectId::HEX_LENGTH + 1..])?;
+        validate_v2_ref_name(name)?;
+        if !names.insert(name.to_vec()) {
+            return protocol_error("duplicate ls-refs name");
+        }
+        validate_v2_ref_attributes(attributes)?;
+        if name == b"HEAD" {
+            head_target = parse_symref_target(attributes)?;
+        }
+        refs.push(RemoteRef {
+            name: std::str::from_utf8(name)
+                .map_err(|_| Error::Protocol("ls-refs name is not UTF-8".into()))?
+                .to_owned(),
+            id,
+        });
+    }
+    let mut effective = b"side-band-64k ofs-delta object-format=sha1".to_vec();
+    if capabilities.shallow {
+        effective.extend_from_slice(b" shallow deepen-relative");
+    }
+    Ok(RemoteAdvertisement {
+        refs,
+        capabilities: Capability::parse_list(&effective)?,
+        head_target,
+    })
+}
+
+fn split_v2_ref_fields(value: &[u8]) -> Result<(&[u8], &[u8])> {
+    let split = value
+        .iter()
+        .position(|byte| *byte == b' ')
+        .unwrap_or(value.len());
+    let name = &value[..split];
+    if name.is_empty() {
+        return protocol_error("empty ls-refs name");
+    }
+    Ok((name, value.get(split + 1..).unwrap_or_default()))
+}
+
+fn validate_v2_ref_name(name: &[u8]) -> Result<()> {
+    let name = std::str::from_utf8(name)
+        .map_err(|_| Error::Protocol("ls-refs name is not UTF-8".into()))?;
+    if name != "HEAD" {
+        ReferenceName::new(name.to_owned())?;
+    }
+    Ok(())
+}
+
+fn parse_symref_target(attributes: &[u8]) -> Result<Option<String>> {
+    for attribute in attributes.split(|byte| *byte == b' ') {
+        if let Some(target) = attribute.strip_prefix(b"symref-target:") {
+            let target = std::str::from_utf8(target)
+                .map_err(|_| Error::Protocol("symref target is not UTF-8".into()))?;
+            ReferenceName::new(target.to_owned())?;
+            return Ok(Some(target.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+fn validate_v2_ref_attributes(attributes: &[u8]) -> Result<()> {
+    for attribute in attributes
+        .split(|byte| *byte == b' ')
+        .filter(|value| !value.is_empty())
+    {
+        if let Some(id) = attribute.strip_prefix(b"peeled:") {
+            parse_wire_id(id, "peeled")?;
+        } else if let Some(target) = attribute.strip_prefix(b"symref-target:") {
+            let target = std::str::from_utf8(target)
+                .map_err(|_| Error::Protocol("symref target is not UTF-8".into()))?;
+            ReferenceName::new(target.to_owned())?;
+        } else {
+            return protocol_error("unsupported ls-refs attribute");
+        }
+    }
+    Ok(())
+}
+
+fn exchange_fetch_v2<T: UploadPackV2Transport>(
+    repository: &Repository,
+    transport: &mut T,
+    selected: &[&RemoteRef],
+    options: &FetchOptions,
+    capabilities: &V2Capabilities,
+) -> Result<ParsedFetchResponse> {
+    let request = build_fetch_request_v2(repository, selected, options, capabilities)?;
+    parse_fetch_response_v2(&transport.request_v2(&request)?)
+}
+
+fn build_fetch_request_v2(
+    repository: &Repository,
+    selected: &[&RemoteRef],
+    options: &FetchOptions,
+    capabilities: &V2Capabilities,
+) -> Result<Vec<u8>> {
+    validate_depth_options(options)?;
+    let shallow = repository.shallow_commits(&crate::ShallowOptions {
+        max_commits: options.max_shallow_commits,
+        max_object_size: options.max_object_size,
+    })?;
+    if (options.depth.is_some() || options.deepen.is_some() || !shallow.is_empty())
+        && !capabilities.shallow
+    {
+        return protocol_error("protocol v2 remote does not support shallow fetches");
+    }
+    let mut request = Vec::new();
+    append_packet(&mut request, b"command=fetch\n")?;
+    if capabilities.object_format {
+        append_packet(&mut request, b"object-format=sha1\n")?;
+    }
+    request.extend(PktLine::Delimiter.encode()?);
+    let mut wants = BTreeSet::new();
+    for reference in selected {
+        if wants.insert(reference.id) {
+            append_packet(&mut request, format!("want {}\n", reference.id).as_bytes())?;
+        }
+    }
+    for argument in [b"thin-pack\n".as_slice(), b"no-progress\n", b"ofs-delta\n"] {
+        append_packet(&mut request, argument)?;
+    }
+    for id in shallow {
+        append_packet(&mut request, format!("shallow {id}\n").as_bytes())?;
+    }
+    if let Some(depth) = options.depth {
+        append_packet(&mut request, format!("deepen {depth}\n").as_bytes())?;
+    }
+    if let Some(deepen) = options.deepen {
+        append_packet(&mut request, format!("deepen {deepen}\n").as_bytes())?;
+        append_packet(&mut request, b"deepen-relative\n")?;
+    }
+    for id in repository.local_have_ids()? {
+        append_packet(&mut request, format!("have {id}\n").as_bytes())?;
+    }
+    append_packet(&mut request, b"done\n")?;
+    request.extend(PktLine::Flush.encode()?);
+    Ok(request)
+}
+
+fn validate_depth_options(options: &FetchOptions) -> Result<()> {
+    if options.depth == Some(0) || options.deepen == Some(0) {
+        return protocol_error("fetch depth must be positive");
+    }
+    if options.depth.is_some() && options.deepen.is_some() {
+        return protocol_error("fetch depth and deepen are mutually exclusive");
+    }
+    Ok(())
+}
+
+fn parse_fetch_response_v2(input: &[u8]) -> Result<ParsedFetchResponse> {
+    let packets = decode_all_packets(input)?;
+    let mut index = 0usize;
+    let mut shallow = BTreeSet::new();
+    let mut unshallow = BTreeSet::new();
+    let mut pack = Vec::new();
+    while index < packets.len() {
+        match &packets[index] {
+            PktLine::Data(header) if header == b"shallow-info\n" => {
+                index += 1;
+                while let Some(PktLine::Data(line)) = packets.get(index) {
+                    parse_shallow_update(line, &mut shallow, &mut unshallow)?;
+                    index += 1;
+                }
+                if packets.get(index) != Some(&PktLine::Delimiter) {
+                    return protocol_error("shallow-info has no delimiter");
+                }
+                index += 1;
+            }
+            PktLine::Data(header) if header == b"acknowledgments\n" => {
+                index += 1;
+                while let Some(PktLine::Data(line)) = packets.get(index) {
+                    if line != b"NAK\n"
+                        && line != b"ready\n"
+                        && !(line.starts_with(b"ACK ") && line.ends_with(b"\n"))
+                    {
+                        return protocol_error("invalid v2 acknowledgment");
+                    }
+                    index += 1;
+                }
+                if packets.get(index) != Some(&PktLine::Delimiter) {
+                    return protocol_error("acknowledgments has no delimiter");
+                }
+                index += 1;
+            }
+            PktLine::Data(header) if header == b"packfile\n" => {
+                index += 1;
+                while let Some(packet) = packets.get(index) {
+                    match packet {
+                        PktLine::Data(data) => match Sideband::decode(data)? {
+                            Sideband::Data(data) => pack.extend(data),
+                            Sideband::Progress(_) => {}
+                            Sideband::Error(error) => {
+                                return protocol_error(format!(
+                                    "remote upload-pack failed: {}",
+                                    String::from_utf8_lossy(&error)
+                                ));
+                            }
+                        },
+                        PktLine::Flush | PktLine::ResponseEnd => {
+                            index += 1;
+                            break;
+                        }
+                        PktLine::Delimiter => {
+                            return protocol_error("delimiter inside v2 packfile");
+                        }
+                    }
+                    index += 1;
+                }
+                break;
+            }
+            PktLine::Flush | PktLine::ResponseEnd if index + 1 == packets.len() => break,
+            _ => return protocol_error("unexpected protocol v2 fetch section"),
+        }
+    }
+    if pack.is_empty() || index != packets.len() {
+        return protocol_error("missing v2 pack or trailing response packets");
+    }
+    Ok(ParsedFetchResponse {
+        pack,
+        shallow,
+        unshallow,
+    })
+}
+
+fn parse_shallow_update(
+    line: &[u8],
+    shallow: &mut BTreeSet<ObjectId>,
+    unshallow: &mut BTreeSet<ObjectId>,
+) -> Result<()> {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let (set, value) = if let Some(value) = line.strip_prefix(b"shallow ") {
+        (&mut *shallow, value)
+    } else if let Some(value) = line.strip_prefix(b"unshallow ") {
+        (&mut *unshallow, value)
+    } else {
+        return protocol_error("invalid v2 shallow update");
+    };
+    let id = parse_wire_id(value, "shallow update")?;
+    if !set.insert(id) || shallow.contains(&id) && unshallow.contains(&id) {
+        return protocol_error("duplicate or contradictory v2 shallow update");
+    }
+    Ok(())
+}
+
+fn parse_wire_id(value: &[u8], context: &str) -> Result<ObjectId> {
+    if value.len() != ObjectId::HEX_LENGTH || !value.is_ascii() {
+        return protocol_error(format!("invalid {context} object ID"));
+    }
+    ObjectId::from_str(
+        std::str::from_utf8(value)
+            .map_err(|_| Error::Protocol(format!("invalid {context} object ID")))?,
+    )
+    .map_err(|_| Error::Protocol(format!("invalid {context} object ID")))
+}
+
+fn decode_all_packets(input: &[u8]) -> Result<Vec<PktLine>> {
+    let mut decoder = crate::PktLineDecoder::new();
+    decoder.extend(input);
+    let mut packets = Vec::new();
+    while let Some(packet) = decoder.next_packet()? {
+        packets.push(packet);
+    }
+    decoder.finish()?;
+    Ok(packets)
+}
+
 fn parse_fetch_response(input: &[u8], depth_requested: bool) -> Result<ParsedFetchResponse> {
     let mut cursor = 0usize;
     let mut shallow = BTreeSet::new();
@@ -809,12 +1369,134 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::Path;
 
-    use super::{CloneOptions, FetchOptions, RemoteAdvertisement, RepositoryTransport};
-    use crate::{
-        CommitBuilder, EntryMode, FileSystem, InitOptions, MemoryFileSystem, ObjectKind,
-        PreviousValue, ReferenceName, Repository, RevisionWalkOptions, Signature, Tree, TreeEntry,
-        UploadPackOptions,
+    use super::{
+        CloneOptions, FetchOptions, RemoteAdvertisement, RepositoryTransport,
+        RepositoryV2Transport, parse_fetch_response_v2, parse_v2_capabilities,
     };
+    use crate::{
+        CommitBuilder, EntryMode, FileSystem, InitOptions, MemoryFileSystem, ObjectKind, PktLine,
+        PreviousValue, ReferenceName, ReferenceTarget, Repository, RevisionWalkOptions, Sideband,
+        Signature, Tree, TreeEntry, UploadPackOptions, UploadPackV2Limits,
+    };
+
+    #[test]
+    fn protocol_v2_client_validates_capabilities_and_section_framing() {
+        let advertisement = [
+            PktLine::Data(b"version 2\n".to_vec()),
+            PktLine::Data(b"fetch=shallow\n".to_vec()),
+            PktLine::Data(b"object-format=sha1\n".to_vec()),
+            PktLine::Flush,
+        ]
+        .into_iter()
+        .flat_map(|packet| packet.encode().unwrap())
+        .collect::<Vec<_>>();
+        assert!(parse_v2_capabilities(&advertisement).unwrap().shallow);
+        assert!(parse_v2_capabilities(&advertisement[..advertisement.len() - 1]).is_err());
+
+        let response = [
+            PktLine::Data(b"acknowledgments\n".to_vec()),
+            PktLine::Data(format!("ACK {}\n", crate::ObjectId::null()).into_bytes()),
+            PktLine::Data(b"ready\n".to_vec()),
+            PktLine::Delimiter,
+            PktLine::Data(b"packfile\n".to_vec()),
+            PktLine::Data(Sideband::Data(b"PACK".to_vec()).encode().unwrap()[4..].to_vec()),
+            PktLine::Flush,
+        ]
+        .into_iter()
+        .flat_map(|packet| packet.encode().unwrap())
+        .collect::<Vec<_>>();
+        assert_eq!(parse_fetch_response_v2(&response).unwrap().pack, b"PACK");
+    }
+
+    #[test]
+    fn protocol_v2_clone_preserves_an_unborn_remote_head_branch() {
+        let remote = Repository::init(
+            MemoryFileSystem::new(),
+            "remote",
+            &InitOptions {
+                bare: false,
+                initial_branch: "trunk".to_owned(),
+            },
+        )
+        .unwrap();
+        let mut transport = RepositoryV2Transport::new(
+            &remote,
+            UploadPackOptions::default(),
+            UploadPackV2Limits::default(),
+        );
+
+        let (clone, result) = Repository::clone_from_v2(
+            MemoryFileSystem::new(),
+            "clone",
+            &mut transport,
+            &CloneOptions::default(),
+        )
+        .unwrap();
+
+        assert!(result.updated_refs.is_empty());
+        assert_eq!(
+            clone.read_reference("HEAD").unwrap().target(),
+            &ReferenceTarget::Symbolic(ReferenceName::branch("trunk").unwrap())
+        );
+    }
+
+    #[test]
+    fn protocol_v2_fetch_discovers_refs_and_deepens_shallow_history() {
+        let remote =
+            Repository::init(MemoryFileSystem::new(), "remote", &InitOptions::default()).unwrap();
+        let root = commit(&remote, None, b"root\n");
+        let tip = commit(&remote, Some(root), b"tip\n");
+        remote
+            .update_reference(
+                &ReferenceName::branch("main").unwrap(),
+                tip,
+                PreviousValue::MustNotExist,
+            )
+            .unwrap();
+        let destination_fs = MemoryFileSystem::new();
+        let mut transport = RepositoryV2Transport::new(
+            &remote,
+            UploadPackOptions::default(),
+            UploadPackV2Limits::default(),
+        );
+        let (destination, first) = Repository::clone_from_v2(
+            destination_fs.clone(),
+            "destination",
+            &mut transport,
+            &CloneOptions {
+                depth: Some(1),
+                ..CloneOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(first.advertisement.head_target(), Some("refs/heads/main"));
+        assert_eq!(first.shallow_commits, BTreeSet::from([tip]));
+        assert_eq!(
+            destination
+                .resolve_reference("refs/remotes/origin/main")
+                .unwrap(),
+            tip
+        );
+        assert!(destination.read_commit(root, 4096).is_err());
+        assert_eq!(
+            destination_fs
+                .read(Path::new("destination/file.txt"))
+                .unwrap(),
+            b"tip\n"
+        );
+
+        let second = destination
+            .fetch_v2(
+                &mut transport,
+                &FetchOptions {
+                    deepen: Some(1),
+                    ..FetchOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(second.shallow_commits.is_empty());
+        assert_eq!(destination.read_commit(root, 4096).unwrap().parents(), &[]);
+    }
 
     #[test]
     fn clones_between_memory_filesystems_and_checks_out_default_branch() {

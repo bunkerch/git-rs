@@ -1,9 +1,10 @@
 # Fetch and clone
 
 `git-rs` separates Git's upload-pack byte protocol from the network or process
-that carries it. Implement `UploadPackTransport` for HTTP, SSH, a message queue,
-or an in-process service. The library never invokes a command-line program and
-the destination repository continues to use its configured `FileSystem`.
+that carries it. Implement `UploadPackTransport` for v0/v1 or
+`UploadPackV2Transport` for v2 over HTTP, SSH, a message queue, or an in-process
+service. The library never invokes a command-line program and the destination
+repository continues to use its configured `FileSystem`.
 
 `RepositoryTransport` connects directly to another `Repository`, which makes
 fully in-memory clones and deterministic tests possible:
@@ -39,6 +40,13 @@ it, writes remote configuration, and checks out the default branch for a
 non-bare repository. A bare clone maps remote branches directly to
 `refs/heads/*`, matching Git's bare-clone ref layout.
 
+`Repository::clone_from_v2`, `fetch_v2`, and `fetch_remote_v2` perform native
+v2 capability discovery, `ls-refs`, and sectioned `fetch`. They validate
+`object-format=sha1`, discover symbolic or unborn `HEAD`, request branch/tag
+prefixes, parse optional acknowledgment and shallow-info sections, and require
+sideband packfile framing. `RepositoryV2Transport` connects two repositories
+in-process with explicit server resource limits.
+
 `Repository::fetch` uses all locally reachable ref tips as `have` lines and
 updates `refs/remotes/<remote>/*`. Tags are fetched into `refs/tags/*`; an
 existing tag is never silently moved. Pack-size, per-object, and aggregate
@@ -62,6 +70,8 @@ The implementation's behavioral comparisons are based on:
 - `connect.c` for v0/v1 advertisement and capability parsing;
 - `fetch-pack.c` for `want`, `have`, `done`, ACK/NAK, shallow updates, and
   sideband negotiation;
+- `Documentation/gitprotocol-v2.adoc` and `serve.c` for capability discovery,
+  `ls-refs`, fetch arguments, section delimiters, and response termination;
 - `builtin/fetch.c` and `remote.c` for fetch mappings and tag update safety;
 - `builtin/clone.c` for default-branch selection, bare ref mapping, remote
   configuration, and initial checkout.
@@ -75,5 +85,6 @@ For a host-backed, in-process demonstration, run:
 ```console
 cargo run --example clone_local -- path/to/source path/to/destination
 cargo run --example clone_local -- path/to/source path/to/shallow-clone 1
+cargo run --example clone_local_v2 -- path/to/source path/to/v2-clone
 cargo run --example fetch_local -- path/to/source path/to/shallow-clone 2
 ```

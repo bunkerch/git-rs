@@ -89,7 +89,7 @@ pub use diff::{DiffEntry, DiffKind, DiffOptions};
 pub use error::{Error, Result};
 pub use fetch::{
     CloneOptions, FetchOptions, FetchResult, RemoteAdvertisement, RemoteRef, RepositoryTransport,
-    UploadPackTransport,
+    RepositoryV2Transport, UploadPackTransport, UploadPackV2Transport,
 };
 pub use format_patch::{FormatPatch, FormatPatchNumbering, FormatPatchOptions};
 pub use fs::{FileStat, FileSystem, HostFileSystem, MemoryFileSystem, Metadata};
