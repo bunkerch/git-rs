@@ -52,6 +52,7 @@ pub mod prune;
 pub mod pull;
 pub mod push;
 pub mod range_diff;
+pub mod read_tree;
 pub mod rebase;
 pub mod receive_pack;
 pub mod refs;
@@ -159,6 +160,7 @@ pub use push::{
     ReceivePackTransport,
 };
 pub use range_diff::{RangeDiffEntry, RangeDiffOptions, RangeDiffStatus};
+pub use read_tree::{ReadTreeOptions, ReadTreeResult};
 pub use rebase::{RebaseEmpty, RebaseOptions, RebaseResult};
 pub use receive_pack::{
     ReceiveCommand, ReceiveCommandStatus, ReceivePackOptions, ReceivePackRequest, ReceivePackResult,
