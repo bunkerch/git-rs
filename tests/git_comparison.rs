@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::process::Command;
 
+use std::io::Write;
+
 use git_rs::{
     CommitBuilder, EntryMode, HostFileSystem, InitOptions, ObjectKind,
     ReferenceName, Repository, Signature, Tree, TreeEntry,
@@ -48,7 +50,6 @@ fn hash_object_matches_git() {
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    use std::io::Write;
     child.stdin.take().unwrap().write_all(b"hello\n").unwrap();
     let output = child.wait_with_output().unwrap();
     let git_hash = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -506,4 +507,183 @@ fn in_process_fetch_matches_git() {
     );
     let body = String::from_utf8_lossy(&git_output);
     assert!(body.contains("shared\n"), "fetched object not readable by git: {body}");
+}
+
+/// Verify in-process receive-pack (push) sends objects that git can verify.
+#[test]
+fn in_process_push_matches_git() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let dest_dir = tempfile::tempdir().unwrap();
+
+    // Source: create a repo with one commit
+    let source = init_repo(source_dir.path(), true);
+    let blob_id = source.write_object(ObjectKind::Blob, b"pushed content\n").unwrap();
+    let tree_id = source.write_tree(
+        &Tree::new(vec![TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap()]).unwrap(),
+    )
+    .unwrap();
+    let commit_id = source
+        .write_commit(
+            &CommitBuilder::new(tree_id, ident(), ident())
+                .message(b"pushed\n".to_vec())
+                .build(),
+        )
+        .unwrap();
+
+    // Destination: bare repo, receive push via in-process transport
+    let dest = init_repo(dest_dir.path(), true);
+    let mut transport = git_rs::InProcessReceivePackTransport::new(
+        &dest,
+        git_rs::ReceivePackOptions::default(),
+    );
+    let update = git_rs::PushUpdate::update(
+        ReferenceName::branch("main").unwrap(),
+        commit_id,
+    );
+    let result = source
+        .push(
+            &mut transport,
+            &[update],
+            &git_rs::PushOptions::default(),
+        )
+        .unwrap();
+    assert!(
+        result.statuses.iter().all(|s| s.error.is_none()),
+        "push had errors: {:?}",
+        result.statuses
+    );
+
+    // Verify git can read the pushed data in the destination
+    let git_output = git(
+        &["cat-file", "-p", &commit_id.to_string()],
+        dest_dir.path(),
+    );
+    let body = String::from_utf8_lossy(&git_output);
+    assert!(body.contains("pushed\n"), "pushed object not readable by git: {body}");
+
+    // Verify git sees the ref in the destination
+    let git_refs = git(&["show-ref"], dest_dir.path());
+    let refs = String::from_utf8_lossy(&git_refs);
+    assert!(
+        refs.contains("refs/heads/main"),
+        "push did not create ref in destination: {refs}"
+    );
+    assert!(
+        refs.contains(&commit_id.to_string()),
+        "push ref points to wrong commit: {refs}"
+    );
+}
+
+/// Verify upload-pack advertisement produces a packet stream git can parse.
+#[test]
+fn upload_pack_advertisement_matches_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), true);
+
+    let blob_id = repo.write_object(ObjectKind::Blob, b"data\n").unwrap();
+    let tree_id = repo.write_tree(
+        &Tree::new(vec![TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap()]).unwrap(),
+    )
+    .unwrap();
+    let commit_id = repo
+        .write_commit(
+            &CommitBuilder::new(tree_id, ident(), ident())
+                .message(b"tip\n".to_vec())
+                .build(),
+        )
+        .unwrap();
+    repo.update_reference(
+        &ReferenceName::branch("main").unwrap(),
+        commit_id,
+        git_rs::PreviousValue::MustNotExist,
+    )
+    .unwrap();
+
+    // Generate upload-pack advertisement (v0/v1 style)
+    let advertisement = repo.advertise_upload_pack().unwrap();
+
+    // Verify the advertisement is a valid pkt-line stream
+    let mut decoder = git_rs::PktLineDecoder::new();
+    decoder.extend(&advertisement);
+    let packets: Vec<_> = std::iter::from_fn(|| decoder.next_packet().ok()?)
+        .collect();
+    assert!(!packets.is_empty(), "upload-pack advertisement should have packets");
+
+    // First packet should be a ref advertisement or capabilities
+    let first = &packets[0];
+    match first {
+        git_rs::PktLine::Data(data) => {
+            // Should contain a null ID (unborn) or commit ID + capabilities
+            let has_commit = String::from_utf8_lossy(data).contains(&commit_id.to_string());
+            let has_null = data.starts_with(b"0000000000000000000000000000000000000000");
+            assert!(
+                has_commit || has_null,
+                "upload-pack first packet should advertise ref or capabilities: {data:?}"
+            );
+        }
+        _ => panic!("upload-pack advertisement should start with data packet"),
+    }
+
+    // Should end with a flush packet
+    assert_eq!(
+        packets.last(),
+        Some(&git_rs::PktLine::Flush),
+        "upload-pack should end with flush"
+    );
+}
+
+/// Verify upload-pack v2 advertisement (capability-based).
+#[test]
+fn upload_pack_v2_advertisement_matches_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), true);
+
+    let blob_id = repo.write_object(ObjectKind::Blob, b"v2 data\n").unwrap();
+    let tree_id = repo.write_tree(
+        &Tree::new(vec![TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap()]).unwrap(),
+    )
+    .unwrap();
+    let commit_id = repo
+        .write_commit(
+            &CommitBuilder::new(tree_id, ident(), ident())
+                .message(b"v2\n".to_vec())
+                .build(),
+        )
+        .unwrap();
+    repo.update_reference(
+        &ReferenceName::branch("main").unwrap(),
+        commit_id,
+        git_rs::PreviousValue::MustNotExist,
+    )
+    .unwrap();
+
+    // Generate v2 advertisement
+    let advertisement = repo.advertise_upload_pack_v2().unwrap();
+    assert!(!advertisement.is_empty(), "v2 advertisement should not be empty");
+
+    let mut decoder = git_rs::PktLineDecoder::new();
+    decoder.extend(&advertisement);
+    let packets: Vec<_> = std::iter::from_fn(|| decoder.next_packet().ok()?)
+        .collect();
+    assert!(!packets.is_empty(), "v2 should have at least a version packet");
+
+    // First packet should declare version 2
+    let first = &packets[0];
+    match first {
+        git_rs::PktLine::Data(data) => {
+            let line = String::from_utf8_lossy(data);
+            assert!(
+                line.contains("version 2"),
+                "v2 should start with version announcement: {line}"
+            );
+        }
+        _ => panic!("v2 should start with version packet"),
+    }
+
+    // Should end with flush
+    assert_eq!(
+        packets.last(),
+        Some(&git_rs::PktLine::Flush),
+        "v2 should end with flush"
+    );
 }
