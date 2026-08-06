@@ -1,7 +1,7 @@
 //! Bounded commit-graph traversal and merge-base queries.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 
 use crate::{Commit, Error, ObjectId, Repository, Result};
 
@@ -63,11 +63,25 @@ impl Repository {
         exclude: &[ObjectId],
         options: &RevisionWalkOptions,
     ) -> Result<Vec<Revision>> {
+        let shallow = self.shallow_commits(&crate::ShallowOptions {
+            max_commits: options.graph.max_commits,
+            max_object_size: options.graph.max_object_size,
+        })?;
         let mut cache = HashMap::new();
-        let included =
-            self.load_reachable(include, options.first_parent, &options.graph, &mut cache)?;
-        let excluded =
-            self.load_reachable(exclude, options.first_parent, &options.graph, &mut cache)?;
+        let included = self.load_reachable(
+            include,
+            options.first_parent,
+            &options.graph,
+            &shallow,
+            &mut cache,
+        )?;
+        let excluded = self.load_reachable(
+            exclude,
+            options.first_parent,
+            &options.graph,
+            &shallow,
+            &mut cache,
+        )?;
         let visible = included
             .difference(&excluded)
             .copied()
@@ -99,7 +113,11 @@ impl Repository {
         if ancestor == descendant {
             return Ok(true);
         }
-        if !self.has_active_replacements()? {
+        let shallow = self.shallow_commits(&crate::ShallowOptions {
+            max_commits: options.max_commits,
+            max_object_size: options.max_object_size,
+        })?;
+        if shallow.is_empty() && !self.has_active_replacements()? {
             match self.read_commit_graph(options.max_object_size, options.max_commits) {
                 Ok(graph) => {
                     if let Some(result) =
@@ -120,6 +138,9 @@ impl Repository {
             }
             enforce_limit(seen.len(), options.max_commits)?;
             let commit = self.read_commit(id, options.max_object_size)?;
+            if shallow.contains(&id) {
+                continue;
+            }
             if commit.parents().contains(&ancestor) {
                 return Ok(true);
             }
@@ -142,9 +163,13 @@ impl Repository {
         two: ObjectId,
         options: &GraphOptions,
     ) -> Result<Vec<ObjectId>> {
+        let shallow = self.shallow_commits(&crate::ShallowOptions {
+            max_commits: options.max_commits,
+            max_object_size: options.max_object_size,
+        })?;
         let mut cache = HashMap::new();
-        let left = self.load_reachable(&[one], false, options, &mut cache)?;
-        let right = self.load_reachable(&[two], false, options, &mut cache)?;
+        let left = self.load_reachable(&[one], false, options, &shallow, &mut cache)?;
+        let right = self.load_reachable(&[two], false, options, &shallow, &mut cache)?;
         let common = left.intersection(&right).copied().collect::<HashSet<_>>();
         let ordered = topo_order(&common, &cache, false);
         let mut stale = HashSet::new();
@@ -170,6 +195,7 @@ impl Repository {
         roots: &[ObjectId],
         first_parent: bool,
         options: &GraphOptions,
+        shallow: &BTreeSet<ObjectId>,
         cache: &mut HashMap<ObjectId, Commit>,
     ) -> Result<HashSet<ObjectId>> {
         let mut seen = HashSet::new();
@@ -181,6 +207,9 @@ impl Repository {
             enforce_limit(seen.len(), options.max_commits)?;
             if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(id) {
                 entry.insert(self.read_commit(id, options.max_object_size)?);
+            }
+            if shallow.contains(&id) {
+                continue;
             }
             let parents = cache[&id].parents();
             if first_parent {

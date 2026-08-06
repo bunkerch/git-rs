@@ -57,6 +57,8 @@ Server-side push ingestion is documented in
 [`docs/receive-pack.md`](docs/receive-pack.md).
 Transport-neutral cloning and fetching are documented in
 [`docs/fetch-clone.md`](docs/fetch-clone.md).
+Depth-limited history and Git-compatible shallow boundaries are documented in
+[`docs/shallow.md`](docs/shallow.md).
 Transport-neutral fetch-and-integrate pull policy is documented in
 [`docs/pull.md`](docs/pull.md).
 In-memory Git bundle v2/v3 creation, parsing, verification, and import are

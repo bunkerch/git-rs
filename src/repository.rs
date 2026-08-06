@@ -242,7 +242,7 @@ fn is_common_path(path: &Path) -> bool {
     match first.as_os_str().to_str() {
         Some(
             "objects" | "refs" | "packed-refs" | "config" | "config.worktree" | "hooks" | "info"
-            | "branches",
+            | "branches" | "shallow",
         ) => true,
         Some("logs") => path != Path::new("logs/HEAD"),
         _ => false,

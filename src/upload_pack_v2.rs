@@ -71,6 +71,8 @@ pub struct FetchV2Request {
     done: bool,
     ofs_delta: bool,
     include_tag: bool,
+    shallow: Vec<ObjectId>,
+    depth: Option<usize>,
 }
 
 impl FetchV2Request {
@@ -136,7 +138,7 @@ impl Repository {
             b"version 2\n".as_slice(),
             b"agent=git-rs/0.1\n",
             b"ls-refs=unborn\n",
-            b"fetch\n",
+            b"fetch=shallow\n",
             b"object-format=sha1\n",
         ] {
             append_packet(&mut output, line)?;
@@ -239,11 +241,17 @@ impl Repository {
         for want in &request.wants {
             self.read_object(*want, options.max_object_size)?;
         }
-        let common = self.reachable_objects_bounded(
+        let mut shallow = request.shallow.iter().copied().collect::<BTreeSet<_>>();
+        shallow.extend(self.shallow_commits(&crate::ShallowOptions {
+            max_commits: options.max_objects,
+            max_object_size: options.max_object_size,
+        })?);
+        let common = self.reachable_objects_stopping_at(
             &request.haves,
             options.max_object_size,
             true,
             options.max_objects,
+            &shallow,
         )?;
         if !request.done {
             let mut response = Vec::new();
@@ -263,12 +271,24 @@ impl Repository {
             response.extend(PktLine::Flush.encode()?);
             return Ok(response);
         }
-        let mut wanted = self.reachable_objects_bounded(
-            &request.wants,
-            options.max_object_size,
-            false,
-            options.max_objects,
-        )?;
+        let (mut wanted, boundaries) = if let Some(depth) = request.depth {
+            self.reachable_objects_at_depth(
+                &request.wants,
+                depth,
+                options.max_object_size,
+                options.max_objects,
+            )?
+        } else {
+            (
+                self.reachable_objects_bounded(
+                    &request.wants,
+                    options.max_object_size,
+                    false,
+                    options.max_objects,
+                )?,
+                BTreeSet::new(),
+            )
+        };
         if request.include_tag {
             self.include_reachable_tags(
                 &mut wanted,
@@ -278,7 +298,8 @@ impl Repository {
             )?;
         }
         let pack_ids = wanted
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|id| !common.contains(id))
             .collect::<Vec<_>>();
         let pack = self.build_pack(
@@ -289,6 +310,20 @@ impl Repository {
             },
         )?;
         let mut response = Vec::new();
+        if request.depth.is_some() {
+            append_packet(&mut response, b"shallow-info\n")?;
+            for id in &boundaries {
+                append_packet(&mut response, format!("shallow {id}\n").as_bytes())?;
+            }
+            for id in request
+                .shallow
+                .iter()
+                .filter(|id| !boundaries.contains(id) && wanted.contains(id))
+            {
+                append_packet(&mut response, format!("unshallow {id}\n").as_bytes())?;
+            }
+            response.extend(PktLine::Delimiter.encode()?);
+        }
         append_packet(&mut response, b"packfile\n")?;
         for chunk in pack.pack().chunks(crate::protocol::MAX_PACKET_DATA_LEN - 1) {
             response.extend(Sideband::Data(chunk.to_vec()).encode()?);
@@ -432,12 +467,29 @@ fn parse_fetch(arguments: &[PktLine]) -> Result<FetchV2Request> {
         done: false,
         ofs_delta: false,
         include_tag: false,
+        shallow: Vec::new(),
+        depth: None,
     };
     for argument in data_lines(arguments)? {
         if let Some(value) = argument.strip_prefix(b"want ") {
             push_id(&mut request.wants, value, "want")?;
         } else if let Some(value) = argument.strip_prefix(b"have ") {
             push_id(&mut request.haves, value, "have")?;
+        } else if let Some(value) = argument.strip_prefix(b"shallow ") {
+            push_id(&mut request.shallow, value, "shallow")?;
+        } else if let Some(value) = argument.strip_prefix(b"deepen ") {
+            if request.depth.is_some() {
+                return protocol_error("duplicate deepen argument");
+            }
+            let value = std::str::from_utf8(value)
+                .map_err(|_| Error::Protocol("deepen is not ASCII".into()))?;
+            let depth = value
+                .parse::<usize>()
+                .map_err(|_| Error::Protocol("invalid deepen depth".into()))?;
+            if depth == 0 {
+                return protocol_error("deepen depth must be positive");
+            }
+            request.depth = Some(depth);
         } else {
             match argument {
                 b"done" => set_once(&mut request.done, "done")?,
@@ -476,7 +528,7 @@ fn push_id(output: &mut Vec<ObjectId>, value: &[u8], name: &str) -> Result<()> {
     let id = ObjectId::from_str(value)
         .map_err(|_| Error::Protocol(format!("invalid {name} object ID")))?;
     if output.contains(&id) {
-        return protocol_error(format!("duplicate {name} {id}"));
+        return Ok(());
     }
     output.push(id);
     Ok(())
@@ -596,7 +648,7 @@ mod tests {
         let packets = decode_request(&bytes).unwrap();
         assert_eq!(packets[0], PktLine::Data(b"version 2\n".to_vec()));
         assert!(packets.contains(&PktLine::Data(b"ls-refs=unborn\n".to_vec())));
-        assert!(packets.contains(&PktLine::Data(b"fetch\n".to_vec())));
+        assert!(packets.contains(&PktLine::Data(b"fetch=shallow\n".to_vec())));
         assert_eq!(packets.last(), Some(&PktLine::Flush));
     }
 
@@ -744,14 +796,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_ids_shallow_filter_and_bad_framing() {
+    fn deduplicates_ids_and_rejects_filter_and_bad_framing() {
         let id = ObjectId::from_bytes([1; ObjectId::LENGTH]);
+        let duplicate = UploadPackV2Request::parse(
+            &command(
+                "fetch",
+                &[
+                    format!("want {id}\n").into_bytes(),
+                    format!("want {id}\n").into_bytes(),
+                ],
+            ),
+            &UploadPackV2Limits::default(),
+        )
+        .unwrap();
+        let UploadPackV2Request::Fetch(duplicate) = duplicate else {
+            panic!("expected fetch");
+        };
+        assert_eq!(duplicate.wants(), &[id]);
         for arguments in [
             vec![
                 format!("want {id}\n").into_bytes(),
-                format!("want {id}\n").into_bytes(),
+                b"deepen-relative\n".to_vec(),
             ],
-            vec![format!("want {id}\n").into_bytes(), b"deepen 1\n".to_vec()],
             vec![
                 format!("want {id}\n").into_bytes(),
                 b"filter blob:none\n".to_vec(),
@@ -806,5 +872,33 @@ mod tests {
                 .include_reachable_tags(&mut vec![tip], 4096, 100, 1)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn shallow_fetch_uses_v2_shallow_info_section() {
+        let (repository, tip) = repository();
+        let fetch = UploadPackV2Request::parse(
+            &command(
+                "fetch",
+                &[
+                    format!("want {tip}\n").into_bytes(),
+                    b"deepen 1\n".to_vec(),
+                    b"done\n".to_vec(),
+                ],
+            ),
+            &UploadPackV2Limits::default(),
+        )
+        .unwrap();
+        let response = repository
+            .respond_upload_pack_v2(
+                &fetch,
+                &UploadPackOptions::default(),
+                &UploadPackV2Limits::default(),
+            )
+            .unwrap();
+        let packets = decode_request(&response).unwrap();
+        assert_eq!(packets[0], PktLine::Data(b"shallow-info\n".to_vec()));
+        assert_eq!(packets[1], PktLine::Delimiter);
+        assert_eq!(packets[2], PktLine::Data(b"packfile\n".to_vec()));
     }
 }

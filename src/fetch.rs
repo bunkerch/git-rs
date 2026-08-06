@@ -189,6 +189,8 @@ pub struct FetchOptions {
     pub max_pack_size: usize,
     pub max_object_size: usize,
     pub max_total_inflated_size: usize,
+    pub depth: Option<usize>,
+    pub max_shallow_commits: usize,
 }
 
 impl Default for FetchOptions {
@@ -199,6 +201,8 @@ impl Default for FetchOptions {
             max_pack_size: 1024 * 1024 * 1024,
             max_object_size: 1024 * 1024 * 1024,
             max_total_inflated_size: 2 * 1024 * 1024 * 1024,
+            depth: None,
+            max_shallow_commits: 10_000_000,
         }
     }
 }
@@ -209,6 +213,7 @@ pub struct FetchResult {
     pub advertisement: RemoteAdvertisement,
     pub updated_refs: Vec<ReferenceName>,
     pub received_objects: usize,
+    pub shallow_commits: BTreeSet<ObjectId>,
 }
 
 /// Clone initialization, remote configuration, and checkout choices.
@@ -221,6 +226,8 @@ pub struct CloneOptions {
     pub max_pack_size: usize,
     pub max_object_size: usize,
     pub max_total_inflated_size: usize,
+    pub depth: Option<usize>,
+    pub max_shallow_commits: usize,
 }
 
 impl Default for CloneOptions {
@@ -233,6 +240,8 @@ impl Default for CloneOptions {
             max_pack_size: 1024 * 1024 * 1024,
             max_object_size: 1024 * 1024 * 1024,
             max_total_inflated_size: 2 * 1024 * 1024 * 1024,
+            depth: None,
+            max_shallow_commits: 10_000_000,
         }
     }
 }
@@ -322,6 +331,8 @@ impl Repository {
                 max_pack_size: options.max_pack_size,
                 max_object_size: options.max_object_size,
                 max_total_inflated_size: options.max_total_inflated_size,
+                depth: options.depth,
+                max_shallow_commits: options.max_shallow_commits,
             },
             options.bare,
             None,
@@ -378,13 +389,17 @@ impl Repository {
                 advertisement,
                 updated_refs: Vec::new(),
                 received_objects: 0,
+                shallow_commits: self.shallow_commits(&crate::ShallowOptions {
+                    max_commits: options.max_shallow_commits,
+                    max_object_size: options.max_object_size,
+                })?,
             });
         }
-        let request = self.build_fetch_request(&selected)?;
+        let request = self.build_fetch_request(&selected, options, &advertisement)?;
         let response = transport.request(&request)?;
-        let pack = parse_fetch_response(&response)?;
+        let parsed = parse_fetch_response(&response, options.depth.is_some())?;
         let validated = self.validate_incoming_pack(
-            &pack,
+            &parsed.pack,
             &IncomingPackOptions {
                 max_pack_size: options.max_pack_size,
                 max_object_size: options.max_object_size,
@@ -395,6 +410,16 @@ impl Repository {
         let received_objects = validated.object_ids().len();
 
         self.publish_validated_pack(&validated)?;
+        let shallow_options = crate::ShallowOptions {
+            max_commits: options.max_shallow_commits,
+            max_object_size: options.max_object_size,
+        };
+        let mut shallow_commits = self.shallow_commits(&shallow_options)?;
+        for id in parsed.unshallow {
+            shallow_commits.remove(&id);
+        }
+        shallow_commits.extend(parsed.shallow);
+        self.write_shallow_commits(&shallow_commits, &shallow_options)?;
         let edits = self.fetch_ref_edits(
             &selected,
             &options.remote_name,
@@ -408,10 +433,31 @@ impl Repository {
             advertisement,
             updated_refs,
             received_objects,
+            shallow_commits,
         })
     }
 
-    fn build_fetch_request(&self, selected: &[&RemoteRef]) -> Result<Vec<u8>> {
+    fn build_fetch_request(
+        &self,
+        selected: &[&RemoteRef],
+        options: &FetchOptions,
+        advertisement: &RemoteAdvertisement,
+    ) -> Result<Vec<u8>> {
+        if options.depth == Some(0) {
+            return protocol_error("fetch depth must be positive");
+        }
+        let shallow = self.shallow_commits(&crate::ShallowOptions {
+            max_commits: options.max_shallow_commits,
+            max_object_size: options.max_object_size,
+        })?;
+        if (options.depth.is_some() || !shallow.is_empty())
+            && !advertisement
+                .capabilities
+                .iter()
+                .any(|capability| capability.name() == "shallow")
+        {
+            return protocol_error("remote does not support shallow fetches");
+        }
         let mut output = Vec::new();
         let mut seen = BTreeSet::new();
         for reference in selected {
@@ -419,7 +465,11 @@ impl Repository {
                 continue;
             }
             let suffix = if output.is_empty() {
-                " side-band-64k ofs-delta no-progress object-format=sha1"
+                if options.depth.is_some() || !shallow.is_empty() {
+                    " side-band-64k ofs-delta no-progress shallow object-format=sha1"
+                } else {
+                    " side-band-64k ofs-delta no-progress object-format=sha1"
+                }
             } else {
                 ""
             };
@@ -427,6 +477,12 @@ impl Repository {
                 &mut output,
                 format!("want {}{suffix}\n", reference.id).as_bytes(),
             )?;
+        }
+        for id in shallow {
+            append_packet(&mut output, format!("shallow {id}\n").as_bytes())?;
+        }
+        if let Some(depth) = options.depth {
+            append_packet(&mut output, format!("deepen {depth}\n").as_bytes())?;
         }
         output.extend(PktLine::Flush.encode()?);
         for id in self.local_have_ids()? {
@@ -586,8 +642,53 @@ fn validate_sha1_advertisement(advertisement: &RemoteAdvertisement) -> Result<()
     Ok(())
 }
 
-fn parse_fetch_response(input: &[u8]) -> Result<Vec<u8>> {
-    let (negotiation, mut cursor) = PktLine::decode(input)?;
+struct ParsedFetchResponse {
+    pack: Vec<u8>,
+    shallow: BTreeSet<ObjectId>,
+    unshallow: BTreeSet<ObjectId>,
+}
+
+fn parse_fetch_response(input: &[u8], depth_requested: bool) -> Result<ParsedFetchResponse> {
+    let mut cursor = 0usize;
+    let mut shallow = BTreeSet::new();
+    let mut unshallow = BTreeSet::new();
+    if depth_requested {
+        loop {
+            let (packet, consumed) = PktLine::decode(&input[cursor..])?;
+            cursor = cursor
+                .checked_add(consumed)
+                .ok_or_else(|| Error::Protocol("shallow response offset overflow".into()))?;
+            match packet {
+                PktLine::Flush => break,
+                PktLine::Data(mut line) => {
+                    if line.last() == Some(&b'\n') {
+                        line.pop();
+                    }
+                    let (set, value, name) = if let Some(value) = line.strip_prefix(b"shallow ") {
+                        (&mut shallow, value, "shallow")
+                    } else if let Some(value) = line.strip_prefix(b"unshallow ") {
+                        (&mut unshallow, value, "unshallow")
+                    } else {
+                        return protocol_error("invalid shallow update response");
+                    };
+                    let value = std::str::from_utf8(value)
+                        .map_err(|_| Error::Protocol(format!("{name} ID is not ASCII")))?;
+                    let id = ObjectId::from_str(value)
+                        .map_err(|_| Error::Protocol(format!("invalid {name} ID")))?;
+                    if !set.insert(id) || shallow.contains(&id) && unshallow.contains(&id) {
+                        return protocol_error("duplicate or contradictory shallow update");
+                    }
+                }
+                PktLine::Delimiter | PktLine::ResponseEnd => {
+                    return protocol_error("control packet in shallow update response");
+                }
+            }
+        }
+    }
+    let (negotiation, consumed) = PktLine::decode(&input[cursor..])?;
+    cursor = cursor
+        .checked_add(consumed)
+        .ok_or_else(|| Error::Protocol("fetch response offset overflow".into()))?;
     let PktLine::Data(line) = negotiation else {
         return protocol_error("fetch response has no ACK/NAK");
     };
@@ -618,7 +719,11 @@ fn parse_fetch_response(input: &[u8]) -> Result<Vec<u8>> {
     if cursor != input.len() || pack.is_empty() {
         return protocol_error("trailing bytes or missing pack in fetch response");
     }
-    Ok(pack)
+    Ok(ParsedFetchResponse {
+        pack,
+        shallow,
+        unshallow,
+    })
 }
 
 fn validate_remote_name(name: &str) -> Result<()> {
@@ -673,12 +778,14 @@ fn protocol_error<T>(message: impl Into<String>) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::path::Path;
 
     use super::{CloneOptions, FetchOptions, RemoteAdvertisement, RepositoryTransport};
     use crate::{
         CommitBuilder, EntryMode, FileSystem, InitOptions, MemoryFileSystem, ObjectKind,
-        PreviousValue, ReferenceName, Repository, Signature, Tree, TreeEntry, UploadPackOptions,
+        PreviousValue, ReferenceName, Repository, RevisionWalkOptions, Signature, Tree, TreeEntry,
+        UploadPackOptions,
     };
 
     #[test]
@@ -764,6 +871,83 @@ mod tests {
         assert_eq!(
             destination.resolve_reference("refs/heads/main").unwrap(),
             base
+        );
+    }
+
+    #[test]
+    fn shallow_clone_and_deepen_persist_git_boundaries() {
+        let remote =
+            Repository::init(MemoryFileSystem::new(), "remote", &InitOptions::default()).unwrap();
+        let root = commit(&remote, None, b"root\n");
+        let middle = commit(&remote, Some(root), b"middle\n");
+        let tip = commit(&remote, Some(middle), b"tip\n");
+        remote
+            .update_reference(
+                &ReferenceName::branch("main").unwrap(),
+                tip,
+                PreviousValue::MustNotExist,
+            )
+            .unwrap();
+        let destination_fs = MemoryFileSystem::new();
+        let mut transport = RepositoryTransport::new(&remote, UploadPackOptions::default());
+        let (destination, result) = Repository::clone_from(
+            destination_fs.clone(),
+            "clone",
+            &mut transport,
+            &CloneOptions {
+                depth: Some(1),
+                ..CloneOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.shallow_commits, BTreeSet::from([tip]));
+        assert!(destination.read_commit(middle, 4096).is_err());
+        assert_eq!(
+            destination
+                .walk_revisions(&[tip], &[], &RevisionWalkOptions::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        destination.fsck(&crate::FsckOptions::default()).unwrap();
+        assert_eq!(
+            destination_fs
+                .read(Path::new("clone/.git/shallow"))
+                .unwrap(),
+            format!("{tip}\n").as_bytes()
+        );
+
+        let result = destination
+            .fetch(
+                &mut transport,
+                &FetchOptions {
+                    depth: Some(2),
+                    ..FetchOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(result.shallow_commits, BTreeSet::from([middle]));
+        assert_eq!(
+            destination.read_commit(middle, 4096).unwrap().parents(),
+            &[root]
+        );
+        assert!(destination.read_commit(root, 4096).is_err());
+
+        let result = destination
+            .fetch(
+                &mut transport,
+                &FetchOptions {
+                    depth: Some(3),
+                    ..FetchOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(result.shallow_commits.is_empty());
+        assert_eq!(destination.read_commit(root, 4096).unwrap().parents(), &[]);
+        assert!(
+            !destination_fs
+                .exists(Path::new("clone/.git/shallow"))
+                .unwrap()
         );
     }
 

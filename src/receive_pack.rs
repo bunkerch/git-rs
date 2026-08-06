@@ -356,6 +356,10 @@ impl Repository {
         incoming: Option<&ValidatedPack>,
         max_size: usize,
     ) -> Result<()> {
+        let shallow = self.shallow_commits(&crate::ShallowOptions {
+            max_commits: usize::MAX,
+            max_object_size: max_size,
+        })?;
         let mut seen = HashSet::new();
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
@@ -373,7 +377,9 @@ impl Repository {
                 ObjectKind::Commit => {
                     let commit = crate::Commit::parse(data)?;
                     stack.push(commit.tree());
-                    stack.extend(commit.parents().iter().copied());
+                    if !shallow.contains(&id) {
+                        stack.extend(commit.parents().iter().copied());
+                    }
                 }
                 ObjectKind::Tree => {
                     let tree = crate::Tree::parse(data)?;

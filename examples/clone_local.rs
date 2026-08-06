@@ -9,9 +9,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: clone_local <source> <destination>")?;
     let destination_path = arguments
         .next()
-        .ok_or("usage: clone_local <source> <destination>")?;
+        .ok_or("usage: clone_local <source> <destination> [depth]")?;
+    let depth = arguments.next().map(|value| value.parse()).transpose()?;
     if arguments.next().is_some() {
-        return Err("usage: clone_local <source> <destination>".into());
+        return Err("usage: clone_local <source> <destination> [depth]".into());
     }
 
     let filesystem = HostFileSystem::new(".")?;
@@ -23,6 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut transport,
         &CloneOptions {
             remote_url: source_path,
+            depth,
             ..CloneOptions::default()
         },
     )?;

@@ -65,12 +65,14 @@ prefix count, reference count, tag depth, object count, and individual object
 size are bounded.
 
 The base v2 `fetch` command supports `want`, `have`, `done`, `thin-pack`,
-`no-progress`, `include-tag`, and `ofs-delta`. A complete pack is valid when a
+`no-progress`, `include-tag`, `ofs-delta`, `shallow`, and absolute `deepen`.
+A complete pack is valid when a
 client permits a thin pack, so `thin-pack` is accepted without creating an
 external-base delta. Negotiation responses use the `acknowledgments` section;
 completed requests use the `packfile` section and mandatory sideband framing.
-Shallow and partial-clone arguments are rejected and their capabilities are not
-advertised.
+Depth fetches use a `shallow-info` section and compute boundary commits with a
+bounded breadth-first history walk. Relative deepen, time/revision cutoffs, and
+partial-clone filters remain unadvertised and are rejected.
 
 The `upload_pack` example demonstrates stateless request handling:
 

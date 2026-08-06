@@ -81,6 +81,10 @@ impl Repository {
     pub fn fsck(&self, options: &FsckOptions) -> Result<FsckReport> {
         let (ids, packed_objects) =
             self.fsck_object_ids(options.max_objects, options.max_object_size)?;
+        let shallow = self.shallow_commits(&crate::ShallowOptions {
+            max_commits: options.max_objects,
+            max_object_size: options.max_object_size,
+        })?;
         let mut links = BTreeMap::<ObjectId, Vec<Link>>::new();
         let mut kinds = BTreeMap::<ObjectId, ObjectKind>::new();
         let mut counts = [0_usize; 4];
@@ -96,10 +100,12 @@ impl Repository {
                         id: commit.tree(),
                         expected: ObjectKind::Tree,
                     }];
-                    found.extend(commit.parents().iter().copied().map(|id| Link {
-                        id,
-                        expected: ObjectKind::Commit,
-                    }));
+                    if !shallow.contains(id) {
+                        found.extend(commit.parents().iter().copied().map(|id| Link {
+                            id,
+                            expected: ObjectKind::Commit,
+                        }));
+                    }
                     found
                 }
                 ObjectKind::Tree => Tree::parse(object.data())?

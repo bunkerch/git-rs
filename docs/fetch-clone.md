@@ -44,6 +44,13 @@ updates `refs/remotes/<remote>/*`. Tags are fetched into `refs/tags/*`; an
 existing tag is never silently moved. Pack-size, per-object, and aggregate
 inflation limits are available in both `FetchOptions` and `CloneOptions`.
 
+Setting `depth` requests a shallow history. The client advertises its existing
+boundaries on later fetches, validates the server's shallow/unshallow update,
+publishes the pack, and atomically writes the resulting `.git/shallow` set.
+Increasing an absolute depth transfers only the newly exposed closure; reaching
+the root removes the shallow file. `max_shallow_commits` bounds persisted and
+wire-provided boundary state.
+
 Ref changes are applied as one reference transaction after pack validation and
 publication. A transport failure, malformed advertisement, corrupt pack, or ref
 conflict therefore cannot expose refs that point at unavailable objects.
@@ -53,7 +60,8 @@ conflict therefore cannot expose refs that point at unavailable objects.
 The implementation's behavioral comparisons are based on:
 
 - `connect.c` for v0/v1 advertisement and capability parsing;
-- `fetch-pack.c` for `want`, `have`, `done`, ACK/NAK, and sideband negotiation;
+- `fetch-pack.c` for `want`, `have`, `done`, ACK/NAK, shallow updates, and
+  sideband negotiation;
 - `builtin/fetch.c` and `remote.c` for fetch mappings and tag update safety;
 - `builtin/clone.c` for default-branch selection, bare ref mapping, remote
   configuration, and initial checkout.
@@ -66,4 +74,6 @@ For a host-backed, in-process demonstration, run:
 
 ```console
 cargo run --example clone_local -- path/to/source path/to/destination
+cargo run --example clone_local -- path/to/source path/to/shallow-clone 1
+cargo run --example fetch_local -- path/to/source path/to/shallow-clone 2
 ```
