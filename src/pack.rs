@@ -360,6 +360,28 @@ impl Repository {
         Ok(())
     }
 
+    pub(crate) fn contains_packed_object(&self, id: ObjectId) -> Result<bool> {
+        if self.midx_object_location(id)?.is_some() {
+            return Ok(true);
+        }
+        let directory = self.git_path("objects/pack");
+        let paths = match self.filesystem().read_dir(&directory) {
+            Ok(paths) => paths,
+            Err(Error::NotFound(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        for child in paths {
+            if child.extension().and_then(|value| value.to_str()) != Some("idx") {
+                continue;
+            }
+            let index = self.cached_pack_index(&directory.join(child))?;
+            if index.find(id).is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn read_packed_object(&self, id: ObjectId, max_size: usize) -> Result<Object> {
         if let Some((index_path, expected_offset)) = self.midx_object_location(id)? {
             match self.read_indexed_object_at(&index_path, id, expected_offset, max_size) {

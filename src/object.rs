@@ -221,6 +221,16 @@ impl Repository {
     pub fn contains_loose_object(&self, id: ObjectId) -> Result<bool> {
         self.filesystem().exists(&self.git_path(object_path(id)))
     }
+
+    /// Test whether an object ID is present in loose or packed storage without
+    /// inflating its contents.
+    ///
+    /// # Errors
+    /// Returns an error when storage cannot be inspected or a pack index is
+    /// malformed.
+    pub fn contains_object(&self, id: ObjectId) -> Result<bool> {
+        Ok(self.contains_loose_object(id)? || self.contains_packed_object(id)?)
+    }
 }
 
 fn encode_object(kind: ObjectKind, data: &[u8]) -> Vec<u8> {
@@ -350,7 +360,7 @@ mod tests {
     use std::str::FromStr;
 
     use super::{ObjectId, ObjectKind, object_path, sha1};
-    use crate::{Error, FileSystem, InitOptions, MemoryFileSystem, Repository};
+    use crate::{Error, FileSystem, InitOptions, MemoryFileSystem, PackOptions, Repository};
 
     #[test]
     fn parses_and_formats_git_hex_object_ids() {
@@ -436,6 +446,22 @@ mod tests {
             repository.read_object(id, 1024),
             Err(Error::InvalidObject(_))
         ));
+    }
+
+    #[test]
+    fn finds_objects_from_pack_indexes_without_inflating_them() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let id = repository
+            .write_object(ObjectKind::Blob, b"packed")
+            .unwrap();
+        repository
+            .write_pack(&[id], &PackOptions::default())
+            .unwrap();
+        fs.remove_file(&repository.git_path(object_path(id)))
+            .unwrap();
+        assert!(!repository.contains_loose_object(id).unwrap());
+        assert!(repository.contains_object(id).unwrap());
     }
 
     fn hex(bytes: [u8; 20]) -> String {
