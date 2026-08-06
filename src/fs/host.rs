@@ -81,6 +81,10 @@ impl FileSystem for HostFileSystem {
         fs::remove_file(self.resolve(path)?).map_err(|error| map_io(error, path))
     }
 
+    fn remove_dir(&self, path: &Path) -> Result<()> {
+        fs::remove_dir(self.resolve(path)?).map_err(|error| map_io(error, path))
+    }
+
     fn metadata(&self, path: &Path) -> Result<Metadata> {
         let metadata =
             fs::symlink_metadata(self.resolve(path)?).map_err(|error| map_io(error, path))?;
@@ -208,6 +212,7 @@ fn map_io(error: std::io::Error, path: &Path) -> Error {
         std::io::ErrorKind::AlreadyExists => Error::AlreadyExists(path.to_path_buf()),
         std::io::ErrorKind::IsADirectory => Error::IsDirectory(path.to_path_buf()),
         std::io::ErrorKind::NotADirectory => Error::NotDirectory(path.to_path_buf()),
+        std::io::ErrorKind::DirectoryNotEmpty => Error::DirectoryNotEmpty(path.to_path_buf()),
         _ => Error::Io(error),
     }
 }

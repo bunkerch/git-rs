@@ -18,3 +18,4 @@ pub use object::{Object, ObjectId, ObjectKind};
 pub use refs::{PreviousValue, Reference, ReferenceName, ReferenceTarget};
 pub use repository::{InitOptions, Repository};
 pub use tree::{EntryMode, Tree, TreeEntry};
+pub use worktree::CheckoutOptions;

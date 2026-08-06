@@ -10,6 +10,7 @@ pub enum Error {
     AlreadyExists(PathBuf),
     NotFound(PathBuf),
     NotDirectory(PathBuf),
+    DirectoryNotEmpty(PathBuf),
     IsDirectory(PathBuf),
     InvalidObjectId(String),
     InvalidObject(String),
@@ -20,6 +21,7 @@ pub enum Error {
     InvalidReferenceName(String),
     InvalidReference(String),
     ReferenceConflict(String),
+    CheckoutConflict(Vec<String>),
     SymbolicReferenceLoop(String),
     InvalidRepository(String),
 }
@@ -32,6 +34,9 @@ impl fmt::Display for Error {
             Self::AlreadyExists(path) => write!(f, "path already exists: {}", path.display()),
             Self::NotFound(path) => write!(f, "path not found: {}", path.display()),
             Self::NotDirectory(path) => write!(f, "not a directory: {}", path.display()),
+            Self::DirectoryNotEmpty(path) => {
+                write!(f, "directory is not empty: {}", path.display())
+            }
             Self::IsDirectory(path) => write!(f, "is a directory: {}", path.display()),
             Self::InvalidObjectId(value) => write!(f, "invalid object ID: {value}"),
             Self::InvalidObject(message) => write!(f, "invalid Git object: {message}"),
@@ -48,6 +53,13 @@ impl fmt::Display for Error {
             Self::InvalidReference(message) => write!(f, "invalid reference: {message}"),
             Self::ReferenceConflict(name) => {
                 write!(f, "reference changed concurrently: {name}")
+            }
+            Self::CheckoutConflict(paths) => {
+                write!(
+                    f,
+                    "checkout would overwrite local changes: {}",
+                    paths.join(", ")
+                )
             }
             Self::SymbolicReferenceLoop(name) => {
                 write!(

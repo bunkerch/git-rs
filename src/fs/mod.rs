@@ -184,6 +184,11 @@ pub trait FileSystem: Send + Sync + 'static {
     /// # Errors
     /// Returns an error when the path is invalid, absent, or not a file.
     fn remove_file(&self, path: &Path) -> Result<()>;
+    /// Remove an empty directory.
+    ///
+    /// # Errors
+    /// Returns an error when the directory is absent, non-empty, or not a directory.
+    fn remove_dir(&self, path: &Path) -> Result<()>;
     /// Return metadata for a file or directory.
     ///
     /// # Errors

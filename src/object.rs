@@ -39,6 +39,12 @@ impl ObjectId {
         }
         output
     }
+
+    /// Compute the ID of an object without storing it.
+    #[must_use]
+    pub fn compute(kind: ObjectKind, data: &[u8]) -> Self {
+        Self(sha1::digest(&encode_object(kind, data)))
+    }
 }
 
 impl FromStr for ObjectId {

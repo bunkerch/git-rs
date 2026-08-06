@@ -26,6 +26,13 @@ let tree = repository.write_index_tree(&repository.read_index()?)?;
 It constructs nested trees without flattening directory boundaries, preserving
 blob, executable, link, gitlink, and sparse-tree modes.
 
+`checkout_tree` expands a tree recursively and updates the worktree plus index.
+Before changing anything it hashes affected worktree files and rejects modified
+tracked files, tracked deletions that would be replaced, untracked destination
+paths, and untracked file/directory obstructions. Entries unchanged between the
+current index and target preserve local modifications. `CheckoutOptions::force`
+requests exact materialization instead.
+
 ## Filesystem requirements
 
 Adapters expose no-follow metadata, symlink target reads/creation, executable
@@ -42,3 +49,5 @@ provide stat identity enable Git's fast unchanged-file checks.
   construction.
 - `read-cache.c:ce_match_stat_basic` defines the stat-cache fields used for fast
   worktree comparisons.
+- `unpack-trees.c:verify_uptodate` and `verify_absent` define modified-file and
+  untracked-path checkout protection.

@@ -202,6 +202,25 @@ impl FileSystem for MemoryFileSystem {
         }
     }
 
+    fn remove_dir(&self, path: &Path) -> Result<()> {
+        let path = validate(path)?;
+        let mut entries = self.entries_mut();
+        match entries.get(&path) {
+            Some(Entry::Directory) => {
+                if entries
+                    .keys()
+                    .any(|candidate| candidate.parent() == Some(path.as_path()))
+                {
+                    return Err(Error::DirectoryNotEmpty(path));
+                }
+                entries.remove(&path);
+                Ok(())
+            }
+            Some(_) => Err(Error::NotDirectory(path)),
+            None => Err(Error::NotFound(path)),
+        }
+    }
+
     fn metadata(&self, path: &Path) -> Result<Metadata> {
         let path = validate(path)?;
         match self.entries().get(&path) {

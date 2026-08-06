@@ -8,6 +8,21 @@ use crate::{
     StatData, Tree, TreeEntry,
 };
 
+#[derive(Clone, Debug)]
+pub struct CheckoutOptions {
+    pub force: bool,
+    pub max_object_size: usize,
+}
+
+impl Default for CheckoutOptions {
+    fn default() -> Self {
+        Self {
+            force: false,
+            max_object_size: 1024 * 1024 * 1024,
+        }
+    }
+}
+
 impl Repository {
     /// Add a file, symlink, directory tree, or deletion to the index.
     ///
@@ -65,6 +80,230 @@ impl Repository {
             insert_node(&mut root, &components, entry.mode(), entry.id())?;
         }
         self.write_node_tree(&root)
+    }
+
+    /// Check out a tree into the worktree and replace the index.
+    ///
+    /// By default, modified tracked files and colliding untracked paths are
+    /// preserved and reported as conflicts. Entries unchanged between the old
+    /// index and target keep their local modifications, matching branch-switch
+    /// behavior. `force` requests an exact materialization.
+    ///
+    /// # Errors
+    /// Returns [`Error::CheckoutConflict`] before mutation when local data would
+    /// be overwritten, or an object, filesystem, or index transaction error.
+    #[allow(clippy::too_many_lines)]
+    pub fn checkout_tree(&self, tree: ObjectId, options: &CheckoutOptions) -> Result<usize> {
+        let work_tree = self.work_tree().ok_or_else(|| {
+            Error::InvalidRepository("cannot check out into a bare repository".into())
+        })?;
+        let mut desired = Vec::new();
+        self.flatten_tree(tree, &[], options.max_object_size, &mut desired)?;
+        desired.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+
+        let current = self.read_index()?;
+        let current_by_path = current
+            .entries()
+            .iter()
+            .filter(|entry| entry.stage() == 0)
+            .map(|entry| (entry.path().to_vec(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let desired_by_path = desired
+            .iter()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect::<BTreeMap<_, _>>();
+
+        if !options.force {
+            let mut conflicts = Vec::new();
+            for (path, current_entry) in &current_by_path {
+                let unchanged_target = desired_by_path.get(path).is_some_and(|target| {
+                    target.id == current_entry.id() && target.raw_mode == current_entry.mode()
+                });
+                if unchanged_target {
+                    continue;
+                }
+                let full_path = work_tree.join(worktree_path(path)?);
+                match self.filesystem().metadata(&full_path) {
+                    Ok(_) if !self.worktree_matches(current_entry, &full_path)? => {
+                        conflicts.push(String::from_utf8_lossy(path).into_owned());
+                    }
+                    Ok(_) | Err(Error::NotFound(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            for (path, target) in &desired_by_path {
+                for slash in path
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, byte)| (*byte == b'/').then_some(index))
+                {
+                    let parent_path = &path[..slash];
+                    let parent = work_tree.join(worktree_path(parent_path)?);
+                    match self.filesystem().metadata(&parent) {
+                        Ok(metadata) if !metadata.is_dir() => {
+                            let tracked_parent_will_be_removed = current_by_path
+                                .contains_key(parent_path)
+                                && !desired_by_path.contains_key(parent_path);
+                            if !tracked_parent_will_be_removed {
+                                conflicts.push(String::from_utf8_lossy(parent_path).into_owned());
+                            }
+                        }
+                        Ok(_) | Err(Error::NotFound(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                if current_by_path.contains_key(path) || target.mode == EntryMode::Gitlink {
+                    continue;
+                }
+                let full_path = work_tree.join(worktree_path(path)?);
+                if self.filesystem().exists(&full_path)? {
+                    conflicts.push(String::from_utf8_lossy(path).into_owned());
+                }
+            }
+            conflicts.sort_unstable();
+            conflicts.dedup();
+            if !conflicts.is_empty() {
+                return Err(Error::CheckoutConflict(conflicts));
+            }
+        }
+
+        let mut removals = current_by_path
+            .keys()
+            .filter(|path| !desired_by_path.contains_key(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        removals.sort_unstable_by_key(|path| std::cmp::Reverse(path.len()));
+        for path in removals {
+            let relative = worktree_path(&path)?;
+            let full_path = work_tree.join(&relative);
+            match self.filesystem().metadata(&full_path) {
+                Ok(metadata) if metadata.is_file() || metadata.is_symlink() => {
+                    self.filesystem().remove_file(&full_path)?;
+                    self.prune_empty_parents(work_tree, relative.parent())?;
+                }
+                Ok(_) | Err(Error::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        let mut new_entries = Vec::with_capacity(desired.len());
+        let mut written = 0;
+        for target in desired {
+            if !options.force
+                && current_by_path
+                    .get(&target.path)
+                    .is_some_and(|current_entry| {
+                        current_entry.id() == target.id && current_entry.mode() == target.raw_mode
+                    })
+            {
+                new_entries.push((*current_by_path[&target.path]).clone());
+                continue;
+            }
+            let relative = worktree_path(&target.path)?;
+            let full_path = work_tree.join(&relative);
+            if target.mode == EntryMode::Gitlink {
+                self.filesystem().create_dir_all(&full_path)?;
+            } else {
+                if let Some(parent) = full_path.parent() {
+                    self.filesystem().create_dir_all(parent)?;
+                }
+                if let Ok(metadata) = self.filesystem().metadata(&full_path) {
+                    if metadata.is_dir() {
+                        self.filesystem().remove_dir(&full_path)?;
+                    } else {
+                        self.filesystem().remove_file(&full_path)?;
+                    }
+                }
+                let object = self.read_object(target.id, options.max_object_size)?;
+                if object.kind() != target.mode.object_kind() {
+                    return Err(Error::InvalidTree(format!(
+                        "entry `{}` points to the wrong object type",
+                        String::from_utf8_lossy(&target.path)
+                    )));
+                }
+                if target.mode == EntryMode::Link {
+                    self.filesystem()
+                        .create_symlink(&full_path, object.data())?;
+                } else {
+                    self.filesystem().write(&full_path, object.data())?;
+                    self.filesystem()
+                        .set_executable(&full_path, target.mode == EntryMode::BlobExecutable)?;
+                }
+            }
+            let metadata = self.filesystem().metadata(&full_path)?;
+            new_entries.push(IndexEntry::new(
+                target.path,
+                target.raw_mode,
+                target.id,
+                index_stat(metadata.stat(), metadata.len()),
+            )?);
+            written += 1;
+        }
+        self.write_index(&Index::new(current.version(), new_entries)?)?;
+        Ok(written)
+    }
+
+    fn flatten_tree(
+        &self,
+        id: ObjectId,
+        prefix: &[u8],
+        max_size: usize,
+        output: &mut Vec<CheckoutEntry>,
+    ) -> Result<()> {
+        for entry in self.read_tree(id, max_size)?.entries() {
+            let mut path = prefix.to_owned();
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.extend_from_slice(entry.name());
+            if entry.mode() == EntryMode::Tree {
+                self.flatten_tree(entry.id(), &path, max_size, output)?;
+            } else {
+                output.push(CheckoutEntry {
+                    raw_mode: tree_mode(entry.mode()),
+                    mode: entry.mode(),
+                    path,
+                    id: entry.id(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn worktree_matches(&self, entry: &IndexEntry, full_path: &Path) -> Result<bool> {
+        let metadata = self.filesystem().metadata(full_path)?;
+        let (contents, mode) = if metadata.is_symlink() {
+            (self.filesystem().read_link(full_path)?, 0o120_000)
+        } else if metadata.is_file() {
+            (
+                self.filesystem().read(full_path)?,
+                if metadata.is_executable() {
+                    0o100_755
+                } else {
+                    0o100_644
+                },
+            )
+        } else if metadata.is_dir() && entry.mode() == 0o160_000 {
+            return Ok(true);
+        } else {
+            return Ok(false);
+        };
+        Ok(mode == entry.mode() && ObjectId::compute(ObjectKind::Blob, &contents) == entry.id())
+    }
+
+    fn prune_empty_parents(&self, work_tree: &Path, mut parent: Option<&Path>) -> Result<()> {
+        while let Some(relative) = parent {
+            if relative.as_os_str().is_empty() {
+                break;
+            }
+            let path = work_tree.join(relative);
+            match self.filesystem().remove_dir(&path) {
+                Ok(()) | Err(Error::NotFound(_) | Error::DirectoryNotEmpty(_)) => {}
+                Err(error) => return Err(error),
+            }
+            parent = relative.parent();
+        }
+        Ok(())
     }
 
     fn write_node_tree(&self, nodes: &BTreeMap<Vec<u8>, IndexNode>) -> Result<ObjectId> {
@@ -127,6 +366,24 @@ impl Repository {
             index_stat(metadata.stat(), metadata.len()),
         )?);
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CheckoutEntry {
+    raw_mode: u32,
+    mode: EntryMode,
+    path: Vec<u8>,
+    id: ObjectId,
+}
+
+const fn tree_mode(mode: EntryMode) -> u32 {
+    match mode {
+        EntryMode::Blob => 0o100_644,
+        EntryMode::BlobExecutable => 0o100_755,
+        EntryMode::Link => 0o120_000,
+        EntryMode::Tree => 0o040_000,
+        EntryMode::Gitlink => 0o160_000,
     }
 }
 
@@ -229,6 +486,26 @@ fn index_path(path: &Path) -> Result<Vec<u8>> {
         }
     }
     Ok(output)
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
+fn worktree_path(path: &[u8]) -> Result<PathBuf> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut output = PathBuf::new();
+    for component in path.split(|byte| *byte == b'/') {
+        output.push(OsStr::from_bytes(component));
+    }
+    Ok(output)
+}
+
+#[cfg(not(unix))]
+fn worktree_path(path: &[u8]) -> Result<PathBuf> {
+    let text = std::str::from_utf8(path)
+        .map_err(|_| Error::InvalidPath(PathBuf::from("non-UTF-8 index path")))?;
+    Ok(text.split('/').collect())
 }
 
 #[cfg(not(unix))]
@@ -348,5 +625,123 @@ mod tests {
                 .name(),
             b"nested"
         );
+    }
+
+    #[test]
+    fn checkout_materializes_modes_and_refuses_modified_overwrites() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let old = repository.write_object(ObjectKind::Blob, b"old").unwrap();
+        let new = repository.write_object(ObjectKind::Blob, b"new").unwrap();
+        let script = repository
+            .write_object(ObjectKind::Blob, b"#!/bin/sh\n")
+            .unwrap();
+        let link = repository
+            .write_object(ObjectKind::Blob, b"script")
+            .unwrap();
+        let first = repository
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Blob, b"file".to_vec(), old).unwrap(),
+                    TreeEntry::new(EntryMode::BlobExecutable, b"script".to_vec(), script).unwrap(),
+                    TreeEntry::new(EntryMode::Link, b"link".to_vec(), link).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            repository
+                .checkout_tree(first, &CheckoutOptions::default())
+                .unwrap(),
+            3
+        );
+        assert_eq!(fs.read(Path::new("repo/file")).unwrap(), b"old");
+        assert!(
+            fs.metadata(Path::new("repo/script"))
+                .unwrap()
+                .is_executable()
+        );
+        assert_eq!(fs.read_link(Path::new("repo/link")).unwrap(), b"script");
+
+        let second = repository
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Blob, b"file".to_vec(), new).unwrap(),
+                    TreeEntry::new(EntryMode::BlobExecutable, b"script".to_vec(), script).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        fs.write(Path::new("repo/file"), b"local change").unwrap();
+        assert!(matches!(
+            repository.checkout_tree(second, &CheckoutOptions::default()),
+            Err(Error::CheckoutConflict(_))
+        ));
+        assert_eq!(fs.read(Path::new("repo/file")).unwrap(), b"local change");
+        assert!(fs.exists(Path::new("repo/link")).unwrap());
+
+        repository
+            .checkout_tree(
+                second,
+                &CheckoutOptions {
+                    force: true,
+                    ..CheckoutOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(fs.read(Path::new("repo/file")).unwrap(), b"new");
+        assert!(!fs.exists(Path::new("repo/link")).unwrap());
+    }
+
+    #[test]
+    fn checkout_preserves_modifications_when_target_entry_is_unchanged() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let blob = repository
+            .write_object(ObjectKind::Blob, b"tracked")
+            .unwrap();
+        let tree = repository
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Blob, b"file".to_vec(), blob).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        repository
+            .checkout_tree(tree, &CheckoutOptions::default())
+            .unwrap();
+        fs.write(Path::new("repo/file"), b"modified").unwrap();
+        assert_eq!(
+            repository
+                .checkout_tree(tree, &CheckoutOptions::default())
+                .unwrap(),
+            0
+        );
+        assert_eq!(fs.read(Path::new("repo/file")).unwrap(), b"modified");
+    }
+
+    #[test]
+    fn checkout_refuses_an_untracked_collision_before_mutating() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let blob = repository
+            .write_object(ObjectKind::Blob, b"target")
+            .unwrap();
+        let tree = repository
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Blob, b"untracked".to_vec(), blob).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        fs.write(Path::new("repo/untracked"), b"local").unwrap();
+        assert!(matches!(
+            repository.checkout_tree(tree, &CheckoutOptions::default()),
+            Err(Error::CheckoutConflict(_))
+        ));
+        assert_eq!(fs.read(Path::new("repo/untracked")).unwrap(), b"local");
+        assert!(repository.read_index().unwrap().entries().is_empty());
     }
 }
