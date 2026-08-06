@@ -28,6 +28,15 @@ pub struct RemoveWorktreeOptions {
     pub override_lock: bool,
 }
 
+/// Collision and lock authority for linked-worktree moves.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MoveWorktreeOptions {
+    /// Replace a missing, already-registered destination.
+    pub force_registered_destination: bool,
+    /// Move a locked source or replace a locked missing destination.
+    pub override_locks: bool,
+}
+
 impl Default for AddWorktreeOptions {
     fn default() -> Self {
         Self {
@@ -99,6 +108,68 @@ impl Default for WorktreePruneOptions {
 }
 
 impl Repository {
+    /// Move a linked worktree directory and update both Git linking files.
+    ///
+    /// When `destination` is an existing directory, the source directory name
+    /// is appended, matching `git worktree move`. The returned path is the
+    /// resolved destination in the adapter namespace.
+    ///
+    /// # Errors
+    /// Returns an error for invalid registration links, occupied or registered
+    /// destinations without authority, locks, populated submodules, adapter
+    /// rename failure, or link-repair failure.
+    pub fn move_worktree(
+        &self,
+        name: &str,
+        destination: impl AsRef<Path>,
+        options: &MoveWorktreeOptions,
+    ) -> Result<PathBuf> {
+        let admin = self.worktree_admin_dir(name)?;
+        if self.worktree_lock_reason(name)?.is_some() && !options.override_locks {
+            return Err(Error::ReferenceConflict(format!(
+                "worktree `{name}` is locked"
+            )));
+        }
+        let backlink = parse_path_file(&self.filesystem().read(&admin.join("gitdir"))?)?;
+        let dot_git = resolve_worktree_path(&admin, &backlink)?;
+        let source = dot_git
+            .parent()
+            .ok_or_else(|| Error::InvalidRepository("invalid worktree backlink".into()))?
+            .to_path_buf();
+        if !self.filesystem().metadata(&source)?.is_dir() {
+            return Err(Error::NotDirectory(source));
+        }
+        self.validate_worktree_gitfile(&source, &admin)?;
+        self.reject_movable_worktree_submodules(&admin, &source)?;
+
+        let mut destination = normalized_storage_path(destination.as_ref())?;
+        match self.filesystem().metadata(&destination) {
+            Ok(metadata) if metadata.is_dir() => {
+                let basename = source.file_name().ok_or_else(|| {
+                    Error::InvalidRepository("worktree has no directory name".into())
+                })?;
+                destination.push(basename);
+            }
+            Ok(_) => return Err(Error::AlreadyExists(destination)),
+            Err(Error::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        if destination == source || destination.starts_with(&source) {
+            return Err(Error::InvalidPath(destination));
+        }
+        if self.filesystem().exists(&destination)? {
+            return Err(Error::AlreadyExists(destination));
+        }
+        self.remove_registered_move_destination(name, &destination, options)?;
+
+        self.filesystem().rename(&source, &destination)?;
+        if let Err(error) = self.repair_worktree(name, &destination) {
+            let _ = self.filesystem().rename(&destination, &source);
+            return Err(error);
+        }
+        Ok(destination)
+    }
+
     /// Repair both linking files after a linked worktree has been moved to
     /// `path` outside this library.
     ///
@@ -495,6 +566,89 @@ impl Repository {
         Ok(admin)
     }
 
+    fn reject_movable_worktree_submodules(&self, admin: &Path, source: &Path) -> Result<()> {
+        if self.filesystem().exists(&admin.join("modules"))? {
+            return Err(Error::InvalidRepository(
+                "worktrees containing submodules cannot be moved".into(),
+            ));
+        }
+        let index = match self.filesystem().read(&admin.join("index")) {
+            Ok(contents) => crate::Index::parse(&contents)?,
+            Err(Error::NotFound(_)) => crate::Index::default(),
+            Err(error) => return Err(error),
+        };
+        for entry in index.entries() {
+            if entry.stage() != 0 || entry.mode() != 0o160_000 {
+                continue;
+            }
+            let path = std::str::from_utf8(entry.path()).map_err(|_| {
+                Error::InvalidRepository("non-UTF-8 submodule path cannot be inspected".into())
+            })?;
+            if self.filesystem().exists(&source.join(path))? {
+                return Err(Error::InvalidRepository(
+                    "worktrees containing populated submodules cannot be moved".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_worktree_gitfile(&self, source: &Path, admin: &Path) -> Result<()> {
+        let contents = self.filesystem().read(&source.join(".git"))?;
+        let line = contents.strip_suffix(b"\n").unwrap_or(&contents);
+        let value = line
+            .strip_prefix(b"gitdir: ")
+            .ok_or_else(|| Error::InvalidRepository("worktree .git file is malformed".into()))?;
+        let path = parse_path_file(value)?;
+        let resolved = resolve_worktree_path(source, &path)?;
+        if resolved != admin {
+            return Err(Error::InvalidRepository(
+                "worktree .git file points at a different registration".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn remove_registered_move_destination(
+        &self,
+        moving_name: &str,
+        destination: &Path,
+        options: &MoveWorktreeOptions,
+    ) -> Result<()> {
+        let root = self.common_dir().join("worktrees");
+        for entry in self.filesystem().read_dir(&root)? {
+            let Some(name) = entry.to_str() else { continue };
+            if name == moving_name {
+                continue;
+            }
+            let admin = root.join(&entry);
+            let Ok(contents) = self.filesystem().read(&admin.join("gitdir")) else {
+                continue;
+            };
+            let Ok(backlink) = parse_path_file(&contents) else {
+                continue;
+            };
+            let Ok(dot_git) = resolve_worktree_path(&admin, &backlink) else {
+                continue;
+            };
+            if dot_git.parent() != Some(destination) {
+                continue;
+            }
+            if !options.force_registered_destination {
+                return Err(Error::ReferenceConflict(format!(
+                    "destination is registered as worktree `{name}`"
+                )));
+            }
+            if self.filesystem().exists(&admin.join("locked"))? && !options.override_locks {
+                return Err(Error::ReferenceConflict(format!(
+                    "destination worktree `{name}` is locked"
+                )));
+            }
+            remove_tree(self.filesystem(), &admin)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn ensure_branch_available(&self, branch: &ReferenceName) -> Result<()> {
         if symbolic_head_matches(
             &self.filesystem().read(&self.common_dir().join("HEAD"))?,
@@ -737,8 +891,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        AddWorktreeOptions, RemoveWorktreeOptions, WorktreePruneOptions, WorktreePruneReason,
-        WorktreeTarget, remove_tree,
+        AddWorktreeOptions, MoveWorktreeOptions, RemoveWorktreeOptions, WorktreePruneOptions,
+        WorktreePruneReason, WorktreeTarget, remove_tree,
     };
     use crate::{
         CommitBuilder, EntryMode, FileSystem, InitOptions, MemoryFileSystem, ObjectKind,
@@ -960,6 +1114,99 @@ mod tests {
                 .unwrap(),
             tip
         );
+    }
+
+    #[test]
+    fn moves_locked_worktree_into_container_with_explicit_authority() {
+        let filesystem = MemoryFileSystem::new();
+        let repository =
+            Repository::init(filesystem.clone(), "main", &InitOptions::default()).unwrap();
+        let tip = commit(&repository, None, b"move\n");
+        repository
+            .add_worktree(
+                "old-place",
+                "moving",
+                &WorktreeTarget::Detached(tip),
+                &AddWorktreeOptions::default(),
+            )
+            .unwrap();
+        repository.lock_worktree("moving", Some("mounted")).unwrap();
+        filesystem.create_dir_all(Path::new("container")).unwrap();
+
+        assert!(
+            repository
+                .move_worktree("moving", "container", &MoveWorktreeOptions::default())
+                .is_err()
+        );
+        let destination = repository
+            .move_worktree(
+                "moving",
+                "container",
+                &MoveWorktreeOptions {
+                    override_locks: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(destination, Path::new("container/old-place"));
+        assert!(!filesystem.exists(Path::new("old-place")).unwrap());
+        assert_eq!(
+            filesystem
+                .read(Path::new("container/old-place/file"))
+                .unwrap(),
+            b"move\n"
+        );
+        assert_eq!(
+            repository.linked_worktrees().unwrap()[0].path,
+            Path::new("container/old-place")
+        );
+        assert_eq!(
+            Repository::open(filesystem, "container/old-place")
+                .unwrap()
+                .resolve_reference("HEAD")
+                .unwrap(),
+            tip
+        );
+    }
+
+    #[test]
+    fn move_requires_force_to_replace_a_missing_registration() {
+        let filesystem = MemoryFileSystem::new();
+        let repository =
+            Repository::init(filesystem.clone(), "main", &InitOptions::default()).unwrap();
+        let tip = commit(&repository, None, b"move\n");
+        for (path, name) in [("source", "source"), ("destination", "stale")] {
+            repository
+                .add_worktree(
+                    path,
+                    name,
+                    &WorktreeTarget::Detached(tip),
+                    &AddWorktreeOptions::default(),
+                )
+                .unwrap();
+        }
+        remove_tree(&filesystem, Path::new("destination")).unwrap();
+        assert!(
+            repository
+                .move_worktree("source", "destination", &MoveWorktreeOptions::default())
+                .is_err()
+        );
+        repository
+            .move_worktree(
+                "source",
+                "destination",
+                &MoveWorktreeOptions {
+                    force_registered_destination: true,
+                    override_locks: false,
+                },
+            )
+            .unwrap();
+        assert!(
+            !filesystem
+                .exists(Path::new("main/.git/worktrees/stale"))
+                .unwrap()
+        );
+        assert!(filesystem.exists(Path::new("destination/.git")).unwrap());
     }
 
     #[test]

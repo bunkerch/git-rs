@@ -76,8 +76,8 @@ pub use grep::{GrepBinaryMode, GrepMatch, GrepOptions, GrepTarget};
 pub use ignore::{IgnoreMatcher, IgnoreRule};
 pub use index::{Index, IndexEntry, IndexExtension, IndexVersion, StatData};
 pub use linked_worktree::{
-    AddWorktreeOptions, LinkedWorktreeInfo, RemoveWorktreeOptions, WorktreePruneEntry,
-    WorktreePruneOptions, WorktreePruneReason, WorktreeTarget,
+    AddWorktreeOptions, LinkedWorktreeInfo, MoveWorktreeOptions, RemoveWorktreeOptions,
+    WorktreePruneEntry, WorktreePruneOptions, WorktreePruneReason, WorktreeTarget,
 };
 pub use ls_files::{LsFilesEntry, LsFilesKind, LsFilesOptions};
 pub use ls_tree::{LsTreeEntry, LsTreeOptions};

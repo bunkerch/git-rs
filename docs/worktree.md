@@ -211,6 +211,34 @@ The explicit administrative name avoids guessing ownership from a corrupt path
 and lets callers repair a missing `.git` file after their storage layer moves
 the worktree.
 
+## Moving linked worktrees
+
+`move_worktree` relocates the complete directory through the adapter's atomic
+rename and then repairs both relative linking files:
+
+```rust
+# use git_rs::{MoveWorktreeOptions, Repository};
+# fn example(repository: &Repository) -> git_rs::Result<()> {
+let destination = repository.move_worktree(
+    "topic-work",
+    "archive",
+    &MoveWorktreeOptions::default(),
+)?;
+println!("moved to {}", destination.display());
+# Ok(())
+# }
+```
+
+Like Git, an existing destination directory is treated as a container and the
+source basename is appended. Files, non-empty final destinations, moves inside
+the source, populated submodules, and ordinary locked sources are rejected.
+`override_locks` is the library equivalent of Git's second `--force`.
+
+A missing worktree may still own the destination through another administrative
+entry. `force_registered_destination` permits replacing an unlocked stale
+registration; replacing a locked one additionally requires `override_locks`.
+If link repair fails after the directory rename, the adapter rename is reversed.
+
 ## Filesystem requirements
 
 Adapters expose no-follow metadata, symlink target reads/creation, executable
@@ -247,3 +275,6 @@ provide stat identity enable Git's fast unchanged-file checks.
 - `worktree.c:repair_gitfile`, `repair_worktree_at_path`, and
   `write_worktree_linking_files` define bidirectional repair and relative-link
   formatting after external moves.
+- `builtin/worktree.c:move_worktree`, `check_candidate_path`, and
+  `validate_no_submodules` define container destinations, registration-force
+  levels, lock protection, and submodule refusal.
