@@ -197,3 +197,313 @@ fn build_pack_matches_git_verify() {
     let output = String::from_utf8_lossy(&git_output);
     assert!(output.contains(&blob_id.to_string()), "verify-pack missing blob: {output}");
 }
+
+/// Verify git-rs commit tree matches `git commit-tree --stdin`.
+#[test]
+fn commit_tree_matches_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), true);
+
+    let blob_id = repo.write_object(ObjectKind::Blob, b"hello\n").unwrap();
+    let tree = Tree::new(vec![
+        TreeEntry::new(EntryMode::Blob, b"greeting".to_vec(), blob_id).unwrap(),
+    ])
+    .unwrap();
+    let tree_id = repo.write_tree(&tree).unwrap();
+
+    let commit = CommitBuilder::new(tree_id, ident(), ident())
+        .message(b"initial\n".to_vec())
+        .build();
+    let commit_id = repo.write_commit(&commit).unwrap();
+
+    let git_output = git(
+        &["cat-file", "-p", &commit_id.to_string()],
+        dir.path(),
+    );
+    let git_body = String::from_utf8_lossy(&git_output);
+    assert!(git_body.starts_with("tree "), "commit missing tree header: {git_body}");
+    assert!(git_body.contains("author Test"), "commit missing author: {git_body}");
+    assert!(git_body.contains("committer Test"), "commit missing committer: {git_body}");
+    assert!(git_body.contains("\ninitial\n"), "commit missing message: {git_body}");
+}
+
+/// Verify git-rs describe output matches `git describe`.
+#[test]
+fn describe_matches_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), true);
+
+    let blob_id = repo.write_object(ObjectKind::Blob, b"content\n").unwrap();
+    let tree = Tree::new(vec![
+        TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap(),
+    ])
+    .unwrap();
+    let tree_id = repo.write_tree(&tree).unwrap();
+
+    // First commit on main
+    let first = repo
+        .write_commit(&CommitBuilder::new(tree_id, ident(), ident()).message(b"first\n".to_vec()).build())
+        .unwrap();
+    repo.update_reference(
+        &ReferenceName::branch("main").unwrap(),
+        first,
+        git_rs::PreviousValue::MustNotExist,
+    )
+    .unwrap();
+
+    // Tag the first commit using create_annotated_tag
+    let tag = git_rs::TagBuilder::new(first, ObjectKind::Commit, "v1.0", ident())
+        .unwrap()
+        .message(b"release\n".to_vec())
+        .build();
+    repo.create_annotated_tag("v1.0", &tag, false, 4096).unwrap();
+
+    // Second commit
+    let second = repo
+        .write_commit(
+            &CommitBuilder::new(tree_id, ident(), ident())
+                .parent(first)
+                .message(b"second\n".to_vec())
+                .build(),
+        )
+        .unwrap();
+    repo.update_reference(
+        &ReferenceName::branch("main").unwrap(),
+        second,
+        git_rs::PreviousValue::Any,
+    )
+    .unwrap();
+
+    let description = repo.describe("HEAD", &Default::default()).unwrap();
+    let describe_str = &*description.rendered();
+
+    let git_output = git(&["describe", "--always"], dir.path());
+    let git_desc = String::from_utf8_lossy(&git_output).trim().to_owned();
+    assert!(
+        describe_str.starts_with("v1.0"),
+        "describe should start with tag: {describe_str}"
+    );
+    assert_eq!(describe_str, git_desc, "describe mismatch: git-rs={describe_str} git={git_desc}");
+}
+
+/// Verify git-rs merge-base matches `git merge-base`.
+#[test]
+fn merge_base_matches_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), true);
+
+    let blob_id = repo.write_object(ObjectKind::Blob, b"base\n").unwrap();
+    let tree_id = repo.write_tree(
+        &Tree::new(vec![TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap()]).unwrap(),
+    )
+    .unwrap();
+
+    // Root commit
+    let root = repo
+        .write_commit(&CommitBuilder::new(tree_id, ident(), ident()).message(b"root\n".to_vec()).build())
+        .unwrap();
+
+    // Left branch
+    let left_blob = repo.write_object(ObjectKind::Blob, b"left\n").unwrap();
+    let left_tree = repo.write_tree(
+        &Tree::new(vec![TreeEntry::new(EntryMode::Blob, b"f".to_vec(), left_blob).unwrap()]).unwrap(),
+    )
+    .unwrap();
+    let left = repo
+        .write_commit(
+            &CommitBuilder::new(left_tree, ident(), ident())
+                .parent(root)
+                .message(b"left\n".to_vec())
+                .build(),
+        )
+        .unwrap();
+
+    // Right branch
+    let right_blob = repo.write_object(ObjectKind::Blob, b"right\n").unwrap();
+    let right_tree = repo.write_tree(
+        &Tree::new(vec![TreeEntry::new(EntryMode::Blob, b"f".to_vec(), right_blob).unwrap()]).unwrap(),
+    )
+    .unwrap();
+    let right = repo
+        .write_commit(
+            &CommitBuilder::new(right_tree, ident(), ident())
+                .parent(root)
+                .message(b"right\n".to_vec())
+                .build(),
+        )
+        .unwrap();
+
+    repo.update_reference(
+        &ReferenceName::branch("left").unwrap(),
+        left,
+        git_rs::PreviousValue::MustNotExist,
+    )
+    .unwrap();
+    repo.update_reference(
+        &ReferenceName::branch("right").unwrap(),
+        right,
+        git_rs::PreviousValue::MustNotExist,
+    )
+    .unwrap();
+
+    let mb = repo.merge_bases(left, right, &Default::default()).unwrap();
+    assert_eq!(mb.len(), 1, "expected exactly one merge base");
+    assert_eq!(mb[0], root, "merge base should be root commit");
+
+    let git_output = git(&["merge-base", "refs/heads/left", "refs/heads/right"], dir.path());
+    let git_base = String::from_utf8_lossy(&git_output).trim().to_owned();
+    assert_eq!(root.to_string(), git_base, "merge-base mismatch");
+}
+
+/// Verify git-rs mktree round-trips correctly for complex trees.
+#[test]
+fn mktree_with_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), true);
+
+    let blob_a = repo.write_object(ObjectKind::Blob, b"alpha\n").unwrap();
+    let blob_b = repo.write_object(ObjectKind::Blob, b"beta\n").unwrap();
+
+    let sub = Tree::new(vec![
+        TreeEntry::new(EntryMode::Blob, b"nested".to_vec(), blob_b).unwrap(),
+    ])
+    .unwrap();
+    let sub_id = repo.write_tree(&sub).unwrap();
+
+    let tree = Tree::new(vec![
+        TreeEntry::new(EntryMode::Blob, b"a".to_vec(), blob_a).unwrap(),
+        TreeEntry::new(EntryMode::Tree, b"sub".to_vec(), sub_id).unwrap(),
+    ])
+    .unwrap();
+    let tree_id = repo.write_tree(&tree).unwrap();
+
+    // Verify with git ls-tree
+    let git_bytes = git(&["ls-tree", &tree_id.to_string()], dir.path());
+    let raw_output = String::from_utf8_lossy(&git_bytes);
+    let lines: Vec<&str> = raw_output.lines().collect();
+    assert_eq!(lines.len(), 2, "expected 2 tree entries, got {lines:?}");
+    assert!(
+        lines.iter().any(|l| l.contains("blob") && l.ends_with("a")),
+        "missing blob entry 'a': {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("tree") && l.ends_with("sub")),
+        "missing tree entry 'sub': {lines:?}"
+    );
+}
+
+/// Verify git-rs diff output format matches git's unified diff.
+#[test]
+fn diff_matches_git_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), false);
+
+    std::fs::write(dir.path().join("file.txt"), b"old content\n").unwrap();
+    repo.add("file.txt").unwrap();
+    let first_tree = repo.write_index_tree(&repo.read_index().unwrap()).unwrap();
+    let first = repo
+        .write_commit(
+            &CommitBuilder::new(first_tree, ident(), ident())
+                .message(b"first\n".to_vec())
+                .build(),
+        )
+        .unwrap();
+    repo.update_reference(
+        &ReferenceName::branch("main").unwrap(),
+        first,
+        git_rs::PreviousValue::MustNotExist,
+    )
+    .unwrap();
+
+    std::fs::write(dir.path().join("file.txt"), b"new content\n").unwrap();
+    repo.add("file.txt").unwrap();
+    let second_tree = repo.write_index_tree(&repo.read_index().unwrap()).unwrap();
+    let second = repo
+        .write_commit(
+            &CommitBuilder::new(second_tree, ident(), ident())
+                .message(b"second\n".to_vec())
+                .build(),
+        )
+        .unwrap();
+    repo.update_reference(
+        &ReferenceName::branch("main").unwrap(),
+        second,
+        git_rs::PreviousValue::Any,
+    )
+    .unwrap();
+
+    // Get the diff between the two trees
+    let diff_entries = repo.diff_trees(Some(first_tree), Some(second_tree), &Default::default()).unwrap();
+    let mut diff_output = Vec::new();
+    for entry in &diff_entries {
+        diff_output.extend(repo.render_patch(entry, &Default::default()).unwrap());
+    }
+    let diff_str = String::from_utf8_lossy(&diff_output);
+    assert!(
+        diff_str.starts_with("diff --git"),
+        "diff should start with diff --git: {diff_str}"
+    );
+    assert!(
+        diff_str.contains("--- a/file.txt"),
+        "diff should have --- a/file.txt: {diff_str}"
+    );
+    assert!(
+        diff_str.contains("+++ b/file.txt"),
+        "diff should have +++ b/file.txt: {diff_str}"
+    );
+    assert!(
+        diff_str.contains("-old content"),
+        "diff should show -old content: {diff_str}"
+    );
+    assert!(
+        diff_str.contains("+new content"),
+        "diff should show +new content: {diff_str}"
+    );
+}
+
+/// Verify in-process fetch transport between two host repositories.
+#[test]
+fn in_process_fetch_matches_git() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+
+    // Source: create a repository with one commit
+    let source = init_repo(source_dir.path(), true);
+    let blob_id = source.write_object(ObjectKind::Blob, b"shared\n").unwrap();
+    let tree_id = source.write_tree(
+        &Tree::new(vec![TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap()]).unwrap(),
+    )
+    .unwrap();
+    let commit_id = source
+        .write_commit(
+            &CommitBuilder::new(tree_id, ident(), ident())
+                .message(b"shared\n".to_vec())
+                .build(),
+        )
+        .unwrap();
+    source
+        .update_reference(
+            &ReferenceName::branch("main").unwrap(),
+            commit_id,
+            git_rs::PreviousValue::MustNotExist,
+        )
+        .unwrap();
+
+    // Target: bare repo, fetch from source via in-process transport
+    let target = init_repo(target_dir.path(), true);
+    let mut transport =
+        git_rs::RepositoryTransport::new(&source, git_rs::UploadPackOptions::default());
+    target
+        .fetch(&mut transport, &git_rs::FetchOptions::default())
+        .unwrap();
+    let new_id = target.resolve_reference("refs/remotes/origin/main").unwrap();
+    assert_eq!(new_id, commit_id, "fetched commit should match source");
+
+    // Verify git can see the fetched data in the target
+    let git_output = git(
+        &["cat-file", "-p", &commit_id.to_string()],
+        target_dir.path(),
+    );
+    let body = String::from_utf8_lossy(&git_output);
+    assert!(body.contains("shared\n"), "fetched object not readable by git: {body}");
+}
