@@ -9,6 +9,7 @@ pub mod branch;
 pub mod bundle;
 pub mod clean;
 pub mod commit;
+pub mod commit_graph;
 pub mod commit_operation;
 pub mod config;
 pub mod count_objects;
@@ -70,6 +71,7 @@ pub use bundle::{
 };
 pub use clean::{CleanEntry, CleanIgnoredMode, CleanOptions};
 pub use commit::{Commit, CommitBuilder, ExtraHeader, Signature};
+pub use commit_graph::{CommitGraph, CommitGraphEntry, CommitGraphOptions, CommitGraphReport};
 pub use commit_operation::CommitOptions;
 pub use config::{Config, ConfigEntry};
 pub use count_objects::{

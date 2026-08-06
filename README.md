@@ -35,6 +35,8 @@ Expiry-controlled loose-object pruning is documented in
 [`docs/prune.md`](docs/prune.md).
 Repository-wide lock-scoped garbage collection is documented in
 [`docs/gc.md`](docs/gc.md).
+Git-compatible, storage-agnostic commit-graph generation and validation is
+documented in [`docs/commit-graph.md`](docs/commit-graph.md).
 Full object and connectivity verification is documented in
 [`docs/fsck.md`](docs/fsck.md).
 Bounded loose, packed, duplicate, size, and garbage inventory is documented in

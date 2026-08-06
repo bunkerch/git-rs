@@ -99,6 +99,19 @@ impl Repository {
         if ancestor == descendant {
             return Ok(true);
         }
+        if !self.has_active_replacements()? {
+            match self.read_commit_graph(options.max_object_size, options.max_commits) {
+                Ok(graph) => {
+                    if let Some(result) =
+                        graph.is_ancestor(ancestor, descendant, options.max_commits)?
+                    {
+                        return Ok(result);
+                    }
+                }
+                Err(Error::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
         let mut pending = vec![descendant];
         let mut seen = HashSet::new();
         while let Some(id) = pending.pop() {

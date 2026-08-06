@@ -165,6 +165,17 @@ impl Repository {
         Ok(())
     }
 
+    pub(crate) fn has_active_replacements(&self) -> Result<bool> {
+        self.prepare_replacements()?;
+        Ok(!self
+            .replacements
+            .read()
+            .map_err(|_| Error::InvalidRepository("replace cache lock poisoned".into()))?
+            .as_ref()
+            .ok_or_else(|| Error::InvalidRepository("replace cache was not initialized".into()))?
+            .is_empty())
+    }
+
     fn load_replacements(&self, honor_config: bool) -> Result<BTreeMap<ObjectId, ObjectId>> {
         if honor_config {
             let config = self.read_config()?;
