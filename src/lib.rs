@@ -15,6 +15,7 @@ pub mod ignore;
 pub mod index;
 pub mod linked_worktree;
 pub mod merge;
+pub mod notes;
 pub mod object;
 pub mod operations;
 pub mod pack;
@@ -59,6 +60,7 @@ pub use linked_worktree::{AddWorktreeOptions, LinkedWorktreeInfo, WorktreeTarget
 pub use merge::{
     FastForwardMode, MergeOptions, MergeResult, ReplayKind, ReplayOptions, ReplayResult,
 };
+pub use notes::{DEFAULT_NOTES_REF, Note, NotesOptions};
 pub use object::{Object, ObjectId, ObjectKind};
 pub use operations::{ResetMode, ResetOptions, SwitchOptions};
 pub use pack::{

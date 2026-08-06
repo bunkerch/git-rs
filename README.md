@@ -80,6 +80,8 @@ Named remotes and typed fetch/push refspecs are documented in
 [`docs/remotes.md`](docs/remotes.md).
 Git-compatible stash topology, application, conflicts, untracked capture, and
 reflog management are documented in [`docs/stash.md`](docs/stash.md).
+Git-compatible object annotations, including fanout notes trees and
+transactional updates, are documented in [`docs/notes.md`](docs/notes.md).
 
 To create a host-backed repository with the included example:
 
