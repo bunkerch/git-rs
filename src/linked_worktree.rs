@@ -18,6 +18,16 @@ pub struct AddWorktreeOptions {
     pub max_object_size: usize,
 }
 
+/// Safety settings for linked-worktree removal.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RemoveWorktreeOptions {
+    /// Permit removal when the linked worktree has local changes.
+    pub force: bool,
+    /// Permit removal of a locked worktree. Git spells this second authority
+    /// as a second `--force`; it is kept distinct in the library API.
+    pub override_lock: bool,
+}
+
 impl Default for AddWorktreeOptions {
     fn default() -> Self {
         Self {
@@ -89,6 +99,59 @@ impl Default for WorktreePruneOptions {
 }
 
 impl Repository {
+    /// Return the trimmed lock reason, or `None` when the worktree is unlocked.
+    /// An empty string represents a lock without a stated reason.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid name, missing registration, non-UTF-8
+    /// lock content, or storage failure.
+    pub fn worktree_lock_reason(&self, name: &str) -> Result<Option<String>> {
+        let admin = self.worktree_admin_dir(name)?;
+        let path = admin.join("locked");
+        match self.filesystem().read(&path) {
+            Ok(contents) => {
+                let reason = std::str::from_utf8(&contents).map_err(|_| {
+                    Error::InvalidRepository("non-UTF-8 worktree lock reason".into())
+                })?;
+                Ok(Some(reason.trim().to_owned()))
+            }
+            Err(Error::NotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Lock a linked worktree so automatic pruning and ordinary removal retain
+    /// its registration.
+    ///
+    /// The reason is stored in Git's `worktrees/<name>/locked` format.
+    ///
+    /// # Errors
+    /// Returns an error for a missing registration, an existing lock, a reason
+    /// containing NUL, or storage failure.
+    pub fn lock_worktree(&self, name: &str, reason: Option<&str>) -> Result<()> {
+        let admin = self.worktree_admin_dir(name)?;
+        let reason = reason.unwrap_or("");
+        if reason.contains('\0') {
+            return Err(Error::InvalidRepository(
+                "worktree lock reason contains NUL".into(),
+            ));
+        }
+        let mut contents = reason.as_bytes().to_vec();
+        contents.push(b'\n');
+        self.filesystem()
+            .write_new(&admin.join("locked"), &contents)
+    }
+
+    /// Unlock a linked worktree.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid or missing registration, an unlocked
+    /// worktree, or storage failure.
+    pub fn unlock_worktree(&self, name: &str) -> Result<()> {
+        let admin = self.worktree_admin_dir(name)?;
+        self.filesystem().remove_file(&admin.join("locked"))
+    }
+
     /// Discover and optionally remove stale linked-worktree registrations.
     ///
     /// Only the administrative entry below `worktrees/` is removed. A
@@ -322,8 +385,33 @@ impl Repository {
     /// Returns an error for an invalid or missing registration, dirty worktree,
     /// corrupt backlink, or storage failure.
     pub fn remove_worktree(&self, name: &str, force: bool) -> Result<()> {
+        self.remove_worktree_with_options(
+            name,
+            &RemoveWorktreeOptions {
+                force,
+                override_lock: false,
+            },
+        )
+    }
+
+    /// Remove a linked worktree with independent dirty-state and lock
+    /// authorities.
+    ///
+    /// # Errors
+    /// Returns an error for a locked worktree without `override_lock`, a dirty
+    /// worktree without `force`, invalid metadata, or storage failure.
+    pub fn remove_worktree_with_options(
+        &self,
+        name: &str,
+        options: &RemoveWorktreeOptions,
+    ) -> Result<()> {
         validate_worktree_name(name)?;
         let admin = self.common_dir().join("worktrees").join(name);
+        if self.worktree_lock_reason(name)?.is_some() && !options.override_lock {
+            return Err(Error::ReferenceConflict(format!(
+                "worktree `{name}` is locked"
+            )));
+        }
         let backlink = parse_path_file(&self.filesystem().read(&admin.join("gitdir"))?)?;
         let dot_git = resolve_relative(&admin, &backlink)?;
         let path = dot_git
@@ -331,7 +419,7 @@ impl Repository {
             .ok_or_else(|| Error::InvalidRepository("invalid worktree backlink".into()))?
             .to_path_buf();
         if self.filesystem().exists(&path)? {
-            if !force {
+            if !options.force {
                 let linked = Repository::open_shared(self.shared_filesystem(), &path)?;
                 let status = linked.status(&StatusOptions::default())?;
                 if !status.is_clean() {
@@ -347,6 +435,15 @@ impl Repository {
             remove_tree(self.filesystem(), &path)?;
         }
         remove_tree(self.filesystem(), &admin)
+    }
+
+    fn worktree_admin_dir(&self, name: &str) -> Result<PathBuf> {
+        validate_worktree_name(name)?;
+        let admin = self.common_dir().join("worktrees").join(name);
+        if !self.filesystem().metadata(&admin)?.is_dir() {
+            return Err(Error::NotDirectory(admin));
+        }
+        Ok(admin)
     }
 
     pub(crate) fn ensure_branch_available(&self, branch: &ReferenceName) -> Result<()> {
@@ -541,7 +638,10 @@ fn remove_tree(filesystem: &dyn crate::FileSystem, path: &Path) -> Result<()> {
 mod tests {
     use std::path::Path;
 
-    use super::{AddWorktreeOptions, WorktreePruneOptions, WorktreePruneReason, WorktreeTarget};
+    use super::{
+        AddWorktreeOptions, RemoveWorktreeOptions, WorktreePruneOptions, WorktreePruneReason,
+        WorktreeTarget,
+    };
     use crate::{
         CommitBuilder, EntryMode, FileSystem, InitOptions, MemoryFileSystem, ObjectKind,
         PreviousValue, ReferenceName, Repository, Signature, Tree, TreeEntry,
@@ -642,6 +742,55 @@ mod tests {
         repository.remove_worktree("topic-work", true).unwrap();
         assert!(!filesystem.exists(Path::new("topic-work")).unwrap());
         assert!(repository.linked_worktrees().unwrap().is_empty());
+    }
+
+    #[test]
+    fn locks_unlocks_and_requires_separate_lock_override_for_removal() {
+        let filesystem = MemoryFileSystem::new();
+        let repository =
+            Repository::init(filesystem.clone(), "main", &InitOptions::default()).unwrap();
+        let tip = commit(&repository, None, b"main\n");
+        repository
+            .add_worktree(
+                "detached-work",
+                "detached-work",
+                &WorktreeTarget::Detached(tip),
+                &AddWorktreeOptions::default(),
+            )
+            .unwrap();
+
+        repository
+            .lock_worktree("detached-work", Some("  portable device  "))
+            .unwrap();
+        assert_eq!(
+            filesystem
+                .read(Path::new("main/.git/worktrees/detached-work/locked"))
+                .unwrap(),
+            b"  portable device  \n"
+        );
+        assert_eq!(
+            repository.worktree_lock_reason("detached-work").unwrap(),
+            Some("portable device".to_owned())
+        );
+        assert!(repository.lock_worktree("detached-work", None).is_err());
+        assert!(repository.remove_worktree("detached-work", true).is_err());
+        repository.unlock_worktree("detached-work").unwrap();
+        assert_eq!(
+            repository.worktree_lock_reason("detached-work").unwrap(),
+            None
+        );
+        assert!(repository.unlock_worktree("detached-work").is_err());
+        repository.lock_worktree("detached-work", None).unwrap();
+        repository
+            .remove_worktree_with_options(
+                "detached-work",
+                &RemoveWorktreeOptions {
+                    force: false,
+                    override_lock: true,
+                },
+            )
+            .unwrap();
+        assert!(!filesystem.exists(Path::new("detached-work")).unwrap());
     }
 
     #[test]

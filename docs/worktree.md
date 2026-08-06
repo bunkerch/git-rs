@@ -160,6 +160,31 @@ The host-backed example is:
 cargo run --example worktree -- repository linked-path linked-name topic
 ```
 
+## Locking linked worktrees
+
+Locks protect registrations whose working directory may temporarily disappear,
+for example when stored on removable media. The lock reason uses Git's ordinary
+`worktrees/<name>/locked` file and is therefore visible to host Git.
+
+```rust
+# use git_rs::{RemoveWorktreeOptions, Repository};
+# fn example(repository: &Repository) -> git_rs::Result<()> {
+repository.lock_worktree("topic-work", Some("portable device"))?;
+assert_eq!(
+    repository.worktree_lock_reason("topic-work")?.as_deref(),
+    Some("portable device"),
+);
+repository.unlock_worktree("topic-work")?;
+# Ok(())
+# }
+```
+
+Repeat locking and unlocking an unlocked registration are errors. An ordinary
+`remove_worktree(name, true)` may bypass dirty-state protection but not a lock.
+Call `remove_worktree_with_options` with both `force` and `override_lock` when
+the caller has independently authorized both risks. Pruning always retains
+locked registrations.
+
 ## Filesystem requirements
 
 Adapters expose no-follow metadata, symlink target reads/creation, executable
@@ -190,3 +215,6 @@ provide stat identity enable Git's fast unchanged-file checks.
 - `worktree.c:get_worktrees`, `write_worktree_linking_files`, and
   `builtin/worktree.c:add_worktree` define common-directory routing, relative
   linking files, registration, checkout exclusivity, and removal safety.
+- `worktree.c:worktree_lock_reason` and `builtin/worktree.c:lock_worktree` /
+  `unlock_worktree` define lock-file creation, trimmed display reasons, and
+  state errors.
