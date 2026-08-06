@@ -25,6 +25,8 @@ Loose objects are documented in [`docs/objects.md`](docs/objects.md), and packed
 object reads in [`docs/packfiles.md`](docs/packfiles.md).
 Verified pack consolidation and safe pruning are documented in
 [`docs/repack.md`](docs/repack.md).
+Expiry-controlled loose-object pruning is documented in
+[`docs/prune.md`](docs/prune.md).
 Full object and connectivity verification is documented in
 [`docs/fsck.md`](docs/fsck.md).
 Wire-format primitives are documented in

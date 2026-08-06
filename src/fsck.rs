@@ -37,6 +37,7 @@ pub struct FsckReport {
     pub commits: usize,
     pub tags: usize,
     reachable_objects: Vec<ObjectId>,
+    packed_objects: Vec<ObjectId>,
     unreachable: Vec<ObjectId>,
     dangling: Vec<ObjectId>,
 }
@@ -45,6 +46,11 @@ impl FsckReport {
     #[must_use]
     pub fn reachable_objects(&self) -> &[ObjectId] {
         &self.reachable_objects
+    }
+
+    #[must_use]
+    pub fn packed_objects(&self) -> &[ObjectId] {
+        &self.packed_objects
     }
 
     #[must_use]
@@ -73,7 +79,8 @@ impl Repository {
     /// Returns an error for corrupt objects or packs, broken or wrongly typed
     /// links, invalid roots, storage failures, or configured resource limits.
     pub fn fsck(&self, options: &FsckOptions) -> Result<FsckReport> {
-        let ids = self.fsck_object_ids(options.max_objects, options.max_object_size)?;
+        let (ids, packed_objects) =
+            self.fsck_object_ids(options.max_objects, options.max_object_size)?;
         let mut links = BTreeMap::<ObjectId, Vec<Link>>::new();
         let mut kinds = BTreeMap::<ObjectId, ObjectKind>::new();
         let mut counts = [0_usize; 4];
@@ -163,13 +170,19 @@ impl Repository {
             commits: counts[2],
             tags: counts[3],
             reachable_objects: reachable.iter().copied().collect(),
+            packed_objects: packed_objects.into_iter().collect(),
             unreachable,
             dangling,
         })
     }
 
-    fn fsck_object_ids(&self, limit: usize, max_object_size: usize) -> Result<BTreeSet<ObjectId>> {
+    fn fsck_object_ids(
+        &self,
+        limit: usize,
+        max_object_size: usize,
+    ) -> Result<(BTreeSet<ObjectId>, BTreeSet<ObjectId>)> {
         let mut ids = BTreeSet::new();
+        let mut packed = BTreeSet::new();
         let objects = self.git_path("objects");
         for directory in self.filesystem().read_dir(&objects)? {
             let Some(fanout) = directory.to_str() else {
@@ -200,13 +213,14 @@ impl Repository {
                     }
                     for id in self.validate_indexed_pack(&packs.join(file), max_object_size)? {
                         insert_bounded(&mut ids, id, limit)?;
+                        packed.insert(id);
                     }
                 }
             }
             Err(Error::NotFound(_)) => {}
             Err(error) => return Err(error),
         }
-        Ok(ids)
+        Ok((ids, packed))
     }
 
     fn fsck_roots(&self, options: &FsckOptions) -> Result<BTreeSet<ObjectId>> {

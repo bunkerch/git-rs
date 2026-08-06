@@ -19,6 +19,7 @@ pub mod object;
 pub mod operations;
 pub mod pack;
 pub mod protocol;
+pub mod prune;
 pub mod push;
 pub mod rebase;
 pub mod receive_pack;
@@ -64,6 +65,7 @@ pub use pack::{
     WrittenPack,
 };
 pub use protocol::{Capability, PktLine, PktLineDecoder, Sideband};
+pub use prune::{PruneEntry, PruneOptions, PruneReason};
 pub use push::{
     InProcessReceivePackTransport, PushOptions, PushResult, PushStatus, PushUpdate,
     ReceivePackTransport,
