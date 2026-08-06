@@ -56,6 +56,7 @@ pub mod remote;
 pub mod repack;
 pub mod replace;
 pub mod repository;
+pub mod rerere;
 pub mod restore;
 pub mod rev_list;
 pub mod revision;
@@ -159,6 +160,7 @@ pub use remote::{Remote, RemoveRemoteResult};
 pub use repack::{RepackOptions, RepackResult};
 pub use replace::Replacement;
 pub use repository::{InitOptions, Repository};
+pub use rerere::{RerereOptions, RerereReport};
 pub use restore::{RestoreOptions, RestoreTarget};
 pub use rev_list::{
     RevListCommit, RevListObject, RevListOptions, RevListOrder, RevListParents, RevListResult,
