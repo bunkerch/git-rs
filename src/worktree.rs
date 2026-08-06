@@ -21,6 +21,48 @@ pub struct AddOptions {
     pub force: bool,
 }
 
+/// Selection, mutation, and resource policy for an atomic multi-path add.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AddTransactionOptions {
+    pub force: bool,
+    /// Update tracked paths but do not add untracked paths.
+    pub update_only: bool,
+    /// Stage tracked paths missing from the worktree as deletions.
+    pub include_removals: bool,
+    /// Record new paths with the empty-blob ID and intent-to-add flag.
+    pub intent_to_add: bool,
+    /// Override the executable bit for regular files.
+    pub executable: Option<bool>,
+    /// Validate and report without writing objects or the index.
+    pub dry_run: bool,
+    pub max_file_size: usize,
+    pub max_paths: usize,
+}
+
+impl Default for AddTransactionOptions {
+    fn default() -> Self {
+        Self {
+            force: false,
+            update_only: false,
+            include_removals: true,
+            intent_to_add: false,
+            executable: None,
+            dry_run: false,
+            max_file_size: 1024 * 1024 * 1024,
+            max_paths: 1_000_000,
+        }
+    }
+}
+
+/// Paths staged, removed, or skipped by an add transaction.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AddReport {
+    pub staged: Vec<Vec<u8>>,
+    pub removed: Vec<Vec<u8>>,
+    pub ignored: Vec<Vec<u8>>,
+}
+
 /// Safety, selection, and mutation policy for tracked-path removal.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,6 +189,128 @@ impl Repository {
         entries.extend(added);
         self.write_index(&Index::new(existing.version(), entries)?)?;
         Ok(count)
+    }
+
+    /// Atomically stage multiple literal files/directories and their deletions.
+    ///
+    /// All paths, ignores, metadata, and file contents are preflighted before
+    /// object or index publication. Selections are literal repository-relative
+    /// paths; a selected directory recursively covers its descendants.
+    ///
+    /// # Errors
+    /// Returns an error for an empty or excessive selection, unmatched paths,
+    /// unsafe paths, ignored explicit files, oversized inputs, bare repositories,
+    /// unsupported file types, or object/index storage failures.
+    #[allow(clippy::too_many_lines)]
+    pub fn add_paths<P: AsRef<Path>>(
+        &self,
+        paths: &[P],
+        options: &AddTransactionOptions,
+    ) -> Result<AddReport> {
+        if paths.is_empty() || paths.len() > options.max_paths {
+            return Err(Error::InvalidRepository("invalid add path count".into()));
+        }
+        let work_tree = self
+            .work_tree()
+            .ok_or_else(|| Error::InvalidRepository("cannot add from a bare repository".into()))?;
+        let existing = self.read_index()?;
+        let tracked = existing
+            .entries()
+            .iter()
+            .map(|entry| entry.path().to_vec())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut selections = Vec::with_capacity(paths.len());
+        let mut pending = BTreeMap::<Vec<u8>, PendingAdd>::new();
+        let mut ignored = std::collections::BTreeSet::new();
+        for path in paths {
+            let relative = normalize_relative(path.as_ref())?;
+            let prefix = index_path(&relative)?;
+            let tracked_match = tracked
+                .iter()
+                .any(|candidate| path_is_selected(candidate, &prefix));
+            let target = work_tree.join(&relative);
+            let metadata = match self.filesystem().metadata(&target) {
+                Ok(metadata) => Some(metadata),
+                Err(Error::NotFound(_)) => None,
+                Err(error) => return Err(error),
+            };
+            if metadata.is_none() && !tracked_match {
+                return Err(Error::InvalidPath(relative));
+            }
+            let mut matcher = self.ignore_matcher()?;
+            matcher.add_worktree_patterns(self, work_tree, b"")?;
+            self.collect_add_plan(
+                work_tree,
+                &relative,
+                &tracked,
+                &mut matcher,
+                options,
+                true,
+                &mut pending,
+                &mut ignored,
+            )?;
+            selections.push(prefix);
+        }
+
+        let removed = existing
+            .entries()
+            .iter()
+            .filter(|entry| {
+                selections
+                    .iter()
+                    .any(|prefix| path_is_selected(entry.path(), prefix))
+                    && !pending.contains_key(entry.path())
+                    && options.include_removals
+            })
+            .map(|entry| entry.path().to_vec())
+            .collect::<std::collections::BTreeSet<_>>();
+        if pending
+            .len()
+            .saturating_add(removed.len())
+            .saturating_add(ignored.len())
+            > options.max_paths
+        {
+            return Err(Error::InvalidRepository(
+                "add result exceeds path limit".into(),
+            ));
+        }
+        let staged = pending.keys().cloned().collect::<Vec<_>>();
+        if !options.dry_run {
+            let mut entries = existing.entries().to_vec();
+            entries.retain(|entry| {
+                !pending.contains_key(entry.path()) && !removed.contains(entry.path())
+            });
+            for (path, plan) in pending {
+                let is_new = !tracked.contains(&path);
+                let (id, stat) = if options.intent_to_add && is_new {
+                    (
+                        ObjectId::compute(ObjectKind::Blob, b""),
+                        StatData::default(),
+                    )
+                } else {
+                    (
+                        self.write_object(ObjectKind::Blob, &plan.contents)?,
+                        plan.stat,
+                    )
+                };
+                entries.push(
+                    IndexEntry::new(path, plan.mode, id, stat)?
+                        .with_intent_to_add(options.intent_to_add && is_new),
+                );
+            }
+            let version = if options.intent_to_add && existing.version() == crate::IndexVersion::V2
+            {
+                crate::IndexVersion::V3
+            } else {
+                existing.version()
+            };
+            self.write_index(&Index::new(version, entries)?)?;
+        }
+        Ok(AddReport {
+            staged,
+            removed: removed.iter().cloned().collect(),
+            ignored: ignored.into_iter().collect(),
+        })
     }
 
     /// Remove one or more literal tracked paths from the index and worktree.
@@ -836,6 +1000,111 @@ impl Repository {
         )?);
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_add_plan(
+        &self,
+        work_tree: &Path,
+        relative: &Path,
+        tracked: &std::collections::BTreeSet<Vec<u8>>,
+        ignores: &mut IgnoreMatcher,
+        options: &AddTransactionOptions,
+        explicit: bool,
+        output: &mut BTreeMap<Vec<u8>, PendingAdd>,
+        skipped: &mut std::collections::BTreeSet<Vec<u8>>,
+    ) -> Result<()> {
+        let path = work_tree.join(relative);
+        let metadata = match self.filesystem().metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(Error::NotFound(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let index_path = index_path(relative)?;
+        if metadata.is_dir() {
+            ignores.add_worktree_patterns(self, work_tree, &index_path)?;
+            if !options.force
+                && !index_path.is_empty()
+                && ignores.is_ignored(&index_path, true)
+                && !tracked
+                    .iter()
+                    .any(|candidate| path_is_selected(candidate, &index_path))
+            {
+                if explicit {
+                    return Err(Error::IgnoredPath(relative.to_path_buf()));
+                }
+                skipped.insert(index_path);
+                return Ok(());
+            }
+            for child in self.filesystem().read_dir(&path)? {
+                let child_relative = relative.join(child);
+                if child_relative == Path::new(".git")
+                    || work_tree.join(&child_relative) == self.git_dir()
+                {
+                    continue;
+                }
+                self.collect_add_plan(
+                    work_tree,
+                    &child_relative,
+                    tracked,
+                    ignores,
+                    options,
+                    false,
+                    output,
+                    skipped,
+                )?;
+            }
+            return Ok(());
+        }
+        let is_tracked = tracked.contains(&index_path);
+        if options.update_only && !is_tracked {
+            return Ok(());
+        }
+        if !options.force && !is_tracked && ignores.is_ignored(&index_path, false) {
+            if explicit {
+                return Err(Error::IgnoredPath(relative.to_path_buf()));
+            }
+            skipped.insert(index_path);
+            return Ok(());
+        }
+        if metadata.len() > options.max_file_size as u64 {
+            return Err(Error::ObjectTooLarge {
+                declared: metadata.len(),
+                limit: options.max_file_size,
+            });
+        }
+        let (contents, mode) = if metadata.is_symlink() {
+            (self.filesystem().read_link(&path)?, 0o120_000)
+        } else if metadata.is_file() {
+            let executable = options.executable.unwrap_or(metadata.is_executable());
+            (
+                self.filesystem().read(&path)?,
+                if executable { 0o100_755 } else { 0o100_644 },
+            )
+        } else {
+            return Err(Error::InvalidPath(path));
+        };
+        if contents.len() > options.max_file_size {
+            return Err(Error::ObjectTooLarge {
+                declared: contents.len() as u64,
+                limit: options.max_file_size,
+            });
+        }
+        output.insert(
+            index_path,
+            PendingAdd {
+                contents,
+                mode,
+                stat: index_stat(metadata.stat(), metadata.len()),
+            },
+        );
+        Ok(())
+    }
+}
+
+struct PendingAdd {
+    contents: Vec<u8>,
+    mode: u32,
+    stat: StatData,
 }
 
 #[derive(Clone, Debug)]
@@ -1150,6 +1419,101 @@ mod tests {
             repository.read_index().unwrap().entries()[0].path(),
             b"dir/a"
         );
+    }
+
+    #[test]
+    fn multi_add_updates_adds_and_removes_in_one_index_write() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.create_dir_all(Path::new("repo/dir")).unwrap();
+        fs.write(Path::new("repo/dir/keep"), b"old").unwrap();
+        fs.write(Path::new("repo/dir/remove"), b"gone").unwrap();
+        repository.add("dir").unwrap();
+        fs.write(Path::new("repo/dir/keep"), b"new").unwrap();
+        fs.remove_file(Path::new("repo/dir/remove")).unwrap();
+        fs.write(Path::new("repo/dir/add"), b"added").unwrap();
+
+        let report = repository
+            .add_paths(&["dir"], &AddTransactionOptions::default())
+            .unwrap();
+        assert_eq!(report.staged, [b"dir/add".to_vec(), b"dir/keep".to_vec()]);
+        assert_eq!(report.removed, [b"dir/remove".to_vec()]);
+        let index = repository.read_index().unwrap();
+        assert_eq!(index.entries().len(), 2);
+        assert_eq!(
+            repository
+                .read_object(index.entries()[1].id(), 32)
+                .unwrap()
+                .data(),
+            b"new"
+        );
+    }
+
+    #[test]
+    fn add_transaction_supports_dry_run_update_intent_chmod_and_limits() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.write(Path::new("repo/tracked"), b"old").unwrap();
+        repository.add("tracked").unwrap();
+        fs.write(Path::new("repo/tracked"), b"new").unwrap();
+        fs.write(Path::new("repo/untracked"), b"value").unwrap();
+        let before = repository.read_index().unwrap().encode().unwrap();
+        let dry = repository
+            .add_paths(
+                &["tracked", "untracked"],
+                &AddTransactionOptions {
+                    dry_run: true,
+                    executable: Some(true),
+                    ..AddTransactionOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(dry.staged.len(), 2);
+        assert_eq!(repository.read_index().unwrap().encode().unwrap(), before);
+
+        repository
+            .add_paths(
+                &["tracked", "untracked"],
+                &AddTransactionOptions {
+                    update_only: true,
+                    executable: Some(true),
+                    ..AddTransactionOptions::default()
+                },
+            )
+            .unwrap();
+        let index = repository.read_index().unwrap();
+        assert_eq!(index.entries().len(), 1);
+        assert_eq!(index.entries()[0].mode(), 0o100_755);
+
+        repository
+            .add_paths(
+                &["untracked"],
+                &AddTransactionOptions {
+                    intent_to_add: true,
+                    ..AddTransactionOptions::default()
+                },
+            )
+            .unwrap();
+        let intent = repository
+            .read_index()
+            .unwrap()
+            .entries()
+            .iter()
+            .find(|entry| entry.path() == b"untracked")
+            .unwrap()
+            .clone();
+        assert!(intent.intent_to_add());
+        assert_eq!(intent.id(), ObjectId::compute(ObjectKind::Blob, b""));
+        assert!(matches!(
+            repository.add_paths(
+                &["untracked"],
+                &AddTransactionOptions {
+                    max_file_size: 4,
+                    ..AddTransactionOptions::default()
+                }
+            ),
+            Err(Error::ObjectTooLarge { .. })
+        ));
     }
 
     #[test]

@@ -212,5 +212,7 @@ pub use unpack_objects::{UnpackObjectsOptions, UnpackObjectsReport};
 pub use update_ref::{UpdateRefCommand, UpdateRefOptions};
 pub use upload_pack::{UploadPackOptions, UploadPackRequest};
 pub use upload_pack_v2::{FetchV2Request, LsRefsRequest, UploadPackV2Limits, UploadPackV2Request};
-pub use worktree::{AddOptions, CheckoutOptions, MoveOptions, RemoveOptions};
+pub use worktree::{
+    AddOptions, AddReport, AddTransactionOptions, CheckoutOptions, MoveOptions, RemoveOptions,
+};
 pub use write_tree::WriteTreeOptions;

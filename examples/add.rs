@@ -1,7 +1,7 @@
 use std::env;
 use std::path::Path;
 
-use git_rs::{HostFileSystem, Repository};
+use git_rs::{AddTransactionOptions, HostFileSystem, Repository};
 
 fn main() -> git_rs::Result<()> {
     let repository_path = env::args().nth(1).unwrap_or_else(|| ".".to_owned());
@@ -14,14 +14,18 @@ fn main() -> git_rs::Result<()> {
         .file_name()
         .expect("repository path must name a directory");
     let repository = Repository::open(HostFileSystem::new(storage_root)?, repository_name)?;
-    if paths.is_empty() {
-        repository.add(".")?;
+    let paths = if paths.is_empty() {
+        vec![".".to_owned()]
     } else {
-        for path in paths {
-            repository.add(path)?;
-        }
-    }
+        paths
+    };
+    let report = repository.add_paths(&paths, &AddTransactionOptions::default())?;
     let tree = repository.write_index_tree(&repository.read_index()?)?;
-    println!("{tree}");
+    println!(
+        "{tree} staged={} removed={} ignored={}",
+        report.staged.len(),
+        report.removed.len(),
+        report.ignored.len()
+    );
     Ok(())
 }
