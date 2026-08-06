@@ -30,6 +30,7 @@ pub mod linked_worktree;
 pub mod log;
 pub mod ls_files;
 pub mod ls_tree;
+pub mod mailmap;
 pub mod maintenance;
 pub mod merge;
 pub mod multi_pack_index;
@@ -55,6 +56,7 @@ pub mod revision;
 pub mod revparse;
 pub mod server_info;
 pub mod shallow;
+pub mod shortlog;
 pub mod show_ref;
 pub mod sparse_checkout;
 pub mod stash;
@@ -107,6 +109,7 @@ pub use linked_worktree::{
 pub use log::{LogEntry, LogOptions, LogParentDiff};
 pub use ls_files::{LsFilesEntry, LsFilesKind, LsFilesOptions};
 pub use ls_tree::{LsTreeEntry, LsTreeOptions};
+pub use mailmap::{Mailmap, MailmapOptions};
 pub use maintenance::{MaintenanceOptions, MaintenanceOutcome, MaintenanceReport, MaintenanceTask};
 pub use merge::{
     FastForwardMode, MergeOptions, MergeResult, MergeTreeConflict, MergeTreeOptions,
@@ -148,6 +151,7 @@ pub use revision::{GraphOptions, Revision, RevisionWalkOptions};
 pub use revparse::{ResolvedObject, RevisionOptions};
 pub use server_info::{ServerInfoOptions, ServerInfoReport};
 pub use shallow::ShallowOptions;
+pub use shortlog::{ShortlogEntry, ShortlogGroup, ShortlogOptions};
 pub use show_ref::{ShowRefEntry, ShowRefOptions};
 pub use sparse_checkout::{SparseCheckoutOptions, SparseCheckoutReport, SparseCheckoutState};
 pub use stash::{StashApplyOptions, StashApplyResult, StashEntry, StashPushOptions};

@@ -96,6 +96,8 @@ Revision walking, ancestry, and merge bases are documented in
 [`docs/revisions.md`](docs/revisions.md).
 Structured full-history logs with literal path selection and bounded patches
 are documented in [`docs/log.md`](docs/log.md).
+Bounded contributor summaries and Git-compatible identity canonicalization are
+documented in [`docs/shortlog-mailmap.md`](docs/shortlog-mailmap.md).
 Stateful good/bad/skip revision bisection and midpoint selection are documented
 in [`docs/bisect.md`](docs/bisect.md).
 Fast-forward, three-way, conflict, continue, and abort behavior is documented
