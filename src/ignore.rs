@@ -231,7 +231,15 @@ fn escaped_at(value: &[u8], index: usize) -> bool {
     preceding % 2 == 1
 }
 
-fn wildmatch(pattern: &[u8], text: &[u8]) -> bool {
+pub(crate) fn wildmatch(pattern: &[u8], text: &[u8]) -> bool {
+    wildmatch_mode(pattern, text, true)
+}
+
+pub(crate) fn wildmatch_ref(pattern: &[u8], text: &[u8]) -> bool {
+    wildmatch_mode(pattern, text, false)
+}
+
+fn wildmatch_mode(pattern: &[u8], text: &[u8], slash_sensitive: bool) -> bool {
     let width = text.len() + 1;
     let Some(states) = pattern
         .len()
@@ -245,15 +253,17 @@ fn wildmatch(pattern: &[u8], text: &[u8]) -> bool {
         return false;
     }
     memo.resize(states, None);
-    wildmatch_at(pattern, text, 0, 0, width, &mut memo)
+    wildmatch_at(pattern, text, 0, 0, width, slash_sensitive, &mut memo)
 }
 
+#[allow(clippy::too_many_lines)]
 fn wildmatch_at(
     pattern: &[u8],
     text: &[u8],
     pattern_at: usize,
     text_at: usize,
     width: usize,
+    slash_sensitive: bool,
     memo: &mut [Option<bool>],
 ) -> bool {
     let slot = pattern_at * width + text_at;
@@ -268,11 +278,28 @@ fn wildmatch_at(
                 let next = pattern_at + 1;
                 next < pattern.len()
                     && text.get(text_at) == Some(&pattern[next])
-                    && wildmatch_at(pattern, text, next + 1, text_at + 1, width, memo)
+                    && wildmatch_at(
+                        pattern,
+                        text,
+                        next + 1,
+                        text_at + 1,
+                        width,
+                        slash_sensitive,
+                        memo,
+                    )
             }
             b'?' => {
-                text.get(text_at).is_some_and(|byte| *byte != b'/')
-                    && wildmatch_at(pattern, text, pattern_at + 1, text_at + 1, width, memo)
+                text.get(text_at)
+                    .is_some_and(|byte| !slash_sensitive || *byte != b'/')
+                    && wildmatch_at(
+                        pattern,
+                        text,
+                        pattern_at + 1,
+                        text_at + 1,
+                        width,
+                        slash_sensitive,
+                        memo,
+                    )
             }
             b'*' => {
                 let mut end = pattern_at + 1;
@@ -281,26 +308,78 @@ fn wildmatch_at(
                 }
                 let starstar = end - pattern_at > 1;
                 if starstar && pattern.get(end) == Some(&b'/') {
-                    wildmatch_at(pattern, text, end + 1, text_at, width, memo)
-                        || text.get(text_at).is_some_and(|byte| *byte != b'/')
-                            && wildmatch_at(pattern, text, pattern_at, text_at + 1, width, memo)
+                    wildmatch_at(
+                        pattern,
+                        text,
+                        end + 1,
+                        text_at,
+                        width,
+                        slash_sensitive,
+                        memo,
+                    ) || text.get(text_at).is_some_and(|byte| *byte != b'/')
+                        && wildmatch_at(
+                            pattern,
+                            text,
+                            pattern_at,
+                            text_at + 1,
+                            width,
+                            slash_sensitive,
+                            memo,
+                        )
                         || text.get(text_at) == Some(&b'/')
-                            && wildmatch_at(pattern, text, pattern_at, text_at + 1, width, memo)
+                            && wildmatch_at(
+                                pattern,
+                                text,
+                                pattern_at,
+                                text_at + 1,
+                                width,
+                                slash_sensitive,
+                                memo,
+                            )
                 } else {
-                    wildmatch_at(pattern, text, end, text_at, width, memo)
+                    wildmatch_at(pattern, text, end, text_at, width, slash_sensitive, memo)
                         || text.get(text_at).is_some()
-                            && (starstar || text[text_at] != b'/')
-                            && wildmatch_at(pattern, text, pattern_at, text_at + 1, width, memo)
+                            && (starstar || !slash_sensitive || text[text_at] != b'/')
+                            && wildmatch_at(
+                                pattern,
+                                text,
+                                pattern_at,
+                                text_at + 1,
+                                width,
+                                slash_sensitive,
+                                memo,
+                            )
                 }
             }
-            b'[' => match_class(pattern, text.get(text_at).copied(), pattern_at).is_some_and(
-                |(matched, next)| {
-                    matched && wildmatch_at(pattern, text, next, text_at + 1, width, memo)
-                },
-            ),
+            b'[' => match_class(
+                pattern,
+                text.get(text_at).copied(),
+                pattern_at,
+                slash_sensitive,
+            )
+            .is_some_and(|(matched, next)| {
+                matched
+                    && wildmatch_at(
+                        pattern,
+                        text,
+                        next,
+                        text_at + 1,
+                        width,
+                        slash_sensitive,
+                        memo,
+                    )
+            }),
             literal => {
                 text.get(text_at) == Some(&literal)
-                    && wildmatch_at(pattern, text, pattern_at + 1, text_at + 1, width, memo)
+                    && wildmatch_at(
+                        pattern,
+                        text,
+                        pattern_at + 1,
+                        text_at + 1,
+                        width,
+                        slash_sensitive,
+                        memo,
+                    )
             }
         }
     };
@@ -308,9 +387,14 @@ fn wildmatch_at(
     result
 }
 
-fn match_class(pattern: &[u8], value: Option<u8>, start: usize) -> Option<(bool, usize)> {
+fn match_class(
+    pattern: &[u8],
+    value: Option<u8>,
+    start: usize,
+    slash_sensitive: bool,
+) -> Option<(bool, usize)> {
     let value = value?;
-    if value == b'/' {
+    if slash_sensitive && value == b'/' {
         return Some((false, start + 1));
     }
     let mut at = start + 1;

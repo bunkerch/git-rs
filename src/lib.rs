@@ -18,6 +18,7 @@ pub mod merge;
 pub mod object;
 pub mod operations;
 pub mod pack;
+pub mod pack_refs;
 pub mod protocol;
 pub mod prune;
 pub mod push;
@@ -64,6 +65,7 @@ pub use pack::{
     IncomingPackOptions, PackBundle, PackIndex, PackIndexEntry, PackOptions, ValidatedPack,
     WrittenPack,
 };
+pub use pack_refs::{PackRefsOptions, PackRefsResult};
 pub use protocol::{Capability, PktLine, PktLineDecoder, Sideband};
 pub use prune::{PruneEntry, PruneOptions, PruneReason};
 pub use push::{
