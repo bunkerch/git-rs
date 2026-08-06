@@ -20,6 +20,7 @@ pub mod grep;
 pub mod ignore;
 pub mod index;
 pub mod linked_worktree;
+pub mod log;
 pub mod ls_files;
 pub mod ls_tree;
 pub mod merge;
@@ -81,6 +82,7 @@ pub use linked_worktree::{
     AddWorktreeOptions, LinkedWorktreeInfo, MoveWorktreeOptions, RemoveWorktreeOptions,
     WorktreePruneEntry, WorktreePruneOptions, WorktreePruneReason, WorktreeTarget,
 };
+pub use log::{LogEntry, LogOptions, LogParentDiff};
 pub use ls_files::{LsFilesEntry, LsFilesKind, LsFilesOptions};
 pub use ls_tree::{LsTreeEntry, LsTreeOptions};
 pub use merge::{

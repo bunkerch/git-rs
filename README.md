@@ -76,6 +76,8 @@ Ref-moving operations and their logs are documented in
 [`docs/reset-switch-reflog.md`](docs/reset-switch-reflog.md).
 Revision walking, ancestry, and merge bases are documented in
 [`docs/revisions.md`](docs/revisions.md).
+Structured full-history logs with literal path selection and bounded patches
+are documented in [`docs/log.md`](docs/log.md).
 Stateful good/bad/skip revision bisection and midpoint selection are documented
 in [`docs/bisect.md`](docs/bisect.md).
 Fast-forward, three-way, conflict, continue, and abort behavior is documented
