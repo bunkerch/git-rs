@@ -715,7 +715,7 @@ impl Repository {
         Ok(())
     }
 
-    fn worktree_matches(&self, entry: &IndexEntry, full_path: &Path) -> Result<bool> {
+    pub(crate) fn worktree_matches(&self, entry: &IndexEntry, full_path: &Path) -> Result<bool> {
         let metadata = self.filesystem().metadata(full_path)?;
         let (contents, mode) = if metadata.is_symlink() {
             (self.filesystem().read_link(full_path)?, 0o120_000)
@@ -736,7 +736,11 @@ impl Repository {
         Ok(mode == entry.mode() && ObjectId::compute(ObjectKind::Blob, &contents) == entry.id())
     }
 
-    fn prune_empty_parents(&self, work_tree: &Path, mut parent: Option<&Path>) -> Result<()> {
+    pub(crate) fn prune_empty_parents(
+        &self,
+        work_tree: &Path,
+        mut parent: Option<&Path>,
+    ) -> Result<()> {
         while let Some(relative) = parent {
             if relative.as_os_str().is_empty() {
                 break;
@@ -1050,7 +1054,7 @@ fn index_path(path: &Path) -> Result<Vec<u8>> {
 
 #[cfg(unix)]
 #[allow(clippy::unnecessary_wraps)]
-fn worktree_path(path: &[u8]) -> Result<PathBuf> {
+pub(crate) fn worktree_path(path: &[u8]) -> Result<PathBuf> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
@@ -1062,7 +1066,7 @@ fn worktree_path(path: &[u8]) -> Result<PathBuf> {
 }
 
 #[cfg(not(unix))]
-fn worktree_path(path: &[u8]) -> Result<PathBuf> {
+pub(crate) fn worktree_path(path: &[u8]) -> Result<PathBuf> {
     let text = std::str::from_utf8(path)
         .map_err(|_| Error::InvalidPath(PathBuf::from("non-UTF-8 index path")))?;
     Ok(text.split('/').collect())
