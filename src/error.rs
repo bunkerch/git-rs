@@ -19,6 +19,7 @@ pub enum Error {
     Protocol(String),
     InvalidTree(String),
     InvalidCommit(String),
+    EmptyReplay,
     InvalidReferenceName(String),
     InvalidReference(String),
     ReferenceConflict(String),
@@ -52,6 +53,7 @@ impl fmt::Display for Error {
             Self::Protocol(message) => write!(f, "Git protocol error: {message}"),
             Self::InvalidTree(message) => write!(f, "invalid tree: {message}"),
             Self::InvalidCommit(message) => write!(f, "invalid commit: {message}"),
+            Self::EmptyReplay => write!(f, "replayed commit would be empty"),
             Self::InvalidReferenceName(name) => write!(f, "invalid reference name: {name}"),
             Self::InvalidReference(message) => write!(f, "invalid reference: {message}"),
             Self::ReferenceConflict(name) => {

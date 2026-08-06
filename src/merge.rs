@@ -169,9 +169,7 @@ impl Repository {
             return Ok(ReplayResult::Conflicted { paths });
         }
         if tree == ours_commit.tree() && !options.allow_empty {
-            return Err(Error::InvalidRepository(
-                "replayed commit would be empty".into(),
-            ));
+            return Err(Error::EmptyReplay);
         }
         if options.no_commit {
             return Ok(ReplayResult::Prepared { tree });

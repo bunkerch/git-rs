@@ -56,6 +56,8 @@ Git-compatible configuration parsing and atomic editing are documented in
 [`docs/config.md`](docs/config.md).
 Ignore matching and its integration with status and staging are documented in
 [`docs/ignore.md`](docs/ignore.md).
+Bounded, resumable commit rebasing is documented in
+[`docs/rebase.md`](docs/rebase.md).
 
 To create a host-backed repository with the included example:
 
