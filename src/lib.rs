@@ -18,6 +18,8 @@ pub mod push;
 pub mod rebase;
 pub mod receive_pack;
 pub mod refs;
+pub mod refspec;
+pub mod remote;
 pub mod repository;
 pub mod revision;
 pub mod revparse;
@@ -60,6 +62,8 @@ pub use receive_pack::{
 pub use refs::{
     PreviousValue, Reference, ReferenceEdit, ReferenceName, ReferenceTarget, ReflogEntry,
 };
+pub use refspec::{RefSpec, RefSpecKind};
+pub use remote::{Remote, RemoveRemoteResult};
 pub use repository::{InitOptions, Repository};
 pub use revision::{GraphOptions, Revision, RevisionWalkOptions};
 pub use revparse::{ResolvedObject, RevisionOptions};

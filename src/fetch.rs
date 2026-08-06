@@ -5,9 +5,9 @@ use std::path::Path;
 use std::str::FromStr;
 
 use crate::{
-    Capability, CheckoutOptions, Error, FileSystem, IncomingPackOptions, InitOptions, ObjectId,
-    PktLine, PreviousValue, ReferenceEdit, ReferenceName, ReferenceTarget, Repository, Result,
-    Sideband, UploadPackOptions, UploadPackRequest,
+    Capability, CheckoutOptions, Error, FileSystem, GraphOptions, IncomingPackOptions, InitOptions,
+    ObjectId, ObjectKind, PktLine, PreviousValue, RefSpec, ReferenceEdit, ReferenceName,
+    ReferenceTarget, Remote, Repository, Result, Sideband, UploadPackOptions, UploadPackRequest,
 };
 
 /// Byte exchange required from an upload-pack transport.
@@ -248,7 +248,26 @@ impl Repository {
         options: &FetchOptions,
     ) -> Result<FetchResult> {
         let advertisement = RemoteAdvertisement::parse(&transport.advertise()?)?;
-        self.fetch_advertisement(transport, advertisement, options, false)
+        self.fetch_advertisement(transport, advertisement, options, false, None)
+    }
+
+    /// Fetch using one named remote's configured positive and negative
+    /// refspecs. The caller supplies the transport corresponding to its URL.
+    ///
+    /// # Errors
+    /// Returns an error for a missing/malformed remote plus the errors from
+    /// [`Self::fetch`].
+    pub fn fetch_remote<T: UploadPackTransport>(
+        &self,
+        name: &str,
+        transport: &mut T,
+        options: &FetchOptions,
+    ) -> Result<FetchResult> {
+        let remote = self.remote(name)?;
+        let advertisement = RemoteAdvertisement::parse(&transport.advertise()?)?;
+        let mut configured = options.clone();
+        name.clone_into(&mut configured.remote_name);
+        self.fetch_advertisement(transport, advertisement, &configured, false, Some(&remote))
     }
 
     /// Initialize, fetch, configure, and optionally check out a clone.
@@ -288,6 +307,7 @@ impl Repository {
                 max_total_inflated_size: options.max_total_inflated_size,
             },
             options.bare,
+            None,
         )?;
         repository.write_clone_config(options, &initial_branch)?;
         if let Some(remote_head) = result.advertisement.default_branch() {
@@ -315,6 +335,7 @@ impl Repository {
         advertisement: RemoteAdvertisement,
         options: &FetchOptions,
         bare_mapping: bool,
+        remote: Option<&Remote>,
     ) -> Result<FetchResult> {
         validate_remote_name(&options.remote_name)?;
         validate_sha1_advertisement(&advertisement)?;
@@ -322,8 +343,16 @@ impl Repository {
             .refs
             .iter()
             .filter(|reference| {
-                reference.name.starts_with("refs/heads/")
-                    || (options.fetch_tags && reference.name.starts_with("refs/tags/"))
+                remote.map_or_else(
+                    || {
+                        reference.name.starts_with("refs/heads/")
+                            || (options.fetch_tags && reference.name.starts_with("refs/tags/"))
+                    },
+                    |remote| {
+                        selected_by_refspecs(remote.fetch_refspecs(), &reference.name)
+                            || (options.fetch_tags && reference.name.starts_with("refs/tags/"))
+                    },
+                )
             })
             .filter(|reference| !is_peeled_ref(&reference.name))
             .collect::<Vec<_>>();
@@ -348,8 +377,14 @@ impl Repository {
         )?;
         let received_objects = validated.object_ids().len();
 
-        let edits = self.fetch_ref_edits(&selected, &options.remote_name, bare_mapping)?;
         self.publish_validated_pack(&validated)?;
+        let edits = self.fetch_ref_edits(
+            &selected,
+            &options.remote_name,
+            bare_mapping,
+            remote.map(Remote::fetch_refspecs),
+            options.max_object_size,
+        )?;
         self.apply_reference_transaction(&edits)?;
         let updated_refs = edits.into_iter().map(|edit| edit.name().clone()).collect();
         Ok(FetchResult {
@@ -403,26 +438,59 @@ impl Repository {
         selected: &[&RemoteRef],
         remote: &str,
         bare_mapping: bool,
+        refspecs: Option<&[RefSpec]>,
+        max_object_size: usize,
     ) -> Result<Vec<ReferenceEdit>> {
         let mut edits = Vec::new();
+        let mut destinations = BTreeSet::new();
         for reference in selected {
-            let destination = if bare_mapping && reference.name.starts_with("refs/heads/") {
-                ReferenceName::new(reference.name.clone())?
-            } else if let Some(branch) = reference.name.strip_prefix("refs/heads/") {
-                ReferenceName::new(format!("refs/remotes/{remote}/{branch}"))?
+            let mappings = if let Some(refspecs) = refspecs {
+                let mut mappings = refspecs
+                    .iter()
+                    .filter(|spec| !spec.is_negative())
+                    .filter_map(|spec| {
+                        spec.map_destination(&reference.name)
+                            .map(|destination| (destination, spec.is_force()))
+                    })
+                    .collect::<Vec<_>>();
+                if mappings.is_empty() && reference.name.starts_with("refs/tags/") {
+                    mappings.push((reference.name.clone(), false));
+                }
+                mappings
             } else {
-                ReferenceName::new(reference.name.clone())?
+                let destination = if bare_mapping && reference.name.starts_with("refs/heads/") {
+                    reference.name.clone()
+                } else if let Some(branch) = reference.name.strip_prefix("refs/heads/") {
+                    format!("refs/remotes/{remote}/{branch}")
+                } else {
+                    reference.name.clone()
+                };
+                vec![(destination, !reference.name.starts_with("refs/tags/"))]
             };
-            let previous = match self.resolve_reference(destination.as_str()) {
-                Ok(id) if id == reference.id => continue,
-                Ok(_) if reference.name.starts_with("refs/tags/") => {
+            for (destination, force) in mappings {
+                let destination = ReferenceName::new(destination)?;
+                if !destinations.insert(destination.clone()) {
                     return Err(Error::ReferenceConflict(destination.to_string()));
                 }
-                Ok(_) => PreviousValue::Any,
-                Err(Error::NotFound(_)) => PreviousValue::MustNotExist,
-                Err(error) => return Err(error),
-            };
-            edits.push(ReferenceEdit::update(destination, reference.id, previous));
+                let previous = match self.resolve_reference(destination.as_str()) {
+                    Ok(id) if id == reference.id => continue,
+                    Ok(id) if force => PreviousValue::MustExist(id),
+                    Ok(id)
+                        if fetch_update_is_fast_forward(
+                            self,
+                            id,
+                            reference.id,
+                            max_object_size,
+                        )? =>
+                    {
+                        PreviousValue::MustExist(id)
+                    }
+                    Ok(_) => return Err(Error::ReferenceConflict(destination.to_string())),
+                    Err(Error::NotFound(_)) => PreviousValue::MustNotExist,
+                    Err(error) => return Err(error),
+                };
+                edits.push(ReferenceEdit::update(destination, reference.id, previous));
+            }
         }
         Ok(edits)
     }
@@ -547,6 +615,36 @@ fn validate_remote_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn selected_by_refspecs(refspecs: &[RefSpec], name: &str) -> bool {
+    refspecs
+        .iter()
+        .any(|spec| !spec.is_negative() && spec.matches(name))
+        && !refspecs
+            .iter()
+            .any(|spec| spec.is_negative() && spec.matches(name))
+}
+
+fn fetch_update_is_fast_forward(
+    repository: &Repository,
+    old: ObjectId,
+    new: ObjectId,
+    max_object_size: usize,
+) -> Result<bool> {
+    let old_kind = repository.read_object(old, max_object_size)?.kind();
+    let new_kind = repository.read_object(new, max_object_size)?.kind();
+    if old_kind != ObjectKind::Commit || new_kind != ObjectKind::Commit {
+        return Ok(false);
+    }
+    repository.is_ancestor(
+        old,
+        new,
+        &GraphOptions {
+            max_object_size,
+            ..GraphOptions::default()
+        },
+    )
+}
+
 fn append_packet(output: &mut Vec<u8>, data: &[u8]) -> Result<()> {
     output.extend(PktLine::Data(data.to_vec()).encode()?);
     Ok(())
@@ -649,6 +747,64 @@ mod tests {
         assert_eq!(
             destination.resolve_reference("refs/heads/main").unwrap(),
             base
+        );
+    }
+
+    #[test]
+    fn named_fetch_honors_positive_negative_and_custom_refspecs() {
+        let remote =
+            Repository::init(MemoryFileSystem::new(), "remote", &InitOptions::default()).unwrap();
+        let main = commit(&remote, None, b"main\n");
+        let private = commit(&remote, Some(main), b"private\n");
+        let change = commit(&remote, Some(main), b"change\n");
+        for (name, id) in [
+            ("refs/heads/main", main),
+            ("refs/heads/private/secret", private),
+            ("refs/changes/123", change),
+        ] {
+            remote
+                .update_reference(
+                    &ReferenceName::new(name).unwrap(),
+                    id,
+                    PreviousValue::MustNotExist,
+                )
+                .unwrap();
+        }
+
+        let destination = Repository::init(
+            MemoryFileSystem::new(),
+            "destination",
+            &InitOptions::default(),
+        )
+        .unwrap();
+        destination
+            .add_remote("origin", b"memory://remote")
+            .unwrap();
+        destination
+            .add_remote_fetch_refspec("origin", "^refs/heads/private/*")
+            .unwrap();
+        destination
+            .add_remote_fetch_refspec("origin", "+refs/changes/*:refs/cache/*")
+            .unwrap();
+        let mut transport = RepositoryTransport::new(&remote, UploadPackOptions::default());
+        destination
+            .fetch_remote("origin", &mut transport, &FetchOptions::default())
+            .unwrap();
+
+        assert_eq!(
+            destination
+                .resolve_reference("refs/remotes/origin/main")
+                .unwrap(),
+            main
+        );
+        assert!(
+            destination
+                .resolve_reference("refs/remotes/origin/private/secret")
+                .is_err()
+        );
+        assert_eq!(
+            destination.resolve_reference("refs/cache/123").unwrap(),
+            change
         );
     }
 

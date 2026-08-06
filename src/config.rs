@@ -212,6 +212,98 @@ impl Config {
         Ok(before - self.entries.len())
     }
 
+    /// Remove every entry in one exact subsection and return its count.
+    /// Section names are case-insensitive; subsection bytes are case-sensitive.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid section name or NUL-containing subsection.
+    pub fn remove_subsection(&mut self, section: &str, subsection: &[u8]) -> Result<usize> {
+        let section = normalized_section(section)?;
+        checked_value(subsection)?;
+        let before = self.entries.len();
+        self.entries.retain(|entry| {
+            entry.section != section || entry.subsection.as_deref() != Some(subsection)
+        });
+        Ok(before - self.entries.len())
+    }
+
+    /// Rename an exact subsection in place and return the number of entries.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid section, NUL-containing subsection, or
+    /// an already existing destination subsection.
+    pub fn rename_subsection(&mut self, section: &str, old: &[u8], new: &[u8]) -> Result<usize> {
+        let section = normalized_section(section)?;
+        checked_value(old)?;
+        let new = checked_value(new)?;
+        if self.entries.iter().any(|entry| {
+            entry.section == section && entry.subsection.as_deref() == Some(new.as_slice())
+        }) {
+            return Err(Error::InvalidRepository(
+                "destination config subsection already exists".into(),
+            ));
+        }
+        let mut changed = 0;
+        for entry in &mut self.entries {
+            if entry.section == section && entry.subsection.as_deref() == Some(old) {
+                entry.subsection = Some(new.clone());
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Remove one exact variable from an exact subsection.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid section/variable or NUL subsection.
+    pub fn unset_in_subsection(
+        &mut self,
+        section: &str,
+        subsection: &[u8],
+        name: &str,
+    ) -> Result<usize> {
+        let section = normalized_section(section)?;
+        let name = normalized_section(name)?;
+        checked_value(subsection)?;
+        let before = self.entries.len();
+        self.entries.retain(|entry| {
+            entry.section != section
+                || entry.subsection.as_deref() != Some(subsection)
+                || entry.name != name
+        });
+        Ok(before - self.entries.len())
+    }
+
+    /// Replace one exact variable in a byte-preserving subsection.
+    ///
+    /// # Errors
+    /// Returns an error for invalid section/variable names or NUL bytes.
+    pub fn set_in_subsection(
+        &mut self,
+        section: &str,
+        subsection: &[u8],
+        name: &str,
+        value: impl AsRef<[u8]>,
+    ) -> Result<()> {
+        let section = normalized_section(section)?;
+        let name = normalized_section(name)?;
+        let subsection = checked_value(subsection)?;
+        let value = checked_value(value.as_ref())?;
+        self.entries.retain(|entry| {
+            entry.section != section
+                || entry.subsection.as_deref() != Some(subsection.as_slice())
+                || entry.name != name
+        });
+        self.entries.push(ConfigEntry {
+            section,
+            subsection: Some(subsection),
+            name,
+            value: Some(value),
+        });
+        Ok(())
+    }
+
     /// Encode a canonical config file preserving entry order and multiplicity.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -504,6 +596,14 @@ fn valid_name(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn normalized_section(value: &str) -> Result<String> {
+    let value = value.to_ascii_lowercase();
+    if !valid_name(&value) {
+        return Err(Error::InvalidRepository("invalid config name".into()));
+    }
+    Ok(value)
 }
 
 fn checked_value(value: &[u8]) -> Result<Vec<u8>> {
