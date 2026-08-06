@@ -257,7 +257,7 @@ impl Repository {
         Ok(ids)
     }
 
-    fn reachable_objects(
+    pub(crate) fn reachable_objects(
         &self,
         roots: &[ObjectId],
         max_size: usize,

@@ -9,6 +9,7 @@ pub mod object;
 pub mod operations;
 pub mod pack;
 pub mod protocol;
+pub mod push;
 pub mod receive_pack;
 pub mod refs;
 pub mod repository;
@@ -32,6 +33,10 @@ pub use pack::{
     WrittenPack,
 };
 pub use protocol::{Capability, PktLine, PktLineDecoder, Sideband};
+pub use push::{
+    InProcessReceivePackTransport, PushOptions, PushResult, PushStatus, PushUpdate,
+    ReceivePackTransport,
+};
 pub use receive_pack::{
     ReceiveCommand, ReceiveCommandStatus, ReceivePackOptions, ReceivePackRequest, ReceivePackResult,
 };

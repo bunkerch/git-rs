@@ -74,7 +74,7 @@ impl ReceivePackRequest {
     ///
     /// # Errors
     /// Returns an error for malformed commands, duplicate refs, unsupported
-    /// capabilities, deletions, or invalid pkt-line framing.
+    /// capabilities, or invalid pkt-line framing.
     pub fn parse(input: &[u8]) -> Result<Self> {
         let mut cursor = 0;
         let mut commands = Vec::new();
@@ -112,13 +112,6 @@ impl ReceivePackRequest {
                     if let Some(requested) = requested {
                         capabilities = Capability::parse_list(&requested)?;
                         validate_capabilities(&capabilities)?;
-                    }
-                    if command.new.is_null()
-                        && !capabilities
-                            .iter()
-                            .any(|capability| capability.name() == "delete-refs")
-                    {
-                        return protocol_error("ref deletion requires `delete-refs`");
                     }
                     commands.push(command);
                 }
@@ -716,10 +709,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_deletion_and_duplicate_command_names_during_parsing() {
+    fn accepts_deletion_and_rejects_duplicate_command_names_during_parsing() {
         let old = ObjectId::compute(ObjectKind::Blob, b"old");
         let deletion = receive_input(old, ObjectId::null(), "refs/heads/main", "", &[]);
-        assert!(ReceivePackRequest::parse(&deletion).is_err());
+        assert!(ReceivePackRequest::parse(&deletion).is_ok());
 
         let new = ObjectId::compute(ObjectKind::Blob, b"new");
         let first = format!(
@@ -734,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn deletes_a_ref_when_delete_refs_was_negotiated() {
+    fn deletes_a_ref_when_delete_refs_was_advertised() {
         let repository = Repository::init(
             MemoryFileSystem::new(),
             "repo",
@@ -750,7 +743,7 @@ mod tests {
             old,
             ObjectId::null(),
             "refs/heads/obsolete",
-            "report-status delete-refs",
+            "report-status",
             &[],
         ))
         .unwrap();

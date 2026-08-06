@@ -31,6 +31,8 @@ Server-side push ingestion is documented in
 [`docs/receive-pack.md`](docs/receive-pack.md).
 Transport-neutral cloning and fetching are documented in
 [`docs/fetch-clone.md`](docs/fetch-clone.md).
+Transport-neutral push orchestration is documented in
+[`docs/push.md`](docs/push.md).
 Typed trees and commits are documented in
 [`docs/trees-and-commits.md`](docs/trees-and-commits.md).
 Index versions 2–4 are documented in [`docs/index.md`](docs/index.md).
