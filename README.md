@@ -27,6 +27,8 @@ Wire-format primitives are documented in
 [`docs/protocol.md`](docs/protocol.md).
 Server-side fetch negotiation is documented in
 [`docs/upload-pack.md`](docs/upload-pack.md).
+Server-side push ingestion is documented in
+[`docs/receive-pack.md`](docs/receive-pack.md).
 Typed trees and commits are documented in
 [`docs/trees-and-commits.md`](docs/trees-and-commits.md).
 Index versions 2–4 are documented in [`docs/index.md`](docs/index.md).

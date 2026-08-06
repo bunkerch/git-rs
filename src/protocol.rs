@@ -17,6 +17,17 @@ pub enum PktLine {
 }
 
 impl PktLine {
+    /// Decode one packet from the beginning of `input`, returning bytes used.
+    ///
+    /// # Errors
+    /// Returns an error for malformed, oversized, or incomplete framing.
+    pub fn decode(input: &[u8]) -> Result<(Self, usize)> {
+        match probe(input)? {
+            Probe::Complete(packet, consumed) => Ok((packet, consumed)),
+            Probe::Incomplete => protocol_error("truncated pkt-line"),
+        }
+    }
+
     /// Encode this packet in Git's four-hex-digit framing.
     ///
     /// # Errors

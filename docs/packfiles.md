@@ -55,6 +55,9 @@ Pack bytes are published before index bytes. Since readers discover packs by
 their index, they cannot observe an index for a partially published pack.
 Existing content-addressed files must match byte-for-byte.
 
+Incoming pack quarantine, including thin REF-delta resolution and self-contained
+repacking, is documented in [`receive-pack.md`](receive-pack.md).
+
 The `pack_objects` example writes a pack stream to standard output:
 
 ```text

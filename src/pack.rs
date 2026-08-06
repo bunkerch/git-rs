@@ -29,6 +29,26 @@ impl Default for PackOptions {
     }
 }
 
+/// Resource limits and repacking choice for untrusted incoming packs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncomingPackOptions {
+    pub max_pack_size: usize,
+    pub max_object_size: usize,
+    pub max_total_inflated_size: usize,
+    pub use_deltas: bool,
+}
+
+impl Default for IncomingPackOptions {
+    fn default() -> Self {
+        Self {
+            max_pack_size: 1024 * 1024 * 1024,
+            max_object_size: 1024 * 1024 * 1024,
+            max_total_inflated_size: 2 * 1024 * 1024 * 1024,
+            use_deltas: true,
+        }
+    }
+}
+
 /// Complete Git-compatible pack and version-2 index bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackBundle {
@@ -72,6 +92,32 @@ pub struct WrittenPack {
     pub index_path: PathBuf,
     pub checksum: [u8; HASH_SIZE],
     pub object_count: usize,
+}
+
+/// An incoming pack whose checksum, compression streams, deltas, and object
+/// identities have been validated but which has not yet been published.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedPack {
+    bundle: PackBundle,
+    objects: std::collections::BTreeMap<ObjectId, (ObjectKind, Vec<u8>)>,
+}
+
+impl ValidatedPack {
+    #[must_use]
+    pub fn object_ids(&self) -> impl ExactSizeIterator<Item = ObjectId> + '_ {
+        self.objects.keys().copied()
+    }
+
+    #[must_use]
+    pub fn contains(&self, id: ObjectId) -> bool {
+        self.objects.contains_key(&id)
+    }
+
+    pub(crate) fn object(&self, id: ObjectId) -> Option<(ObjectKind, &[u8])> {
+        self.objects
+            .get(&id)
+            .map(|(kind, data)| (*kind, data.as_slice()))
+    }
 }
 
 /// An object location and integrity checksum from a pack index.
@@ -241,6 +287,35 @@ impl Repository {
     /// fails.
     pub fn write_pack(&self, ids: &[ObjectId], options: &PackOptions) -> Result<WrittenPack> {
         let bundle = self.build_pack(ids, options)?;
+        self.publish_bundle(&bundle)
+    }
+
+    /// Validate an incoming pack without making any of its objects visible.
+    ///
+    /// Thin REF deltas may use an existing repository object as their base.
+    /// Every compressed stream and reconstructed object is bounded by
+    /// `max_object_size`. The returned pack is rebuilt as a self-contained pack.
+    ///
+    /// # Errors
+    /// Returns an error for malformed headers, checksum failures, trailing data,
+    /// missing delta bases, delta cycles, duplicate objects, or size violations.
+    pub fn validate_incoming_pack(
+        &self,
+        bytes: &[u8],
+        options: &IncomingPackOptions,
+    ) -> Result<ValidatedPack> {
+        validate_incoming_pack(self, bytes, options)
+    }
+
+    /// Publish a previously validated incoming pack under `objects/pack`.
+    ///
+    /// # Errors
+    /// Returns an error if content-addressed publication fails.
+    pub fn publish_validated_pack(&self, pack: &ValidatedPack) -> Result<WrittenPack> {
+        self.publish_bundle(&pack.bundle)
+    }
+
+    fn publish_bundle(&self, bundle: &PackBundle) -> Result<WrittenPack> {
         let stem = bundle.stem();
         let pack_relative = Path::new("objects/pack").join(format!("{stem}.pack"));
         let index_relative = Path::new("objects/pack").join(format!("{stem}.idx"));
@@ -362,6 +437,265 @@ struct PackSource {
     id: ObjectId,
     kind: ObjectKind,
     data: Vec<u8>,
+}
+
+enum IncomingRepresentation {
+    Direct(ObjectKind, Vec<u8>),
+    OfsDelta { base_offset: u64, delta: Vec<u8> },
+    RefDelta { base_id: ObjectId, delta: Vec<u8> },
+}
+
+struct IncomingEntry {
+    representation: IncomingRepresentation,
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_incoming_pack(
+    repository: &Repository,
+    pack: &[u8],
+    options: &IncomingPackOptions,
+) -> Result<ValidatedPack> {
+    if pack.len() > options.max_pack_size {
+        return Err(Error::ObjectTooLarge {
+            declared: u64::try_from(pack.len()).unwrap_or(u64::MAX),
+            limit: options.max_pack_size,
+        });
+    }
+    if pack.len() < PACK_HEADER_SIZE + HASH_SIZE || &pack[..4] != b"PACK" {
+        return invalid("invalid incoming pack header");
+    }
+    let version = be_u32(pack, 4)?;
+    if !(2..=3).contains(&version) {
+        return invalid("unsupported incoming pack version");
+    }
+    let count = usize::try_from(be_u32(pack, 8)?)
+        .map_err(|_| pack_error("incoming object count overflow"))?;
+    let trailer_start = pack.len() - HASH_SIZE;
+    if count > trailer_start.saturating_sub(PACK_HEADER_SIZE) {
+        return invalid("incoming object count exceeds available bytes");
+    }
+    if sha1::digest(&pack[..trailer_start]) != pack[trailer_start..] {
+        return invalid("incoming pack checksum mismatch");
+    }
+
+    let mut cursor = PACK_HEADER_SIZE;
+    let mut entries = Vec::with_capacity(count);
+    let mut offsets = std::collections::BTreeMap::new();
+    let mut inflated_total = 0_usize;
+    for index in 0..count {
+        if cursor >= trailer_start {
+            return invalid("incoming pack has fewer objects than declared");
+        }
+        let entry_start = cursor;
+        let offset = u64::try_from(entry_start).map_err(|_| pack_error("pack offset overflow"))?;
+        let (object_type, declared, header_size) =
+            parse_object_header(&pack[cursor..trailer_start])?;
+        cursor = checked_add(cursor, header_size)?;
+        let declared = usize::try_from(declared).map_err(|_| pack_error("object size overflow"))?;
+        if declared > options.max_object_size {
+            return Err(Error::ObjectTooLarge {
+                declared: declared as u64,
+                limit: options.max_object_size,
+            });
+        }
+        inflated_total = inflated_total
+            .checked_add(declared)
+            .filter(|total| *total <= options.max_total_inflated_size)
+            .ok_or(Error::ObjectTooLarge {
+                declared: u64::try_from(inflated_total)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(u64::try_from(declared).unwrap_or(u64::MAX)),
+                limit: options.max_total_inflated_size,
+            })?;
+        let representation = match object_type {
+            1..=4 => {
+                let (data, consumed) = inflate_one(&pack[cursor..trailer_start], declared)?;
+                cursor = checked_add(cursor, consumed)?;
+                IncomingRepresentation::Direct(kind_from_type(object_type)?, data)
+            }
+            6 => {
+                let mut relative = 0;
+                let distance = parse_ofs_distance(&pack[cursor..trailer_start], &mut relative)?;
+                cursor = checked_add(cursor, relative)?;
+                let base_offset = offset
+                    .checked_sub(distance)
+                    .ok_or_else(|| pack_error("invalid incoming OFS_DELTA base"))?;
+                let (delta, consumed) = inflate_one(&pack[cursor..trailer_start], declared)?;
+                cursor = checked_add(cursor, consumed)?;
+                IncomingRepresentation::OfsDelta { base_offset, delta }
+            }
+            7 => {
+                let base_id = ObjectId::from_bytes(read_hash(pack, cursor)?);
+                cursor = checked_add(cursor, HASH_SIZE)?;
+                let (delta, consumed) = inflate_one(&pack[cursor..trailer_start], declared)?;
+                cursor = checked_add(cursor, consumed)?;
+                IncomingRepresentation::RefDelta { base_id, delta }
+            }
+            _ => return invalid("reserved incoming packed object type"),
+        };
+        if offsets.insert(offset, index).is_some() {
+            return invalid("duplicate incoming pack offset");
+        }
+        entries.push(IncomingEntry { representation });
+    }
+    if cursor != trailer_start {
+        return invalid("incoming pack has trailing data or more objects than declared");
+    }
+
+    let mut resolved: Vec<Option<(ObjectId, ObjectKind, Vec<u8>)>> = vec![None; entries.len()];
+    let mut by_id = std::collections::BTreeMap::new();
+    let mut resolved_total = 0_usize;
+    for (index, entry) in entries.iter().enumerate() {
+        if let IncomingRepresentation::Direct(kind, data) = &entry.representation {
+            install_resolved(
+                index,
+                *kind,
+                data.clone(),
+                &mut resolved,
+                &mut by_id,
+                &mut resolved_total,
+                options.max_total_inflated_size,
+            )?;
+        }
+    }
+
+    while resolved.iter().any(Option::is_none) {
+        let mut progress = false;
+        for (index, entry) in entries.iter().enumerate() {
+            if resolved[index].is_some() {
+                continue;
+            }
+            let base = match &entry.representation {
+                IncomingRepresentation::OfsDelta { base_offset, .. } => offsets
+                    .get(base_offset)
+                    .and_then(|base_index| resolved[*base_index].as_ref())
+                    .map(|(_, kind, data)| (*kind, data.as_slice())),
+                IncomingRepresentation::RefDelta { base_id, .. } => by_id
+                    .get(base_id)
+                    .and_then(|base_index| resolved[*base_index].as_ref())
+                    .map(|(_, kind, data)| (*kind, data.as_slice())),
+                IncomingRepresentation::Direct(_, _) => unreachable!("direct objects resolved"),
+            };
+            if let Some((kind, base_data)) = base {
+                let data = apply_delta(base_data, delta_bytes(entry), options.max_object_size)?;
+                install_resolved(
+                    index,
+                    kind,
+                    data,
+                    &mut resolved,
+                    &mut by_id,
+                    &mut resolved_total,
+                    options.max_total_inflated_size,
+                )?;
+                progress = true;
+            }
+        }
+        if progress {
+            continue;
+        }
+
+        for (index, entry) in entries.iter().enumerate() {
+            if resolved[index].is_some() {
+                continue;
+            }
+            let IncomingRepresentation::RefDelta { base_id, .. } = &entry.representation else {
+                continue;
+            };
+            let base = match repository.read_object(*base_id, options.max_object_size) {
+                Ok(base) => base,
+                Err(Error::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let data = apply_delta(base.data(), delta_bytes(entry), options.max_object_size)?;
+            install_resolved(
+                index,
+                base.kind(),
+                data,
+                &mut resolved,
+                &mut by_id,
+                &mut resolved_total,
+                options.max_total_inflated_size,
+            )?;
+            progress = true;
+        }
+        if !progress {
+            return invalid("incoming delta base is missing or cyclic");
+        }
+    }
+
+    let mut objects = std::collections::BTreeMap::new();
+    let mut sources = Vec::with_capacity(entries.len());
+    for object in resolved.into_iter().flatten() {
+        let (id, kind, data) = object;
+        if objects.insert(id, (kind, data.clone())).is_some() {
+            return invalid("incoming pack contains a duplicate object");
+        }
+        sources.push(PackSource { id, kind, data });
+    }
+    let bundle = build_pack(
+        &sources,
+        &PackOptions {
+            max_object_size: options.max_object_size,
+            use_deltas: options.use_deltas,
+        },
+    )?;
+    Ok(ValidatedPack { bundle, objects })
+}
+
+fn install_resolved(
+    index: usize,
+    kind: ObjectKind,
+    data: Vec<u8>,
+    resolved: &mut [Option<(ObjectId, ObjectKind, Vec<u8>)>],
+    by_id: &mut std::collections::BTreeMap<ObjectId, usize>,
+    resolved_total: &mut usize,
+    limit: usize,
+) -> Result<()> {
+    *resolved_total = resolved_total
+        .checked_add(data.len())
+        .filter(|total| *total <= limit)
+        .ok_or(Error::ObjectTooLarge {
+            declared: u64::try_from(*resolved_total)
+                .unwrap_or(u64::MAX)
+                .saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX)),
+            limit,
+        })?;
+    let id = ObjectId::compute(kind, &data);
+    if by_id.insert(id, index).is_some() {
+        return invalid("incoming pack contains a duplicate object");
+    }
+    resolved[index] = Some((id, kind, data));
+    Ok(())
+}
+
+fn delta_bytes(entry: &IncomingEntry) -> &[u8] {
+    match &entry.representation {
+        IncomingRepresentation::OfsDelta { delta, .. }
+        | IncomingRepresentation::RefDelta { delta, .. } => delta,
+        IncomingRepresentation::Direct(_, _) => unreachable!("direct entry is not a delta"),
+    }
+}
+
+fn inflate_one(input: &[u8], declared: usize) -> Result<(Vec<u8>, usize)> {
+    use miniz_oxide::inflate::stream::{InflateState, inflate};
+    use miniz_oxide::{DataFormat, MZFlush, MZStatus};
+
+    let mut state = InflateState::new_boxed(DataFormat::Zlib);
+    let mut output = vec![0; declared.max(1)];
+    let result = inflate(&mut state, input, &mut output, MZFlush::Finish);
+    if result.status != Ok(MZStatus::StreamEnd) || result.bytes_written != declared {
+        return Err(Error::Compression(format!(
+            "incoming stream ended with {:?} after {} of {declared} bytes",
+            result.status, result.bytes_written
+        )));
+    }
+    if result.bytes_consumed == 0 {
+        return Err(Error::Compression(
+            "incoming stream consumed no bytes".into(),
+        ));
+    }
+    output.truncate(declared);
+    Ok((output, result.bytes_consumed))
 }
 
 fn build_pack(objects: &[PackSource], options: &PackOptions) -> Result<PackBundle> {
@@ -952,7 +1286,8 @@ mod tests {
     use super::{PackIndex, apply_delta, crc32};
     use crate::object::sha1;
     use crate::{
-        FileSystem, InitOptions, MemoryFileSystem, ObjectId, ObjectKind, PackOptions, Repository,
+        FileSystem, IncomingPackOptions, InitOptions, MemoryFileSystem, ObjectId, ObjectKind,
+        PackOptions, Repository,
     };
 
     #[test]
@@ -1050,6 +1385,78 @@ mod tests {
         let bundle = repository.build_pack(&[], &PackOptions::default()).unwrap();
         assert_eq!(bundle.object_count(), 0);
         assert_eq!(PackIndex::parse(bundle.index()).unwrap().entries(), &[]);
+    }
+
+    #[test]
+    fn validates_quarantines_and_publishes_an_incoming_pack() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let id = repository
+            .write_object(ObjectKind::Blob, b"incoming")
+            .unwrap();
+        let source = repository
+            .build_pack(&[id], &PackOptions::default())
+            .unwrap();
+        let validated = repository
+            .validate_incoming_pack(
+                source.pack(),
+                &IncomingPackOptions {
+                    max_pack_size: 1024,
+                    max_object_size: 1024,
+                    max_total_inflated_size: 1024,
+                    use_deltas: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(validated.object_ids().collect::<Vec<_>>(), vec![id]);
+        assert!(
+            !fs.read_dir(Path::new("repo/.git/objects/pack"))
+                .unwrap()
+                .iter()
+                .any(|path| path.extension().is_some_and(|value| value == "idx"))
+        );
+        let written = repository.publish_validated_pack(&validated).unwrap();
+        assert!(fs.exists(&written.pack_path).unwrap());
+        remove_loose(&fs, id);
+        assert_eq!(
+            repository.read_object(id, 1024).unwrap().data(),
+            b"incoming"
+        );
+    }
+
+    #[test]
+    fn resolves_a_thin_ref_delta_against_existing_storage() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs, "repo", &InitOptions::default()).unwrap();
+        let base = repository
+            .write_object(ObjectKind::Blob, b"hello world")
+            .unwrap();
+        let target = ObjectId::compute(ObjectKind::Blob, b"hello rust");
+        let delta = [11, 10, 0x90, 6, 4, b'r', b'u', b's', b't'];
+        let mut entry = super::encode_object_header(7, delta.len() as u64);
+        entry.extend_from_slice(base.as_bytes());
+        entry.extend(miniz_oxide::deflate::compress_to_vec_zlib(&delta, 6));
+        let mut pack = b"PACK\0\0\0\x02\0\0\0\x01".to_vec();
+        pack.extend(entry);
+        pack.extend_from_slice(&sha1::digest(&pack));
+
+        let validated = repository
+            .validate_incoming_pack(
+                &pack,
+                &IncomingPackOptions {
+                    max_pack_size: 1024,
+                    max_object_size: 1024,
+                    max_total_inflated_size: 1024,
+                    use_deltas: true,
+                },
+            )
+            .unwrap();
+        assert!(validated.contains(target));
+        repository.publish_validated_pack(&validated).unwrap();
+        assert_eq!(
+            repository.read_object(target, 1024).unwrap().data(),
+            b"hello rust"
+        );
     }
 
     fn one_object_index(id: ObjectId, crc: u32, offset: u32, pack_checksum: [u8; 20]) -> Vec<u8> {
