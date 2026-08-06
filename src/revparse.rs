@@ -40,6 +40,41 @@ pub struct ResolvedObject {
 }
 
 impl Repository {
+    /// Return the shortest unique hexadecimal abbreviation at least `minimum`
+    /// digits long for an existing object.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid minimum, a missing object, malformed
+    /// object storage, an exceeded candidate bound, or storage failures.
+    pub fn unique_abbreviation(
+        &self,
+        id: ObjectId,
+        minimum: usize,
+        max_candidates: usize,
+    ) -> Result<String> {
+        if minimum == 0 || minimum > ObjectId::HEX_LENGTH {
+            return revision_error("abbreviation minimum must be between 1 and 40");
+        }
+        self.read_object(id, usize::MAX)?;
+        let hex = id.to_string();
+        let prefix = &hex[..minimum];
+        let mut matches = BTreeSet::new();
+        let mut inspected = 0;
+        self.collect_loose_prefix(prefix, max_candidates, &mut inspected, &mut matches)?;
+        self.collect_packed_prefix(prefix, max_candidates, &mut inspected, &mut matches)?;
+        if !matches.contains(&id) {
+            return Err(Error::InvalidRevision(format!("object {id} is not stored")));
+        }
+        for length in minimum..=ObjectId::HEX_LENGTH {
+            if matches.iter().all(|candidate| {
+                *candidate == id || candidate.to_hex()[..length] != id.to_hex()[..length]
+            }) {
+                return Ok(hex[..length].to_owned());
+            }
+        }
+        Ok(hex)
+    }
+
     /// Resolve a Git revision expression to an existing typed object.
     ///
     /// Base names support full IDs, unique abbreviated IDs, `@`, pseudorefs,
@@ -634,6 +669,14 @@ mod tests {
                 .unwrap(),
             target
         );
+        let generated = repository.unique_abbreviation(target, 4, 10_000).unwrap();
+        assert!(target.to_string().starts_with(&generated));
+        assert_eq!(
+            repository
+                .resolve_revision_id(&generated, &RevisionOptions::default())
+                .unwrap(),
+            target
+        );
 
         let bundle = repository
             .write_pack(&commits, &PackOptions::default())
@@ -654,6 +697,10 @@ mod tests {
                 .resolve_revision_id(&abbreviation, &RevisionOptions::default())
                 .unwrap(),
             target
+        );
+        assert_eq!(
+            repository.unique_abbreviation(target, 4, 10_000).unwrap(),
+            generated
         );
     }
 

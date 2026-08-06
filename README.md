@@ -84,6 +84,8 @@ Typed tree/index differences and unified patches are documented in
 [`docs/diff.md`](docs/diff.md).
 Lightweight and annotated tag operations are documented in
 [`docs/tags.md`](docs/tags.md).
+Bounded nearest-tag/reference naming is documented in
+[`docs/describe.md`](docs/describe.md).
 Git-compatible configuration parsing and atomic editing are documented in
 [`docs/config.md`](docs/config.md).
 Ignore matching and its integration with status and staging are documented in
