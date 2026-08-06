@@ -82,6 +82,7 @@ pub mod submodule;
 pub mod tag;
 pub mod tree;
 pub mod unpack_objects;
+pub mod update_index;
 pub mod update_ref;
 pub mod upload_pack;
 pub mod upload_pack_v2;
@@ -211,6 +212,7 @@ pub use submodule::{
 pub use tag::{AnnotatedTag, PeeledObject, TagBuilder};
 pub use tree::{EntryMode, Tree, TreeEntry};
 pub use unpack_objects::{UnpackObjectsOptions, UnpackObjectsReport};
+pub use update_index::{UpdateIndexCommand, UpdateIndexOptions, UpdateIndexReport};
 pub use update_ref::{UpdateRefCommand, UpdateRefOptions};
 pub use upload_pack::{UploadPackOptions, UploadPackRequest};
 pub use upload_pack_v2::{FetchV2Request, LsRefsRequest, UploadPackV2Limits, UploadPackV2Request};

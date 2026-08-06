@@ -161,6 +161,26 @@ impl IndexEntry {
         self
     }
 
+    #[must_use]
+    pub const fn with_stat(mut self, value: StatData) -> Self {
+        self.stat = value;
+        self
+    }
+
+    /// Replace the regular-file executable bit while preserving other data.
+    ///
+    /// # Errors
+    /// Returns an error when this is not a regular-file entry.
+    pub fn with_executable(mut self, value: bool) -> Result<Self> {
+        if !matches!(self.mode, 0o100_644 | 0o100_755) {
+            return Err(Error::InvalidRepository(
+                "executable bit requires a regular-file index entry".into(),
+            ));
+        }
+        self.mode = if value { 0o100_755 } else { 0o100_644 };
+        Ok(self)
+    }
+
     /// Replace the repository path while preserving object, mode, stat, stage,
     /// and extended flags.
     ///
@@ -271,6 +291,20 @@ impl Index {
     /// Returns the same validation errors as [`Self::new`].
     pub fn with_entries(self, entries: Vec<IndexEntry>) -> Result<Self> {
         let mut replacement = Self::new(self.version, entries)?;
+        replacement.extensions = self.extensions;
+        Ok(replacement)
+    }
+
+    /// Replace the format version and entries while preserving extensions.
+    ///
+    /// # Errors
+    /// Returns the same validation errors as [`Self::new`].
+    pub fn with_version_and_entries(
+        self,
+        version: IndexVersion,
+        entries: Vec<IndexEntry>,
+    ) -> Result<Self> {
+        let mut replacement = Self::new(version, entries)?;
         replacement.extensions = self.extensions;
         Ok(replacement)
     }
