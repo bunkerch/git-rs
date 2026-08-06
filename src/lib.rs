@@ -33,6 +33,7 @@ pub mod index;
 pub mod linked_worktree;
 pub mod log;
 pub mod ls_files;
+pub mod ls_remote;
 pub mod ls_tree;
 pub mod mailmap;
 pub mod maintenance;
@@ -121,6 +122,9 @@ pub use linked_worktree::{
 };
 pub use log::{LogEntry, LogOptions, LogParentDiff};
 pub use ls_files::{LsFilesEntry, LsFilesKind, LsFilesOptions};
+pub use ls_remote::{
+    LsRemoteEntry, LsRemoteOptions, LsRemoteResult, LsRemoteSelection, ls_remote, ls_remote_v2,
+};
 pub use ls_tree::{LsTreeEntry, LsTreeOptions};
 pub use mailmap::{Mailmap, MailmapOptions};
 pub use maintenance::{MaintenanceOptions, MaintenanceOutcome, MaintenanceReport, MaintenanceTask};

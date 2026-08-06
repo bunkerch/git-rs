@@ -135,6 +135,15 @@ impl RemoteAdvertisement {
     /// Returns an error for malformed framing, object IDs, duplicate refs,
     /// capabilities, symbolic HEAD values, or trailing bytes.
     pub fn parse(input: &[u8]) -> Result<Self> {
+        Self::parse_with_limit(input, 10_000_000)
+    }
+
+    /// Parse an advertisement while bounding its number of refs.
+    ///
+    /// # Errors
+    /// Returns the same errors as parse and rejects advertisements containing
+    /// more entries than the configured limit.
+    pub fn parse_with_limit(input: &[u8], max_refs: usize) -> Result<Self> {
         let mut cursor = 0;
         let mut refs = Vec::new();
         let mut capabilities = Vec::new();
@@ -173,6 +182,9 @@ impl RemoteAdvertisement {
                         capabilities = Capability::parse_list(&values)?;
                     }
                     refs.push(remote_ref);
+                    if refs.len() > max_refs {
+                        return protocol_error("advertised ref count exceeds limit");
+                    }
                     first = false;
                 }
                 PktLine::Delimiter | PktLine::ResponseEnd => {
@@ -874,12 +886,19 @@ struct ParsedFetchResponse {
 }
 
 #[derive(Clone, Debug)]
-struct V2Capabilities {
+#[allow(clippy::struct_excessive_bools)]
+pub(crate) struct V2Capabilities {
     shallow: bool,
     object_format: bool,
+    server_options: bool,
+    ls_refs: bool,
 }
 
-fn parse_v2_capabilities(input: &[u8]) -> Result<V2Capabilities> {
+pub(crate) fn parse_v2_capabilities(input: &[u8]) -> Result<V2Capabilities> {
+    parse_v2_capabilities_for(input, true)
+}
+
+fn parse_v2_capabilities_for(input: &[u8], require_fetch: bool) -> Result<V2Capabilities> {
     let packets = decode_all_packets(input)?;
     if packets.first() != Some(&PktLine::Data(b"version 2\n".to_vec()))
         || packets.last() != Some(&PktLine::Flush)
@@ -888,6 +907,8 @@ fn parse_v2_capabilities(input: &[u8]) -> Result<V2Capabilities> {
     }
     let mut object_format = None;
     let mut fetch = None;
+    let mut server_options = false;
+    let mut ls_refs = false;
     for packet in &packets[1..packets.len() - 1] {
         let PktLine::Data(line) = packet else {
             return protocol_error("control packet in v2 capability advertisement");
@@ -896,6 +917,14 @@ fn parse_v2_capabilities(input: &[u8]) -> Result<V2Capabilities> {
         if let Some(value) = line.strip_prefix(b"object-format=") {
             if object_format.replace(value).is_some() {
                 return protocol_error("duplicate v2 object-format capability");
+            }
+        } else if line == b"server-option" {
+            if std::mem::replace(&mut server_options, true) {
+                return protocol_error("duplicate v2 server-option capability");
+            }
+        } else if line == b"ls-refs" || line.starts_with(b"ls-refs=") {
+            if std::mem::replace(&mut ls_refs, true) {
+                return protocol_error("duplicate v2 ls-refs capability");
             }
         } else if (line == b"fetch" || line.starts_with(b"fetch="))
             && fetch
@@ -908,13 +937,17 @@ fn parse_v2_capabilities(input: &[u8]) -> Result<V2Capabilities> {
     if object_format.is_some_and(|format| format != b"sha1") {
         return protocol_error("protocol v2 remote does not use SHA-1");
     }
-    let fetch =
-        fetch.ok_or_else(|| Error::Protocol("remote does not advertise v2 fetch".into()))?;
+    if require_fetch && fetch.is_none() {
+        return protocol_error("remote does not advertise v2 fetch");
+    }
+    let fetch = fetch.unwrap_or_default();
     Ok(V2Capabilities {
         shallow: fetch
             .split(|byte| *byte == b' ')
             .any(|value| value == b"shallow"),
         object_format: object_format.is_some(),
+        server_options,
+        ls_refs,
     })
 }
 
@@ -939,10 +972,69 @@ fn discover_refs_v2<T: UploadPackV2Transport>(
         append_packet(&mut request, argument)?;
     }
     request.extend(PktLine::Flush.encode()?);
-    parse_ls_refs_v2(&transport.request_v2(&request)?, capabilities)
+    parse_ls_refs_v2(&transport.request_v2(&request)?, capabilities, 10_000_000)
 }
 
-fn parse_ls_refs_v2(input: &[u8], capabilities: &V2Capabilities) -> Result<RemoteAdvertisement> {
+pub(crate) fn query_refs_v2<T: UploadPackV2Transport>(
+    transport: &mut T,
+    prefixes: &[String],
+    server_options: &[String],
+    max_refs: usize,
+    max_response_size: usize,
+) -> Result<RemoteAdvertisement> {
+    let advertisement = transport.advertise_v2()?;
+    if advertisement.len() > max_response_size {
+        return protocol_error("v2 capability advertisement exceeds limit");
+    }
+    let capabilities = parse_v2_capabilities_for(&advertisement, false)?;
+    if !capabilities.ls_refs {
+        return protocol_error("remote does not advertise v2 ls-refs");
+    }
+    if !server_options.is_empty() && !capabilities.server_options {
+        return protocol_error("remote does not advertise v2 server-option");
+    }
+    let mut request = Vec::new();
+    append_packet(&mut request, b"command=ls-refs\n")?;
+    if capabilities.object_format {
+        append_packet(&mut request, b"object-format=sha1\n")?;
+    }
+    for option in server_options {
+        if option
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(byte, 0 | b'\n'))
+        {
+            return protocol_error("v2 server option contains NUL or LF");
+        }
+        append_packet(&mut request, format!("server-option={option}\n").as_bytes())?;
+    }
+    request.extend(PktLine::Delimiter.encode()?);
+    for argument in [b"symrefs\n".as_slice(), b"peel\n", b"unborn\n"] {
+        append_packet(&mut request, argument)?;
+    }
+    for prefix in prefixes {
+        if prefix
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(byte, 0 | b'\n'))
+        {
+            return protocol_error("v2 ref prefix contains NUL or LF");
+        }
+        append_packet(&mut request, format!("ref-prefix {prefix}\n").as_bytes())?;
+    }
+    request.extend(PktLine::Flush.encode()?);
+    let response = transport.request_v2(&request)?;
+    if response.len() > max_response_size {
+        return protocol_error("ls-refs response exceeds limit");
+    }
+    parse_ls_refs_v2(&response, &capabilities, max_refs)
+}
+
+fn parse_ls_refs_v2(
+    input: &[u8],
+    capabilities: &V2Capabilities,
+    max_refs: usize,
+) -> Result<RemoteAdvertisement> {
     let packets = decode_all_packets(input)?;
     if packets.last() != Some(&PktLine::Flush) {
         return protocol_error("ls-refs response has no terminating flush");
@@ -962,6 +1054,9 @@ fn parse_ls_refs_v2(input: &[u8], capabilities: &V2Capabilities) -> Result<Remot
             if !names.insert(name.to_vec()) {
                 return protocol_error("duplicate ls-refs name");
             }
+            if names.len() > max_refs {
+                return protocol_error("ls-refs ref count exceeds limit");
+            }
             if name == b"HEAD" {
                 head_target = parse_symref_target(attributes)?;
             }
@@ -976,6 +1071,9 @@ fn parse_ls_refs_v2(input: &[u8], capabilities: &V2Capabilities) -> Result<Remot
         if !names.insert(name.to_vec()) {
             return protocol_error("duplicate ls-refs name");
         }
+        if names.len() > max_refs {
+            return protocol_error("ls-refs ref count exceeds limit");
+        }
         validate_v2_ref_attributes(attributes)?;
         if name == b"HEAD" {
             head_target = parse_symref_target(attributes)?;
@@ -986,6 +1084,22 @@ fn parse_ls_refs_v2(input: &[u8], capabilities: &V2Capabilities) -> Result<Remot
                 .to_owned(),
             id,
         });
+        if let Some(peeled) = attributes
+            .split(|byte| *byte == b' ')
+            .find_map(|attribute| attribute.strip_prefix(b"peeled:"))
+        {
+            refs.push(RemoteRef {
+                name: format!(
+                    "{}^{{}}",
+                    std::str::from_utf8(name)
+                        .map_err(|_| Error::Protocol("ls-refs name is not UTF-8".into()))?
+                ),
+                id: parse_wire_id(peeled, "peeled")?,
+            });
+        }
+        if refs.len() > max_refs {
+            return protocol_error("ls-refs ref count exceeds limit");
+        }
     }
     let mut effective = b"side-band-64k ofs-delta object-format=sha1".to_vec();
     if capabilities.shallow {

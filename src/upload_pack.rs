@@ -218,6 +218,12 @@ impl Repository {
                 ReferenceTarget::Symbolic(_) => self.resolve_reference(reference.name())?,
             };
             advertised.push((reference.name().to_owned(), id));
+            if reference.name().starts_with("refs/tags/") {
+                let peeled = self.peel_tag(id, 64, 1024 * 1024 * 1024)?;
+                if peeled.id != id {
+                    advertised.push((format!("{}^{{}}", reference.name()), peeled.id));
+                }
+            }
         }
         advertised.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         if head_target.is_some() {
