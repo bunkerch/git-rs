@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 pub use host::HostFileSystem;
 pub use memory::MemoryFileSystem;
+pub(crate) use path::validate as normalize_path;
 
 use crate::Result;
 
