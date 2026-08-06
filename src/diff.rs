@@ -803,6 +803,27 @@ pub(crate) fn unchanged_line_map(
     Ok(mapping)
 }
 
+pub(crate) fn diff_line_cost(
+    old_data: &[u8],
+    new_data: &[u8],
+    max_lines: usize,
+    max_trace_cells: usize,
+) -> Result<usize> {
+    let old = split_lines(old_data);
+    let new = split_lines(new_data);
+    if old.len().max(new.len()) > max_lines {
+        return Err(Error::InvalidRepository(format!(
+            "diff exceeds {max_lines} lines"
+        )));
+    }
+    let edits = myers(&old, &new, max_trace_cells)?;
+    let mut rendered = Vec::new();
+    render_hunks(&mut rendered, &edits, 3);
+    Ok(rendered
+        .iter()
+        .fold(0usize, |count, byte| count + usize::from(*byte == b'\n')))
+}
+
 #[allow(clippy::many_single_char_names)]
 fn myers<'a>(old: &[&'a [u8]], new: &[&'a [u8]], max_cells: usize) -> Result<Vec<Edit<'a>>> {
     let n = isize::try_from(old.len())

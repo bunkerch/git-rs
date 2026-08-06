@@ -122,6 +122,8 @@ Bounded line attribution across history and exact renames is documented in
 [`docs/blame.md`](docs/blame.md).
 Stable patch identity and patch-equivalent cherry classification are documented
 in [`docs/patch-id-cherry.md`](docs/patch-id-cherry.md).
+Global correspondence between reordered and revised patch series is documented
+in [`docs/range-diff.md`](docs/range-diff.md).
 Git-compatible configuration parsing and atomic editing are documented in
 [`docs/config.md`](docs/config.md).
 Ignore matching and its integration with status and staging are documented in
