@@ -83,6 +83,7 @@ pub mod status;
 pub mod submodule;
 pub mod tag;
 pub mod tree;
+pub mod unpack_file;
 pub mod unpack_objects;
 pub mod update_index;
 pub mod update_ref;
@@ -215,6 +216,7 @@ pub use submodule::{
 };
 pub use tag::{AnnotatedTag, MkTagOptions, PeeledObject, TagBuilder};
 pub use tree::{EntryMode, Tree, TreeEntry};
+pub use unpack_file::{UnpackFileOptions, UnpackedFile};
 pub use unpack_objects::{UnpackObjectsOptions, UnpackObjectsReport};
 pub use update_index::{UpdateIndexCommand, UpdateIndexOptions, UpdateIndexReport};
 pub use update_ref::{UpdateRefCommand, UpdateRefOptions};
