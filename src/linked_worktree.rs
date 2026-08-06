@@ -190,7 +190,7 @@ impl Repository {
         remove_tree(self.filesystem(), &admin)
     }
 
-    fn ensure_branch_available(&self, branch: &ReferenceName) -> Result<()> {
+    pub(crate) fn ensure_branch_available(&self, branch: &ReferenceName) -> Result<()> {
         if symbolic_head_matches(
             &self.filesystem().read(&self.common_dir().join("HEAD"))?,
             branch,

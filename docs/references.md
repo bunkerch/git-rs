@@ -33,6 +33,18 @@ expected old object ID, and removes both representations. This prevents a
 packed value hidden by a loose override from reappearing. An annotated tag's
 peeled line and the deleted ref's reflog are removed with it.
 
+The higher-level `delete_branch` additionally refuses to delete a branch that
+is checked out in the main or any linked worktree. Without `force`, its tip
+must be an ancestor of `HEAD`; the bounded `GraphOptions` make malformed or
+hostile histories fail predictably. Successful deletion also removes the
+branch's config subsection.
+
+`rename_branch` moves the ref with one compare-and-swap ref transaction,
+preserves and extends its reflog, renames its `[branch "..."]` config, and
+updates every main or linked-worktree `HEAD` that names the branch. A forced
+rename may replace another direct branch, but never one checked out by a
+worktree.
+
 `apply_reference_transaction` batches `ReferenceEdit::update` and
 `ReferenceEdit::delete` operations. It rejects duplicate names, acquires all
 loose locks in bytewise order to avoid deadlocks, then checks every CAS
@@ -50,6 +62,11 @@ organized around these upstream contracts:
 - `refs/files-backend.c:read_ref_internal` defines loose-first, packed fallback.
 - `refs/files-backend.c` and `lockfile.c` define exclusive `.lock` acquisition
   and atomic publication.
+- `builtin/branch.c:delete_branches` defines mergedness and checked-out
+  deletion safeguards.
+- `builtin/branch.c:copy_or_rename_branch` and
+  `worktree.c:replace_each_worktree_head_symref` define branch rename behavior,
+  reflog migration, and linked-worktree `HEAD` updates.
 - `hex.c:get_oid_hex` and `hash_to_hex_algop_r` define object-ID parsing and
   canonical lowercase formatting.
 
@@ -57,8 +74,10 @@ The current repository format is version 0 and therefore uses 20-byte SHA-1
 object IDs. SHA-256 repository-format support will be represented explicitly
 rather than accepting ambiguous identifier lengths.
 
-The host-backed example opens an existing repository and creates a branch:
+The host-backed example opens an existing repository and manages branches:
 
 ```console
-cargo run --example branch -- my-repository feature/new <40-hex-object-id>
+cargo run --example branch -- my-repository create feature/new <40-hex-object-id>
+cargo run --example branch -- my-repository rename feature/new feature/ready
+cargo run --example branch -- my-repository delete feature/ready --force
 ```
