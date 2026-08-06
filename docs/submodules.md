@@ -30,6 +30,14 @@ library does not choose a network stack or invoke a process. The child clone
 shares the superproject's `Arc<dyn FileSystem>`; memory and custom routed
 adapters therefore work without host-path assumptions.
 
+`Repository::add_submodule` performs the creation workflow: it preflights
+registration and index-prefix conflicts, clones through a supplied transport
+into `<common-dir>/modules/<name>`, connects the selected worktree with a
+relative `.git` file and `core.worktree`, checks out the selected/default
+branch, records local activation, and stages both `.gitmodules` and the
+gitlink. This absorbed layout keeps object history outside the disposable
+worktree and is directly usable by native Git.
+
 ```rust
 use git_rs::{Repository, SubmoduleUpdateOptions, UploadPackTransport};
 
@@ -43,6 +51,13 @@ repo.update_submodule(
 # }
 ```
 
+For two host repositories, the local transport example performs an add without
+spawning Git:
+
+```console
+cargo run --example submodule_add_local -- superproject child deps/child
+```
+
 The update rejects conflicted or non-gitlink index entries, corrupt existing
 nested repositories, unsupported update policies, unavailable target commits,
 and checkout conflicts. Pack and inflated-object limits flow through to fetch.
@@ -50,7 +65,7 @@ and checkout conflicts. Pack and inflated-object limits flow through to fetch.
 ## Source correspondence
 
 The status prefixes, init precedence, and detached checkout behavior are
-compared with `Documentation/git-submodule.adoc`, `builtin/submodule--helper.c`,
-and `submodule-config.c` in the Git source tree. The implementation is
-independent Rust and does not invoke Git or copy gitoxide.
-
+compared with `Documentation/git-submodule.adoc`, `builtin/submodule--helper.c`
+(including `clone_submodule`), `submodule.c`, and `submodule-config.c` in the
+Git source tree. The implementation is independent Rust and does not invoke
+Git or copy gitoxide.

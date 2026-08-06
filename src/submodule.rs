@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use crate::worktree::worktree_path;
 use crate::{
-    CheckoutOptions, CloneOptions, Config, Error, FetchOptions, ObjectId, Repository, Result,
-    UploadPackTransport,
+    CheckoutOptions, CloneOptions, Config, Error, FetchOptions, IndexEntry, ObjectId, Repository,
+    Result, StatData, UploadPackTransport,
 };
 
 /// Bounds and optional literal path selection for metadata/status/init.
@@ -141,6 +141,38 @@ pub struct SubmoduleUpdateReport {
     pub current: ObjectId,
 }
 
+/// Metadata and transfer bounds for adding one new submodule.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubmoduleAddOptions {
+    pub name: Option<Vec<u8>>,
+    pub branch: Option<Vec<u8>>,
+    pub max_gitmodules_size: usize,
+    pub max_pack_size: usize,
+    pub max_object_size: usize,
+    pub max_total_inflated_size: usize,
+}
+
+impl Default for SubmoduleAddOptions {
+    fn default() -> Self {
+        Self {
+            name: None,
+            branch: None,
+            max_gitmodules_size: 64 * 1024 * 1024,
+            max_pack_size: 1024 * 1024 * 1024,
+            max_object_size: 1024 * 1024 * 1024,
+            max_total_inflated_size: 2 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+/// Result of cloning and staging a new submodule.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubmoduleAddReport {
+    pub module: Submodule,
+    pub gitlink: ObjectId,
+    pub fetched_objects: usize,
+}
+
 impl Repository {
     /// Parse and validate `.gitmodules` from the superproject worktree.
     ///
@@ -254,6 +286,112 @@ impl Repository {
         Ok(initialized)
     }
 
+    /// Clone, register, and stage one new submodule.
+    ///
+    /// The supplied transport corresponds to `url`. The clone is stored below
+    /// the superproject's common `modules/` directory and the worktree receives
+    /// a relative `.git` indirection, matching modern Git's absorbed layout.
+    ///
+    /// # Errors
+    /// Returns an error for unsafe/duplicate names or paths, a nonempty target,
+    /// an existing administrative repository, malformed metadata/index state,
+    /// unavailable branches, transport/object failures, or storage failures.
+    pub fn add_submodule<T: UploadPackTransport>(
+        &self,
+        path: &[u8],
+        url: &[u8],
+        transport: &mut T,
+        options: &SubmoduleAddOptions,
+    ) -> Result<SubmoduleAddReport> {
+        validate_submodule_path(path)?;
+        let name = options.name.as_deref().unwrap_or(path);
+        validate_submodule_path(name)?;
+        if url.is_empty() || url.contains(&0) {
+            return Err(Error::InvalidRepository("invalid submodule URL".into()));
+        }
+        let (mut modules_config, existing) = self.read_gitmodules_for_add(options)?;
+        if existing
+            .iter()
+            .any(|module| paths_overlap(module.name(), name) || module.path() == path)
+        {
+            return Err(Error::InvalidRepository(
+                "submodule name or path is already registered".into(),
+            ));
+        }
+        let index = self.read_index()?;
+        if index
+            .entries()
+            .iter()
+            .any(|entry| paths_overlap(entry.path(), path))
+        {
+            return Err(Error::InvalidRepository(
+                "submodule path overlaps an index entry".into(),
+            ));
+        }
+        let worktree = self
+            .work_tree()
+            .ok_or_else(|| Error::InvalidRepository("submodules require a worktree".into()))?;
+        let nested_path = worktree.join(worktree_path(path)?);
+        let transfer = add_transfer_options(options);
+        let (nested, _, fetched_objects) =
+            self.clone_submodule(&nested_path, name, url, transport, &transfer)?;
+        let (gitlink, checkout_branch) = self.add_submodule_target(&nested, options)?;
+        let commit = nested.read_commit(gitlink, options.max_object_size)?;
+        nested.checkout_tree(
+            commit.tree(),
+            &CheckoutOptions {
+                force: true,
+                max_object_size: options.max_object_size,
+            },
+        )?;
+        if let Some(branch) = checkout_branch.as_deref() {
+            nested.write_atomic(
+                Path::new("HEAD"),
+                format!("ref: refs/heads/{branch}\n").as_bytes(),
+            )?;
+        }
+
+        modules_config.set_in_subsection("submodule", name, "path", path)?;
+        modules_config.set_in_subsection("submodule", name, "url", url)?;
+        if let Some(branch) = &options.branch {
+            modules_config.set_in_subsection("submodule", name, "branch", branch)?;
+        }
+        let encoded = modules_config.encode();
+        if encoded.len() > options.max_gitmodules_size {
+            return Err(Error::ObjectTooLarge {
+                declared: u64::try_from(encoded.len()).unwrap_or(u64::MAX),
+                limit: options.max_gitmodules_size,
+            });
+        }
+        self.filesystem()
+            .write(&worktree.join(".gitmodules"), &encoded)?;
+        let mut local = self.read_config()?;
+        local.set_in_subsection("submodule", name, "url", url)?;
+        local.set_in_subsection("submodule", name, "active", b"true")?;
+        self.write_config(&local)?;
+        self.add(".gitmodules")?;
+        let current = self.read_index()?;
+        let mut entries = current.entries().to_vec();
+        entries.push(IndexEntry::new(
+            path.to_vec(),
+            0o160_000,
+            gitlink,
+            StatData::default(),
+        )?);
+        self.write_index(&current.with_entries(entries)?)?;
+        Ok(SubmoduleAddReport {
+            module: Submodule {
+                name: name.to_vec(),
+                path: path.to_vec(),
+                url: url.to_vec(),
+                branch: options.branch.clone(),
+                update: None,
+            },
+            gitlink,
+            fetched_objects,
+        })
+    }
+
     /// Clone/fetch one initialized submodule and detach it at its index gitlink.
     ///
     /// The caller provides the transport corresponding to the configured URL;
@@ -324,10 +462,10 @@ impl Repository {
             .ok_or_else(|| Error::InvalidRepository("submodules require a worktree".into()))?
             .join(worktree_path(module.path())?);
         let (nested, cloned, fetched_objects) =
-            self.obtain_submodule_repository(&nested_path, url, transport, options)?;
+            self.obtain_submodule_repository(&nested_path, module.name(), url, transport, options)?;
         nested.read_commit(expected, options.max_object_size)?;
         let previous = nested.resolve_reference("HEAD").ok();
-        if previous != Some(expected) || options.force {
+        if cloned || previous != Some(expected) || options.force {
             let commit = nested.read_commit(expected, options.max_object_size)?;
             nested.checkout_tree(
                 commit.tree(),
@@ -357,15 +495,75 @@ impl Repository {
         Repository::open_shared(self.shared_filesystem(), nested)
     }
 
+    fn read_gitmodules_for_add(
+        &self,
+        options: &SubmoduleAddOptions,
+    ) -> Result<(Config, Vec<Submodule>)> {
+        let worktree = self
+            .work_tree()
+            .ok_or_else(|| Error::InvalidRepository("submodules require a worktree".into()))?;
+        match self.filesystem().read(&worktree.join(".gitmodules")) {
+            Ok(data) => {
+                if data.len() > options.max_gitmodules_size {
+                    return Err(Error::ObjectTooLarge {
+                        declared: u64::try_from(data.len()).unwrap_or(u64::MAX),
+                        limit: options.max_gitmodules_size,
+                    });
+                }
+                let config = Config::parse(&data)?;
+                let modules = parse_modules(
+                    &data,
+                    &SubmoduleOptions {
+                        max_gitmodules_size: options.max_gitmodules_size,
+                        ..SubmoduleOptions::default()
+                    },
+                )?;
+                Ok((config, modules))
+            }
+            Err(Error::NotFound(_)) => Ok((Config::parse(b"")?, Vec::new())),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn add_submodule_target(
+        &self,
+        nested: &Repository,
+        options: &SubmoduleAddOptions,
+    ) -> Result<(ObjectId, Option<String>)> {
+        let Some(branch) = options.branch.as_deref() else {
+            return Ok((nested.resolve_reference("HEAD")?, None));
+        };
+        let branch = if branch == b"." {
+            let head = self.read_reference("HEAD")?;
+            let crate::ReferenceTarget::Symbolic(target) = head.target() else {
+                return Err(Error::InvalidRepository(
+                    "submodule branch `.` requires a symbolic superproject HEAD".into(),
+                ));
+            };
+            target
+                .as_str()
+                .strip_prefix("refs/heads/")
+                .ok_or_else(|| Error::InvalidRepository("HEAD is not a local branch".into()))?
+                .to_owned()
+        } else {
+            std::str::from_utf8(branch)
+                .map_err(|_| Error::InvalidRepository("submodule branch is not UTF-8".into()))?
+                .to_owned()
+        };
+        let reference = crate::ReferenceName::branch(&branch)?;
+        Ok((nested.resolve_reference(reference.as_str())?, Some(branch)))
+    }
+
     fn obtain_submodule_repository<T: UploadPackTransport>(
         &self,
         nested_path: &Path,
+        name: &[u8],
         url: &[u8],
         transport: &mut T,
         options: &SubmoduleUpdateOptions,
     ) -> Result<(Repository, bool, usize)> {
         if !self.filesystem().exists(&nested_path.join(".git"))? {
-            return self.clone_submodule(nested_path, url, transport, options);
+            return self.clone_submodule(nested_path, name, url, transport, options);
         }
         match Repository::open_shared(self.shared_filesystem(), nested_path) {
             Ok(repository) => {
@@ -379,25 +577,66 @@ impl Repository {
     fn clone_submodule<T: UploadPackTransport>(
         &self,
         nested_path: &Path,
+        name: &[u8],
         url: &[u8],
         transport: &mut T,
         options: &SubmoduleUpdateOptions,
     ) -> Result<(Repository, bool, usize)> {
         let url = std::str::from_utf8(url)
             .map_err(|_| Error::InvalidRepository("submodule URL is not UTF-8".into()))?;
-        let (repository, fetched) = Repository::clone_from_shared(
+        let modules_root = self.common_dir().join("modules");
+        let name_path = worktree_path(name)?;
+        let mut prefix = modules_root.clone();
+        let components = name_path.components().collect::<Vec<_>>();
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            prefix.push(component.as_os_str());
+            if self.filesystem().exists(&prefix.join("HEAD"))? {
+                return Err(Error::InvalidRepository(
+                    "submodule administrative directory would nest inside another repository"
+                        .into(),
+                ));
+            }
+        }
+        let admin = modules_root.join(name_path);
+        if self.filesystem().exists(&admin)? {
+            return Err(Error::AlreadyExists(admin));
+        }
+        if self.filesystem().exists(nested_path)?
+            && !self.filesystem().read_dir(nested_path)?.is_empty()
+        {
+            return Err(Error::InvalidRepository(format!(
+                "submodule worktree `{}` is not empty",
+                nested_path.display()
+            )));
+        }
+        let (administrative, fetched) = Repository::clone_from_shared(
             self.shared_filesystem(),
-            nested_path,
+            &admin,
             transport,
             &CloneOptions {
                 remote_url: url.to_owned(),
-                checkout: true,
+                bare: true,
+                checkout: false,
                 max_pack_size: options.max_pack_size,
                 max_object_size: options.max_object_size,
                 max_total_inflated_size: options.max_total_inflated_size,
                 ..CloneOptions::default()
             },
         )?;
+        let mut config = administrative.read_config()?;
+        config.set("core.bare", b"false")?;
+        config.set(
+            "core.worktree",
+            path_bytes(&relative_path(&admin, nested_path)?)?,
+        )?;
+        administrative.write_config(&config)?;
+        self.filesystem().create_dir_all(nested_path)?;
+        let pointer = relative_path(nested_path, &admin)?;
+        self.filesystem().write(
+            &nested_path.join(".git"),
+            format!("gitdir: {}\n", pointer.display()).as_bytes(),
+        )?;
+        let repository = Repository::open_shared(self.shared_filesystem(), nested_path)?;
         Ok((repository, true, fetched.received_objects))
     }
 }
@@ -409,6 +648,68 @@ fn fetch_options(options: &SubmoduleUpdateOptions) -> FetchOptions {
         max_total_inflated_size: options.max_total_inflated_size,
         ..FetchOptions::default()
     }
+}
+
+fn add_transfer_options(options: &SubmoduleAddOptions) -> SubmoduleUpdateOptions {
+    SubmoduleUpdateOptions {
+        max_gitmodules_size: options.max_gitmodules_size,
+        max_pack_size: options.max_pack_size,
+        max_object_size: options.max_object_size,
+        max_total_inflated_size: options.max_total_inflated_size,
+        ..SubmoduleUpdateOptions::default()
+    }
+}
+
+fn paths_overlap(left: &[u8], right: &[u8]) -> bool {
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with(b"/"))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with(b"/"))
+}
+
+fn relative_path(from: &Path, to: &Path) -> Result<PathBuf> {
+    let from = from.components().collect::<Vec<_>>();
+    let to = to.components().collect::<Vec<_>>();
+    let common = from
+        .iter()
+        .zip(&to)
+        .take_while(|(left, right)| left == right)
+        .count();
+    if from.first().is_some_and(|component| {
+        matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Prefix(_)
+        )
+    }) != to.first().is_some_and(|component| {
+        matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(Error::InvalidRepository(
+            "submodule paths use different storage roots".into(),
+        ));
+    }
+    let mut output = PathBuf::new();
+    for _ in common..from.len() {
+        output.push("..");
+    }
+    for component in &to[common..] {
+        output.push(component.as_os_str());
+    }
+    if output.as_os_str().is_empty() {
+        output.push(".");
+    }
+    Ok(output)
+}
+
+fn path_bytes(path: &Path) -> Result<&[u8]> {
+    path.to_str()
+        .map(str::as_bytes)
+        .ok_or_else(|| Error::InvalidRepository("submodule path is not UTF-8".into()))
 }
 
 #[derive(Default)]
@@ -551,6 +852,36 @@ mod tests {
             )
             .unwrap();
         (repository, filesystem, gitlink)
+    }
+
+    fn remote_fixture(filesystem: &MemoryFileSystem) -> (Repository, ObjectId) {
+        let remote =
+            Repository::init(filesystem.clone(), "remote-add", &InitOptions::default()).unwrap();
+        let blob = remote.write_object(ObjectKind::Blob, b"nested\n").unwrap();
+        let tree = remote
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Blob, b"file.txt".to_vec(), blob).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let signature = Signature::new("Sub", "sub@example.com", 1, 0).unwrap();
+        let tip = remote
+            .write_commit(
+                &CommitBuilder::new(tree, signature.clone(), signature)
+                    .message(b"nested\n".to_vec())
+                    .build(),
+            )
+            .unwrap();
+        remote
+            .update_reference(
+                &ReferenceName::branch("main").unwrap(),
+                tip,
+                PreviousValue::MustNotExist,
+            )
+            .unwrap();
+        (remote, tip)
     }
 
     #[test]
@@ -708,6 +1039,79 @@ mod tests {
                 .unwrap()[0]
                 .kind(),
             SubmoduleStatusKind::Matches
+        );
+    }
+
+    #[test]
+    fn add_clones_absorbed_layout_and_stages_metadata_and_gitlink() {
+        let filesystem = MemoryFileSystem::new();
+        let (remote, tip) = remote_fixture(&filesystem);
+        let superproject =
+            Repository::init(filesystem.clone(), "super-add", &InitOptions::default()).unwrap();
+        let mut transport = RepositoryTransport::new(&remote, UploadPackOptions::default());
+        let report = superproject
+            .add_submodule(
+                b"deps/lib",
+                b"memory://remote",
+                &mut transport,
+                &SubmoduleAddOptions {
+                    name: Some(b"library".to_vec()),
+                    branch: Some(b"main".to_vec()),
+                    ..SubmoduleAddOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(report.gitlink, tip);
+        assert_eq!(report.module.name(), b"library");
+        assert_eq!(
+            filesystem
+                .read(Path::new("super-add/deps/lib/.git"))
+                .unwrap(),
+            b"gitdir: ../../.git/modules/library\n"
+        );
+        assert!(
+            filesystem
+                .exists(Path::new("super-add/.git/modules/library/HEAD"))
+                .unwrap()
+        );
+        assert_eq!(
+            filesystem
+                .read(Path::new("super-add/deps/lib/file.txt"))
+                .unwrap(),
+            b"nested\n"
+        );
+        let nested = Repository::open(filesystem.clone(), "super-add/deps/lib").unwrap();
+        assert_eq!(
+            nested.read_git_file("HEAD").unwrap(),
+            b"ref: refs/heads/main\n"
+        );
+        let index = superproject.read_index().unwrap();
+        assert!(index.entries().iter().any(|entry| {
+            entry.path() == b"deps/lib" && entry.mode() == 0o160_000 && entry.id() == tip
+        }));
+        assert!(
+            index
+                .entries()
+                .iter()
+                .any(|entry| entry.path() == b".gitmodules" && entry.mode() == 0o100_644)
+        );
+        let modules = superproject
+            .submodules(&SubmoduleOptions::default())
+            .unwrap();
+        assert_eq!(modules, vec![report.module]);
+        assert!(
+            superproject
+                .add_submodule(
+                    b"other",
+                    b"memory://remote",
+                    &mut transport,
+                    &SubmoduleAddOptions {
+                        name: Some(b"library/child".to_vec()),
+                        ..SubmoduleAddOptions::default()
+                    },
+                )
+                .is_err()
         );
     }
 }

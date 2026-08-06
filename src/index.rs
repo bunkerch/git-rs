@@ -265,6 +265,16 @@ impl Index {
         &self.extensions
     }
 
+    /// Replace entries while preserving optional index extensions.
+    ///
+    /// # Errors
+    /// Returns the same validation errors as [`Self::new`].
+    pub fn with_entries(self, entries: Vec<IndexEntry>) -> Result<Self> {
+        let mut replacement = Self::new(self.version, entries)?;
+        replacement.extensions = self.extensions;
+        Ok(replacement)
+    }
+
     /// Decode and checksum-verify an index file.
     ///
     /// # Errors
