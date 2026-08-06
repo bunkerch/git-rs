@@ -6,13 +6,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = env::args().skip(1);
     let source = arguments
         .next()
-        .ok_or("usage: fetch_local <source> <destination> [depth]")?;
+        .ok_or("usage: fetch_local <source> <destination> [depth|+deepen]")?;
     let destination = arguments
         .next()
-        .ok_or("usage: fetch_local <source> <destination> [depth]")?;
-    let depth = arguments.next().map(|value| value.parse()).transpose()?;
+        .ok_or("usage: fetch_local <source> <destination> [depth|+deepen]")?;
+    let value = arguments.next();
+    let depth = value
+        .as_deref()
+        .filter(|value| !value.starts_with('+'))
+        .map(str::parse)
+        .transpose()?;
+    let deepen = value
+        .as_deref()
+        .and_then(|value| value.strip_prefix('+'))
+        .map(str::parse)
+        .transpose()?;
     if arguments.next().is_some() {
-        return Err("usage: fetch_local <source> <destination> [depth]".into());
+        return Err("usage: fetch_local <source> <destination> [depth|+deepen]".into());
     }
     let filesystem = HostFileSystem::new(".")?;
     let remote = Repository::open(filesystem.clone(), source)?;
@@ -22,6 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut transport,
         &FetchOptions {
             depth,
+            deepen,
             ..FetchOptions::default()
         },
     )?;

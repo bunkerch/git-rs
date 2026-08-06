@@ -8,8 +8,7 @@ use crate::{
     ReferenceTarget, Repository, Result, Sideband,
 };
 
-const CAPABILITIES: &str =
-    "side-band-64k ofs-delta no-progress shallow object-format=sha1 agent=git-rs/0.1";
+const CAPABILITIES: &str = "side-band-64k ofs-delta no-progress shallow deepen-relative object-format=sha1 agent=git-rs/0.1";
 
 /// Limits and encoding choices for an upload-pack session.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,6 +38,7 @@ pub struct UploadPackRequest {
     capabilities: Vec<Capability>,
     shallow: Vec<ObjectId>,
     depth: Option<usize>,
+    deepen_relative: bool,
     done: bool,
 }
 
@@ -49,6 +49,7 @@ impl UploadPackRequest {
     /// # Errors
     /// Returns an error for malformed framing, invalid commands, capabilities
     /// outside the supported advertisement, or data following `done`.
+    #[allow(clippy::too_many_lines)]
     pub fn parse(input: &[u8]) -> Result<Self> {
         let mut decoder = PktLineDecoder::new();
         decoder.extend(input);
@@ -57,6 +58,7 @@ impl UploadPackRequest {
         let mut capabilities = Vec::new();
         let mut shallow = Vec::new();
         let mut depth = None;
+        let mut deepen_relative = false;
         let mut want_section = true;
         let mut done = false;
         while let Some(packet) = decoder.next_packet()? {
@@ -136,12 +138,19 @@ impl UploadPackRequest {
         if wants.is_empty() {
             return protocol_error("upload-pack request has no wants");
         }
+        deepen_relative |= capabilities
+            .iter()
+            .any(|capability| capability.name() == "deepen-relative");
+        if deepen_relative && depth.is_none() {
+            return protocol_error("deepen-relative requires deepen");
+        }
         Ok(Self {
             wants,
             haves,
             capabilities,
             shallow,
             depth,
+            deepen_relative,
             done,
         })
     }
@@ -169,6 +178,11 @@ impl UploadPackRequest {
     #[must_use]
     pub const fn depth(&self) -> Option<usize> {
         self.depth
+    }
+
+    #[must_use]
+    pub const fn is_deepen_relative(&self) -> bool {
+        self.deepen_relative
     }
 
     #[must_use]
@@ -271,20 +285,33 @@ impl Repository {
         let acknowledged = request.haves.iter().rev().find(|id| common.contains(id));
         let mut response = Vec::new();
         let wanted = if let Some(depth) = request.depth {
-            let (wanted, boundaries) = self.reachable_objects_at_depth(
-                &request.wants,
-                depth,
-                options.max_object_size,
-                options.max_objects,
-            )?;
+            let (wanted, boundaries, unshallow) = if request.deepen_relative {
+                self.reachable_objects_deepen_relative(
+                    &request.wants,
+                    &request.shallow.iter().copied().collect(),
+                    depth,
+                    options.max_object_size,
+                    options.max_objects,
+                )?
+            } else {
+                let (wanted, boundaries) = self.reachable_objects_at_depth(
+                    &request.wants,
+                    depth,
+                    options.max_object_size,
+                    options.max_objects,
+                )?;
+                let unshallow = request
+                    .shallow
+                    .iter()
+                    .copied()
+                    .filter(|id| !boundaries.contains(id) && wanted.contains(id))
+                    .collect();
+                (wanted, boundaries, unshallow)
+            };
             for id in &boundaries {
                 append_packet(&mut response, format!("shallow {id}\n").as_bytes())?;
             }
-            for id in request
-                .shallow
-                .iter()
-                .filter(|id| !boundaries.contains(id) && wanted.contains(id))
-            {
+            for id in &unshallow {
                 append_packet(&mut response, format!("unshallow {id}\n").as_bytes())?;
             }
             response.extend(PktLine::Flush.encode()?);
@@ -507,6 +534,81 @@ impl Repository {
         Ok((ordered, boundaries))
     }
 
+    pub(crate) fn reachable_objects_deepen_relative(
+        &self,
+        roots: &[ObjectId],
+        client_shallow: &BTreeSet<ObjectId>,
+        additional_depth: usize,
+        max_size: usize,
+        max_objects: usize,
+    ) -> Result<(Vec<ObjectId>, BTreeSet<ObjectId>, BTreeSet<ObjectId>)> {
+        if additional_depth == 0 {
+            return protocol_error("relative deepen depth must be positive");
+        }
+        let mut ordered = self.reachable_objects_stopping_at(
+            roots,
+            max_size,
+            false,
+            max_objects,
+            client_shallow,
+        )?;
+        let mut objects = ordered.iter().copied().collect::<BTreeSet<_>>();
+        let reached = client_shallow
+            .iter()
+            .copied()
+            .filter(|id| objects.contains(id))
+            .collect::<BTreeSet<_>>();
+        let repository_shallow = self.shallow_commits(&crate::ShallowOptions {
+            max_commits: max_objects,
+            max_object_size: max_size,
+        })?;
+        let mut boundaries = BTreeSet::new();
+        let mut unshallow = BTreeSet::new();
+        let mut commits = std::collections::VecDeque::new();
+        for id in reached {
+            if repository_shallow.contains(&id) {
+                boundaries.insert(id);
+                continue;
+            }
+            unshallow.insert(id);
+            for parent in self.read_commit(id, max_size)?.parents() {
+                commits.push_back((*parent, 1usize));
+            }
+        }
+        let mut commit_depths = std::collections::BTreeMap::new();
+        while let Some((id, current_depth)) = commits.pop_front() {
+            if commit_depths
+                .get(&id)
+                .is_some_and(|known| *known <= current_depth)
+            {
+                continue;
+            }
+            commit_depths.insert(id, current_depth);
+            let commit = self.read_commit(id, max_size)?;
+            if objects.insert(id) {
+                ordered.push(id);
+                ensure_object_limit(objects.len(), max_objects)?;
+            }
+            self.collect_non_commit_closure(
+                commit.tree(),
+                max_size,
+                max_objects,
+                &mut objects,
+                &mut ordered,
+            )?;
+            if repository_shallow.contains(&id)
+                || current_depth == additional_depth && !commit.parents().is_empty()
+            {
+                boundaries.insert(id);
+            } else {
+                for parent in commit.parents() {
+                    commits.push_back((*parent, current_depth.saturating_add(1)));
+                }
+            }
+        }
+        Ok((ordered, boundaries, unshallow))
+    }
+
     fn collect_non_commit_closure(
         &self,
         root: ObjectId,
@@ -582,7 +684,7 @@ fn parse_exact_id(value: &[u8], command: &str) -> Result<ObjectId> {
 fn validate_capabilities(capabilities: &[Capability]) -> Result<()> {
     for capability in capabilities {
         let valid = match capability.name() {
-            "side-band-64k" | "ofs-delta" | "no-progress" | "shallow" => {
+            "side-band-64k" | "ofs-delta" | "no-progress" | "shallow" | "deepen-relative" => {
                 capability.value().is_none()
             }
             "object-format" => capability.value() == Some("sha1"),

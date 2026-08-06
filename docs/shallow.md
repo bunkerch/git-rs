@@ -24,9 +24,12 @@ assert_eq!(
 # }
 ```
 
-Both v0/v1 and v2 upload-pack parse positive absolute depths. The server walks
-commit generations breadth-first, includes complete trees and blobs for every
-selected commit, stops at repository/client shallow boundaries, and sends
+Both v0/v1 and v2 upload-pack parse positive absolute depths and relative
+deepening requests. Set `FetchOptions::deepen` to extend every shallow frontier
+by that many generations; `depth` and `deepen` are mutually exclusive. The
+server walks commit generations breadth-first, includes complete trees and
+blobs for every selected commit, expands every reached client boundary for
+relative requests, stops at repository shallow boundaries, and sends
 `shallow`/`unshallow` updates before a sideband pack. Object count and size
 limits apply throughout.
 

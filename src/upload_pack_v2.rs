@@ -65,6 +65,7 @@ impl LsRefsRequest {
 
 /// A validated base protocol-v2 `fetch` request.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct FetchV2Request {
     wants: Vec<ObjectId>,
     haves: Vec<ObjectId>,
@@ -73,6 +74,7 @@ pub struct FetchV2Request {
     include_tag: bool,
     shallow: Vec<ObjectId>,
     depth: Option<usize>,
+    deepen_relative: bool,
 }
 
 impl FetchV2Request {
@@ -230,6 +232,7 @@ impl Repository {
         Ok(output)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn respond_fetch_v2(
         &self,
         request: &FetchV2Request,
@@ -271,13 +274,30 @@ impl Repository {
             response.extend(PktLine::Flush.encode()?);
             return Ok(response);
         }
-        let (mut wanted, boundaries) = if let Some(depth) = request.depth {
-            self.reachable_objects_at_depth(
-                &request.wants,
-                depth,
-                options.max_object_size,
-                options.max_objects,
-            )?
+        let (mut wanted, boundaries, unshallow) = if let Some(depth) = request.depth {
+            if request.deepen_relative {
+                self.reachable_objects_deepen_relative(
+                    &request.wants,
+                    &request.shallow.iter().copied().collect(),
+                    depth,
+                    options.max_object_size,
+                    options.max_objects,
+                )?
+            } else {
+                let (wanted, boundaries) = self.reachable_objects_at_depth(
+                    &request.wants,
+                    depth,
+                    options.max_object_size,
+                    options.max_objects,
+                )?;
+                let unshallow = request
+                    .shallow
+                    .iter()
+                    .copied()
+                    .filter(|id| !boundaries.contains(id) && wanted.contains(id))
+                    .collect();
+                (wanted, boundaries, unshallow)
+            }
         } else {
             (
                 self.reachable_objects_bounded(
@@ -286,6 +306,7 @@ impl Repository {
                     false,
                     options.max_objects,
                 )?,
+                BTreeSet::new(),
                 BTreeSet::new(),
             )
         };
@@ -315,11 +336,7 @@ impl Repository {
             for id in &boundaries {
                 append_packet(&mut response, format!("shallow {id}\n").as_bytes())?;
             }
-            for id in request
-                .shallow
-                .iter()
-                .filter(|id| !boundaries.contains(id) && wanted.contains(id))
-            {
+            for id in &unshallow {
                 append_packet(&mut response, format!("unshallow {id}\n").as_bytes())?;
             }
             response.extend(PktLine::Delimiter.encode()?);
@@ -469,6 +486,7 @@ fn parse_fetch(arguments: &[PktLine]) -> Result<FetchV2Request> {
         include_tag: false,
         shallow: Vec::new(),
         depth: None,
+        deepen_relative: false,
     };
     for argument in data_lines(arguments)? {
         if let Some(value) = argument.strip_prefix(b"want ") {
@@ -492,6 +510,7 @@ fn parse_fetch(arguments: &[PktLine]) -> Result<FetchV2Request> {
             request.depth = Some(depth);
         } else {
             match argument {
+                b"deepen-relative" => set_once(&mut request.deepen_relative, "deepen-relative")?,
                 b"done" => set_once(&mut request.done, "done")?,
                 b"ofs-delta" => set_once(&mut request.ofs_delta, "ofs-delta")?,
                 b"include-tag" => set_once(&mut request.include_tag, "include-tag")?,
@@ -504,6 +523,9 @@ fn parse_fetch(arguments: &[PktLine]) -> Result<FetchV2Request> {
                 }
             }
         }
+    }
+    if request.deepen_relative && request.depth.is_none() {
+        return protocol_error("deepen-relative requires deepen");
     }
     Ok(request)
 }

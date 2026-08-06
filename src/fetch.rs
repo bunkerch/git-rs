@@ -190,6 +190,8 @@ pub struct FetchOptions {
     pub max_object_size: usize,
     pub max_total_inflated_size: usize,
     pub depth: Option<usize>,
+    /// Extend every reached shallow boundary by this many generations.
+    pub deepen: Option<usize>,
     pub max_shallow_commits: usize,
 }
 
@@ -202,6 +204,7 @@ impl Default for FetchOptions {
             max_object_size: 1024 * 1024 * 1024,
             max_total_inflated_size: 2 * 1024 * 1024 * 1024,
             depth: None,
+            deepen: None,
             max_shallow_commits: 10_000_000,
         }
     }
@@ -332,6 +335,7 @@ impl Repository {
                 max_object_size: options.max_object_size,
                 max_total_inflated_size: options.max_total_inflated_size,
                 depth: options.depth,
+                deepen: None,
                 max_shallow_commits: options.max_shallow_commits,
             },
             options.bare,
@@ -397,7 +401,10 @@ impl Repository {
         }
         let request = self.build_fetch_request(&selected, options, &advertisement)?;
         let response = transport.request(&request)?;
-        let parsed = parse_fetch_response(&response, options.depth.is_some())?;
+        let parsed = parse_fetch_response(
+            &response,
+            options.depth.is_some() || options.deepen.is_some(),
+        )?;
         let validated = self.validate_incoming_pack(
             &parsed.pack,
             &IncomingPackOptions {
@@ -446,17 +453,31 @@ impl Repository {
         if options.depth == Some(0) {
             return protocol_error("fetch depth must be positive");
         }
+        if options.deepen == Some(0) {
+            return protocol_error("fetch relative depth must be positive");
+        }
+        if options.depth.is_some() && options.deepen.is_some() {
+            return protocol_error("fetch depth and deepen are mutually exclusive");
+        }
         let shallow = self.shallow_commits(&crate::ShallowOptions {
             max_commits: options.max_shallow_commits,
             max_object_size: options.max_object_size,
         })?;
-        if (options.depth.is_some() || !shallow.is_empty())
+        if (options.depth.is_some() || options.deepen.is_some() || !shallow.is_empty())
             && !advertisement
                 .capabilities
                 .iter()
                 .any(|capability| capability.name() == "shallow")
         {
             return protocol_error("remote does not support shallow fetches");
+        }
+        if options.deepen.is_some()
+            && !advertisement
+                .capabilities
+                .iter()
+                .any(|capability| capability.name() == "deepen-relative")
+        {
+            return protocol_error("remote does not support relative deepening");
         }
         let mut output = Vec::new();
         let mut seen = BTreeSet::new();
@@ -465,8 +486,12 @@ impl Repository {
                 continue;
             }
             let suffix = if output.is_empty() {
-                if options.depth.is_some() || !shallow.is_empty() {
-                    " side-band-64k ofs-delta no-progress shallow object-format=sha1"
+                if options.depth.is_some() || options.deepen.is_some() || !shallow.is_empty() {
+                    if options.deepen.is_some() {
+                        " side-band-64k ofs-delta no-progress shallow deepen-relative object-format=sha1"
+                    } else {
+                        " side-band-64k ofs-delta no-progress shallow object-format=sha1"
+                    }
                 } else {
                     " side-band-64k ofs-delta no-progress object-format=sha1"
                 }
@@ -483,6 +508,9 @@ impl Repository {
         }
         if let Some(depth) = options.depth {
             append_packet(&mut output, format!("deepen {depth}\n").as_bytes())?;
+        }
+        if let Some(deepen) = options.deepen {
+            append_packet(&mut output, format!("deepen {deepen}\n").as_bytes())?;
         }
         output.extend(PktLine::Flush.encode()?);
         for id in self.local_have_ids()? {
@@ -921,7 +949,7 @@ mod tests {
             .fetch(
                 &mut transport,
                 &FetchOptions {
-                    depth: Some(2),
+                    deepen: Some(1),
                     ..FetchOptions::default()
                 },
             )
@@ -937,7 +965,7 @@ mod tests {
             .fetch(
                 &mut transport,
                 &FetchOptions {
-                    depth: Some(3),
+                    deepen: Some(1),
                     ..FetchOptions::default()
                 },
             )
