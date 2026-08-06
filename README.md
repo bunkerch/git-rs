@@ -46,6 +46,8 @@ Revision walking, ancestry, and merge bases are documented in
 [`docs/revisions.md`](docs/revisions.md).
 Fast-forward, three-way, conflict, continue, and abort behavior is documented
 in [`docs/merge.md`](docs/merge.md).
+Cherry-pick and revert behavior is documented in
+[`docs/replay.md`](docs/replay.md).
 
 To create a host-backed repository with the included example:
 

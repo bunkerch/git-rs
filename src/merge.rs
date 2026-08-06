@@ -47,6 +47,42 @@ pub enum MergeResult {
     Conflicted { paths: Vec<Vec<u8>> },
 }
 
+/// Direction of a single-commit replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplayKind {
+    CherryPick,
+    Revert,
+}
+
+/// Cherry-pick/revert parent selection and resource choices.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplayOptions {
+    /// One-based parent number for replaying a merge commit.
+    pub mainline: Option<usize>,
+    pub no_commit: bool,
+    pub allow_empty: bool,
+    pub max_object_size: usize,
+}
+
+impl Default for ReplayOptions {
+    fn default() -> Self {
+        Self {
+            mainline: None,
+            no_commit: false,
+            allow_empty: false,
+            max_object_size: 1024 * 1024 * 1024,
+        }
+    }
+}
+
+/// Result of cherry-picking or reverting one commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReplayResult {
+    Committed { commit: ObjectId },
+    Prepared { tree: ObjectId },
+    Conflicted { paths: Vec<Vec<u8>> },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MergeEntry {
     mode: u32,
@@ -68,6 +104,141 @@ struct TreeMerge {
 }
 
 impl Repository {
+    /// Apply or reverse the change introduced by one commit.
+    ///
+    /// # Errors
+    /// Returns an error for dirty or bare repositories, ambiguous merge-commit
+    /// parent selection, empty changes unless allowed, corrupt objects, index
+    /// or checkout conflicts, or storage failures.
+    pub fn replay_commit(
+        &self,
+        target: ObjectId,
+        kind: ReplayKind,
+        options: &ReplayOptions,
+        committer: &Signature,
+    ) -> Result<ReplayResult> {
+        if self.work_tree().is_none() {
+            return Err(Error::InvalidRepository(
+                "commit replay requires a working tree".into(),
+            ));
+        }
+        if self.replay_in_progress()? || self.filesystem().exists(&self.git_path("MERGE_HEAD"))? {
+            return Err(Error::InvalidRepository(
+                "another merge or replay is already in progress".into(),
+            ));
+        }
+        if !self
+            .status(&StatusOptions {
+                include_untracked: false,
+                max_object_size: options.max_object_size,
+            })?
+            .is_clean()
+        {
+            return Err(Error::InvalidRepository(
+                "cannot replay with staged or unstaged changes".into(),
+            ));
+        }
+        let ours = self.resolve_reference("HEAD")?;
+        let ours_commit = self.read_commit(ours, options.max_object_size)?;
+        let picked = self.read_commit(target, options.max_object_size)?;
+        let parent_tree = match replay_parent_tree(self, &picked, options)? {
+            Some(tree) => tree,
+            None => self.empty_tree()?,
+        };
+        let (base, theirs) = match kind {
+            ReplayKind::CherryPick => (parent_tree, picked.tree()),
+            ReplayKind::Revert => (picked.tree(), parent_tree),
+        };
+        let merge_options = MergeOptions {
+            graph: GraphOptions {
+                max_object_size: options.max_object_size,
+                ..GraphOptions::default()
+            },
+            ..MergeOptions::default()
+        };
+        let merged = self.merge_trees(base, ours_commit.tree(), theirs, target, &merge_options)?;
+        let (tree, paths) = self.materialize_merge(&merged, options.max_object_size)?;
+        let message = replay_message(kind, target, &picked, options.mainline);
+        if !paths.is_empty() {
+            self.write_atomic(Path::new("ORIG_HEAD"), format!("{ours}\n").as_bytes())?;
+            self.write_atomic(
+                Path::new(replay_head_name(kind)),
+                format!("{target}\n").as_bytes(),
+            )?;
+            self.write_atomic(Path::new("MERGE_MSG"), &message)?;
+            return Ok(ReplayResult::Conflicted { paths });
+        }
+        if tree == ours_commit.tree() && !options.allow_empty {
+            return Err(Error::InvalidRepository(
+                "replayed commit would be empty".into(),
+            ));
+        }
+        if options.no_commit {
+            return Ok(ReplayResult::Prepared { tree });
+        }
+        let author = match kind {
+            ReplayKind::CherryPick => picked.author().clone(),
+            ReplayKind::Revert => committer.clone(),
+        };
+        let id = self.commit_replay(ours, tree, &message, author, committer, kind)?;
+        Ok(ReplayResult::Committed { commit: id })
+    }
+
+    /// Continue a conflicted cherry-pick or revert after all paths are staged.
+    ///
+    /// # Errors
+    /// Returns an error when no replay is active, stages remain unresolved,
+    /// `HEAD` moved, or commit/ref storage fails.
+    pub fn continue_replay(
+        &self,
+        max_object_size: usize,
+        committer: &Signature,
+    ) -> Result<ObjectId> {
+        let (kind, target) = self.read_replay_head()?;
+        let ours = self.resolve_reference("HEAD")?;
+        if ours != self.read_orig_head()? {
+            return Err(Error::ReferenceConflict(
+                "HEAD changed during commit replay".into(),
+            ));
+        }
+        let index = self.read_index()?;
+        if index.entries().iter().any(|entry| entry.stage() != 0) {
+            return Err(Error::InvalidRepository(
+                "cannot continue with unresolved replay entries".into(),
+            ));
+        }
+        let tree = self.write_index_tree(&index)?;
+        let picked = self.read_commit(target, max_object_size)?;
+        let author = match kind {
+            ReplayKind::CherryPick => picked.author().clone(),
+            ReplayKind::Revert => committer.clone(),
+        };
+        let message = self.read_git_file("MERGE_MSG")?;
+        self.commit_replay(ours, tree, &message, author, committer, kind)
+    }
+
+    /// Abort a conflicted cherry-pick or revert.
+    ///
+    /// # Errors
+    /// Returns an error when no replay is active or restoration/storage fails.
+    pub fn abort_replay(&self, max_object_size: usize, committer: &Signature) -> Result<()> {
+        self.read_replay_head()?;
+        let original = self.read_orig_head()?;
+        let current = self.resolve_reference("HEAD")?;
+        let tree = self.read_commit(original, max_object_size)?.tree();
+        self.checkout_tree(
+            tree,
+            &CheckoutOptions {
+                force: true,
+                max_object_size,
+            },
+        )?;
+        if current != original {
+            self.move_merge_head(current, original, committer, b"reset: moving to ORIG_HEAD")?;
+        }
+        self.clear_replay_state()
+    }
+
     /// Merge `target` into the current `HEAD`.
     ///
     /// Fast-forwards update the checked-out ref directly. Diverged histories
@@ -523,6 +694,140 @@ impl Repository {
         }
         Ok(())
     }
+
+    fn replay_in_progress(&self) -> Result<bool> {
+        Ok(self
+            .filesystem()
+            .exists(&self.git_path("CHERRY_PICK_HEAD"))?
+            || self.filesystem().exists(&self.git_path("REVERT_HEAD"))?)
+    }
+
+    fn read_replay_head(&self) -> Result<(ReplayKind, ObjectId)> {
+        for (kind, name) in [
+            (ReplayKind::CherryPick, "CHERRY_PICK_HEAD"),
+            (ReplayKind::Revert, "REVERT_HEAD"),
+        ] {
+            match self.read_git_file(name) {
+                Ok(data) => {
+                    let value = data.strip_suffix(b"\n").unwrap_or(&data);
+                    let id = std::str::from_utf8(value)
+                        .map_err(|_| Error::InvalidRepository("replay HEAD is not ASCII".into()))?
+                        .parse()
+                        .map_err(|_| Error::InvalidRepository("replay HEAD is invalid".into()))?;
+                    return Ok((kind, id));
+                }
+                Err(Error::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::InvalidRepository(
+            "no cherry-pick or revert is in progress".into(),
+        ))
+    }
+
+    fn commit_replay(
+        &self,
+        ours: ObjectId,
+        tree: ObjectId,
+        message: &[u8],
+        author: Signature,
+        committer: &Signature,
+        kind: ReplayKind,
+    ) -> Result<ObjectId> {
+        let commit = CommitBuilder::new(tree, author, committer.clone())
+            .parent(ours)
+            .message(message.to_vec())
+            .build();
+        let id = self.write_commit(&commit)?;
+        let action = match kind {
+            ReplayKind::CherryPick => b"cherry-pick: applied commit".as_slice(),
+            ReplayKind::Revert => b"revert: reverted commit".as_slice(),
+        };
+        self.move_merge_head(ours, id, committer, action)?;
+        self.clear_replay_state()?;
+        Ok(id)
+    }
+
+    fn clear_replay_state(&self) -> Result<()> {
+        for name in ["CHERRY_PICK_HEAD", "REVERT_HEAD", "MERGE_MSG"] {
+            let path = self.git_path(name);
+            match self.filesystem().remove_file(&path) {
+                Ok(()) | Err(Error::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn replay_parent_tree(
+    repository: &Repository,
+    commit: &crate::Commit,
+    options: &ReplayOptions,
+) -> Result<Option<ObjectId>> {
+    if commit.parents().is_empty() {
+        if options.mainline.is_some() {
+            return Err(Error::InvalidCommit(
+                "mainline parent specified for a root commit".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    let index = if commit.parents().len() == 1 {
+        if options.mainline.is_some() {
+            return Err(Error::InvalidCommit(
+                "mainline parent specified for a non-merge commit".into(),
+            ));
+        }
+        0
+    } else {
+        options
+            .mainline
+            .and_then(|value| value.checked_sub(1))
+            .filter(|index| *index < commit.parents().len())
+            .ok_or_else(|| Error::InvalidCommit("merge commit requires a valid mainline".into()))?
+    };
+    Ok(Some(
+        repository
+            .read_commit(commit.parents()[index], options.max_object_size)?
+            .tree(),
+    ))
+}
+
+fn replay_head_name(kind: ReplayKind) -> &'static str {
+    match kind {
+        ReplayKind::CherryPick => "CHERRY_PICK_HEAD",
+        ReplayKind::Revert => "REVERT_HEAD",
+    }
+}
+
+fn replay_message(
+    kind: ReplayKind,
+    target: ObjectId,
+    commit: &crate::Commit,
+    mainline: Option<usize>,
+) -> Vec<u8> {
+    match kind {
+        ReplayKind::CherryPick => commit.message().to_vec(),
+        ReplayKind::Revert => {
+            let subject = commit
+                .message()
+                .split(|byte| *byte == b'\n')
+                .next()
+                .unwrap_or_default();
+            let mut message = b"Revert \"".to_vec();
+            message.extend_from_slice(subject);
+            message.extend_from_slice(b"\"\n\nThis reverts commit ");
+            message.extend_from_slice(target.to_string().as_bytes());
+            if let Some(mainline) = mainline {
+                message.extend_from_slice(
+                    format!(", reversing changes made to its parent {mainline}").as_bytes(),
+                );
+            }
+            message.extend_from_slice(b".\n");
+            message
+        }
+    }
 }
 
 fn reject_file_directory_collisions<'a>(paths: impl Iterator<Item = &'a Vec<u8>>) -> Result<()> {
@@ -559,7 +864,9 @@ fn append_with_newline(output: &mut Vec<u8>, contents: &[u8]) {
 mod tests {
     use std::path::Path;
 
-    use super::{FastForwardMode, MergeOptions, MergeResult};
+    use super::{
+        FastForwardMode, MergeOptions, MergeResult, ReplayKind, ReplayOptions, ReplayResult,
+    };
     use crate::{
         CheckoutOptions, CommitBuilder, EntryMode, FileSystem, InitOptions, MemoryFileSystem,
         ObjectKind, PreviousValue, ReferenceName, Repository, Signature, Tree, TreeEntry,
@@ -707,6 +1014,139 @@ mod tests {
             .merge(theirs, &MergeOptions::default(), &signature)
             .unwrap();
         repository.abort_merge(4096, &signature).unwrap();
+        assert_eq!(filesystem.read(Path::new("repo/file")).unwrap(), b"ours\n");
+        assert!(
+            repository
+                .read_index()
+                .unwrap()
+                .entries()
+                .iter()
+                .all(|entry| entry.stage() == 0)
+        );
+    }
+
+    #[test]
+    fn cherry_picks_with_original_author_and_reverts_the_change() {
+        let (repository, filesystem, signature) = repository();
+        let base = commit(
+            &repository,
+            &[],
+            &[(&b"file"[..], b"base\n"), (&b"other"[..], b"base\n")],
+            1,
+        );
+        let picked = commit(
+            &repository,
+            &[base],
+            &[(&b"file"[..], b"picked\n"), (&b"other"[..], b"base\n")],
+            2,
+        );
+        let ours = commit(
+            &repository,
+            &[base],
+            &[(&b"file"[..], b"base\n"), (&b"other"[..], b"ours\n")],
+            3,
+        );
+        set_main(&repository, ours);
+        checkout(&repository, ours);
+
+        let replayed = repository
+            .replay_commit(
+                picked,
+                ReplayKind::CherryPick,
+                &ReplayOptions::default(),
+                &signature,
+            )
+            .unwrap();
+        let ReplayResult::Committed { commit: cherry } = replayed else {
+            panic!("expected committed cherry-pick");
+        };
+        let cherry_commit = repository.read_commit(cherry, 4096).unwrap();
+        assert_eq!(cherry_commit.parents(), [ours]);
+        assert_eq!(cherry_commit.author().timestamp(), 2);
+        assert_eq!(
+            filesystem.read(Path::new("repo/file")).unwrap(),
+            b"picked\n"
+        );
+        assert_eq!(filesystem.read(Path::new("repo/other")).unwrap(), b"ours\n");
+
+        let reverted = repository
+            .replay_commit(
+                picked,
+                ReplayKind::Revert,
+                &ReplayOptions::default(),
+                &signature,
+            )
+            .unwrap();
+        let ReplayResult::Committed { commit: revert } = reverted else {
+            panic!("expected committed revert");
+        };
+        let revert_commit = repository.read_commit(revert, 4096).unwrap();
+        assert_eq!(revert_commit.parents(), [cherry]);
+        assert!(revert_commit.message().starts_with(b"Revert \"commit\""));
+        assert_eq!(filesystem.read(Path::new("repo/file")).unwrap(), b"base\n");
+        assert_eq!(filesystem.read(Path::new("repo/other")).unwrap(), b"ours\n");
+    }
+
+    #[test]
+    fn cherry_pick_conflicts_can_continue_or_abort() {
+        let (repository, filesystem, signature) = repository();
+        let base = commit(&repository, &[], &[(&b"file"[..], b"base\n")], 1);
+        let ours = commit(&repository, &[base], &[(&b"file"[..], b"ours\n")], 2);
+        let picked = commit(&repository, &[base], &[(&b"file"[..], b"picked\n")], 3);
+        set_main(&repository, ours);
+        checkout(&repository, ours);
+
+        assert!(matches!(
+            repository
+                .replay_commit(
+                    picked,
+                    ReplayKind::CherryPick,
+                    &ReplayOptions::default(),
+                    &signature,
+                )
+                .unwrap(),
+            ReplayResult::Conflicted { .. }
+        ));
+        assert!(
+            filesystem
+                .exists(Path::new("repo/.git/CHERRY_PICK_HEAD"))
+                .unwrap()
+        );
+        assert!(repository.continue_replay(4096, &signature).is_err());
+        filesystem
+            .write(Path::new("repo/file"), b"resolved\n")
+            .unwrap();
+        repository.add("file").unwrap();
+        let replayed = repository.continue_replay(4096, &signature).unwrap();
+        assert_eq!(
+            repository.read_commit(replayed, 4096).unwrap().parents(),
+            [ours]
+        );
+        assert!(
+            !filesystem
+                .exists(Path::new("repo/.git/CHERRY_PICK_HEAD"))
+                .unwrap()
+        );
+
+        repository
+            .reset(
+                ours,
+                &crate::ResetOptions {
+                    mode: crate::ResetMode::Hard,
+                    ..crate::ResetOptions::default()
+                },
+                &signature,
+            )
+            .unwrap();
+        repository
+            .replay_commit(
+                picked,
+                ReplayKind::CherryPick,
+                &ReplayOptions::default(),
+                &signature,
+            )
+            .unwrap();
+        repository.abort_replay(4096, &signature).unwrap();
         assert_eq!(filesystem.read(Path::new("repo/file")).unwrap(), b"ours\n");
         assert!(
             repository
