@@ -37,7 +37,9 @@ Ordinary branch updates must be fast-forwards. Use
 `PushUpdate::force_update` when replacement is intentional. Existing tags also
 require force. `PushUpdate::delete` requests deletion only when the remote
 advertises `delete-refs`. `PushOptions::atomic` requires the server's `atomic`
-capability and makes all commands one remote transaction.
+capability and makes all commands one remote transaction. `max_commits` bounds
+fast-forward graph discovery, while `max_object_size` bounds commit and pack
+source reads.
 
 Remote ref rejection is represented in `PushResult::statuses`; malformed
 advertisements, unsupported requested features, unpack failure, malformed

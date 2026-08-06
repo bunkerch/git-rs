@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    Error, ObjectId, PackOptions, PktLine, ReceivePackOptions, ReceivePackRequest, ReferenceName,
-    RemoteAdvertisement, Repository, Result,
+    Error, GraphOptions, ObjectId, PackOptions, PktLine, ReceivePackOptions, ReceivePackRequest,
+    ReferenceName, RemoteAdvertisement, Repository, Result,
 };
 
 /// Byte exchange required from a receive-pack transport.
@@ -110,6 +110,7 @@ impl PushUpdate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PushOptions {
     pub atomic: bool,
+    pub max_commits: usize,
     pub max_object_size: usize,
     pub use_deltas: bool,
 }
@@ -118,6 +119,7 @@ impl Default for PushOptions {
     fn default() -> Self {
         Self {
             atomic: false,
+            max_commits: 10_000_000,
             max_object_size: 1024 * 1024 * 1024,
             use_deltas: true,
         }
@@ -182,7 +184,7 @@ impl Repository {
                 ));
             }
         }
-        self.validate_push_updates(&remote, updates, options.max_object_size)?;
+        self.validate_push_updates(&remote, updates, options)?;
 
         let new_roots = updates
             .iter()
@@ -219,7 +221,7 @@ impl Repository {
         &self,
         remote: &BTreeMap<&str, ObjectId>,
         updates: &[PushUpdate],
-        max_object_size: usize,
+        options: &PushOptions,
     ) -> Result<()> {
         for update in updates {
             let Some(new) = update.new_id else {
@@ -232,7 +234,14 @@ impl Repository {
                 continue;
             }
             if !update.destination.as_str().starts_with("refs/heads/")
-                || !self.is_commit_ancestor(old, new, max_object_size)?
+                || !self.is_ancestor(
+                    old,
+                    new,
+                    &GraphOptions {
+                        max_commits: options.max_commits,
+                        max_object_size: options.max_object_size,
+                    },
+                )?
             {
                 return Err(Error::ReferenceConflict(format!(
                     "non-fast-forward update to {}",
@@ -241,25 +250,6 @@ impl Repository {
             }
         }
         Ok(())
-    }
-
-    fn is_commit_ancestor(
-        &self,
-        ancestor: ObjectId,
-        descendant: ObjectId,
-        max_object_size: usize,
-    ) -> Result<bool> {
-        let mut pending = vec![descendant];
-        let mut seen = BTreeSet::new();
-        while let Some(id) = pending.pop() {
-            if id == ancestor {
-                return Ok(true);
-            }
-            if seen.insert(id) {
-                pending.extend(self.read_commit(id, max_object_size)?.parents());
-            }
-        }
-        Ok(false)
     }
 }
 

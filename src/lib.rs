@@ -14,6 +14,7 @@ pub mod push;
 pub mod receive_pack;
 pub mod refs;
 pub mod repository;
+pub mod revision;
 pub mod status;
 pub mod tree;
 pub mod upload_pack;
@@ -46,6 +47,7 @@ pub use refs::{
     PreviousValue, Reference, ReferenceEdit, ReferenceName, ReferenceTarget, ReflogEntry,
 };
 pub use repository::{InitOptions, Repository};
+pub use revision::{GraphOptions, Revision, RevisionWalkOptions};
 pub use status::{ChangeKind, RepositoryStatus, StatusEntry, StatusOptions};
 pub use tree::{EntryMode, Tree, TreeEntry};
 pub use upload_pack::{UploadPackOptions, UploadPackRequest};
