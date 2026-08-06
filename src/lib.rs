@@ -8,6 +8,7 @@ pub mod bisect;
 pub mod blame;
 pub mod branch;
 pub mod bundle;
+pub mod cat_file;
 pub mod checkout_index;
 pub mod cherry;
 pub mod clean;
@@ -94,6 +95,7 @@ pub use bundle::{
     BundleCreateOptions, BundleParseOptions, BundlePrerequisite, BundleReference, BundleVersion,
     GitBundle,
 };
+pub use cat_file::{CatFileBatchOptions, CatFileMode, CatFileResult};
 pub use checkout_index::{
     CheckoutIndexEntry, CheckoutIndexOptions, CheckoutIndexResult, CheckoutIndexStage,
 };
