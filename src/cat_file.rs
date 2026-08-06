@@ -145,7 +145,13 @@ impl Repository {
                         append_byte(&mut output, delimiter, options.max_output_bytes)?;
                     }
                 }
-                Err(Error::NotFound(_) | Error::InvalidRevision(_)) => {
+                Err(
+                    Error::NotFound(_)
+                    | Error::InvalidRevision(_)
+                    | Error::InvalidReferenceName(_)
+                    | Error::InvalidObjectId(_)
+                    | Error::AmbiguousRevision(_),
+                ) => {
                     append_bounded(&mut output, expression, options.max_output_bytes)?;
                     append_bounded(&mut output, b" missing", options.max_output_bytes)?;
                     append_byte(&mut output, delimiter, options.max_output_bytes)?;

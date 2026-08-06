@@ -79,6 +79,7 @@ pub mod status;
 pub mod submodule;
 pub mod tag;
 pub mod tree;
+pub mod update_ref;
 pub mod upload_pack;
 pub mod upload_pack_v2;
 pub mod worktree;
@@ -204,6 +205,7 @@ pub use submodule::{
 };
 pub use tag::{AnnotatedTag, PeeledObject, TagBuilder};
 pub use tree::{EntryMode, Tree, TreeEntry};
+pub use update_ref::{UpdateRefCommand, UpdateRefOptions};
 pub use upload_pack::{UploadPackOptions, UploadPackRequest};
 pub use upload_pack_v2::{FetchV2Request, LsRefsRequest, UploadPackV2Limits, UploadPackV2Request};
 pub use worktree::{AddOptions, CheckoutOptions, MoveOptions, RemoveOptions};

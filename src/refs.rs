@@ -81,6 +81,7 @@ pub enum PreviousReferenceValue {
     Any,
     MustNotExist,
     MustExist(ReferenceTarget),
+    MustResolveTo(ObjectId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -458,6 +459,9 @@ impl Repository {
                 PreviousReferenceValue::Any => true,
                 PreviousReferenceValue::MustNotExist => actual.is_none(),
                 PreviousReferenceValue::MustExist(expected) => actual == Some(expected),
+                PreviousReferenceValue::MustResolveTo(expected) => {
+                    actual.is_some() && resolved_target(self, actual.as_ref()) == expected
+                }
             };
             if !matches {
                 return Err(Error::ReferenceConflict(name.to_owned()));
@@ -741,6 +745,7 @@ impl Repository {
     /// Returns an error for invalid or duplicate names, null direct targets,
     /// stale target preconditions, absent deletes, lock contention, malformed
     /// packed refs, or storage failure.
+    #[allow(clippy::too_many_lines)]
     pub fn apply_mixed_reference_transaction(
         &self,
         edits: &[ReferenceTransactionEdit],
@@ -863,7 +868,7 @@ impl Repository {
                 Err(Error::NotFound(_)) => None,
                 Err(error) => return Err(error),
             };
-            if !previous_reference_matches(&item.edit.previous, actual.as_ref())
+            if !previous_reference_matches(self, &item.edit.previous, actual.as_ref())
                 || (matches!(item.edit.change, ReferenceTransactionChange::Delete)
                     && actual.is_none())
             {
@@ -1667,7 +1672,11 @@ impl Repository {
 }
 
 fn validate_read_name(name: &str) -> Result<()> {
-    if name == "HEAD" || (name.starts_with("refs/") && is_valid_refname(name, false)) {
+    let root_ref = !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
+    if root_ref || (name.starts_with("refs/") && is_valid_refname(name, false)) {
         Ok(())
     } else {
         Err(Error::InvalidReferenceName(name.to_owned()))
@@ -1719,6 +1728,7 @@ fn previous_matches(previous: PreviousValue, actual: Option<ObjectId>) -> bool {
 }
 
 fn previous_reference_matches(
+    repository: &Repository,
     previous: &PreviousReferenceValue,
     actual: Option<&ReferenceTarget>,
 ) -> bool {
@@ -1726,6 +1736,9 @@ fn previous_reference_matches(
         PreviousReferenceValue::Any => true,
         PreviousReferenceValue::MustNotExist => actual.is_none(),
         PreviousReferenceValue::MustExist(expected) => actual == Some(expected),
+        PreviousReferenceValue::MustResolveTo(expected) => {
+            actual.is_some() && resolved_target(repository, actual) == *expected
+        }
     }
 }
 
