@@ -15,6 +15,8 @@ const CAPABILITIES: &str =
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UploadPackOptions {
     pub max_object_size: usize,
+    pub max_objects: usize,
+    pub max_tag_depth: usize,
     pub use_deltas: bool,
 }
 
@@ -22,6 +24,8 @@ impl Default for UploadPackOptions {
     fn default() -> Self {
         Self {
             max_object_size: 1024 * 1024 * 1024,
+            max_objects: 10_000_000,
+            max_tag_depth: 64,
             use_deltas: true,
         }
     }
@@ -208,7 +212,12 @@ impl Repository {
             return protocol_error(format!("want {id} is not an advertised ref"));
         }
 
-        let common = self.reachable_objects(&request.haves, options.max_object_size, true)?;
+        let common = self.reachable_objects_bounded(
+            &request.haves,
+            options.max_object_size,
+            true,
+            options.max_objects,
+        )?;
         let acknowledged = request.haves.iter().rev().find(|id| common.contains(id));
         let mut response = Vec::new();
         let negotiation = acknowledged.map_or_else(
@@ -220,7 +229,12 @@ impl Repository {
             return Ok(response);
         }
 
-        let wanted = self.reachable_objects(&request.wants, options.max_object_size, false)?;
+        let wanted = self.reachable_objects_bounded(
+            &request.wants,
+            options.max_object_size,
+            false,
+            options.max_objects,
+        )?;
         let pack_ids = wanted
             .into_iter()
             .filter(|id| !common.contains(id))

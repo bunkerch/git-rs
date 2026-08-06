@@ -49,7 +49,7 @@ Bounded loose, packed, duplicate, size, and garbage inventory is documented in
 [`docs/count-objects.md`](docs/count-objects.md).
 Wire-format primitives are documented in
 [`docs/protocol.md`](docs/protocol.md).
-Server-side fetch negotiation is documented in
+Server-side fetch negotiation for wire protocols v0/v1 and v2 is documented in
 [`docs/upload-pack.md`](docs/upload-pack.md).
 Dumb/static HTTP reference and pack metadata generation is documented in
 [`docs/server-info.md`](docs/server-info.md).

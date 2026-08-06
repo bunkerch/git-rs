@@ -1,10 +1,11 @@
 # Upload-pack
 
-The library exposes Git protocol v0/v1 upload-pack as transport-neutral byte
-operations. `Repository::advertise_upload_pack` produces the pkt-line ref
-advertisement. `UploadPackRequest::parse` validates a complete stateless request
-body, and `Repository::respond_upload_pack` returns the negotiation reply and,
-after `done`, a pack stream.
+The library exposes Git protocol v0/v1 and v2 upload-pack as transport-neutral
+byte operations. `Repository::advertise_upload_pack` and
+`Repository::advertise_upload_pack_v2` produce the corresponding capability
+advertisements. `UploadPackRequest` and `UploadPackV2Request` validate complete
+stateless requests before repository access. The response APIs return
+negotiation replies and pack streams without owning a socket or process.
 
 No Git executable, socket, or HTTP implementation is involved. A caller can
 connect these methods to an HTTP request body, SSH channel, TCP stream, or an
@@ -52,12 +53,32 @@ are ignored.
 When `side-band-64k` is selected, pack chunks use band 1 and end in a flush.
 Otherwise the raw `PACK` stream immediately follows the ACK/NAK pkt-line.
 Object reads and pack construction retain caller-configured size bounds.
+Object graph walks are additionally bounded by `UploadPackOptions::max_objects`.
+
+## Protocol v2
+
+The v2 capability advertisement contains only implemented behavior:
+`agent`, `object-format=sha1`, `ls-refs=unborn`, and `fetch`. `ls-refs` supports
+`symrefs`, annotated-tag `peel`, repeated literal `ref-prefix` filters, and
+unborn symbolic HEAD. Its request bytes, capability count, argument count,
+prefix count, reference count, tag depth, object count, and individual object
+size are bounded.
+
+The base v2 `fetch` command supports `want`, `have`, `done`, `thin-pack`,
+`no-progress`, `include-tag`, and `ofs-delta`. A complete pack is valid when a
+client permits a thin pack, so `thin-pack` is accepted without creating an
+external-base delta. Negotiation responses use the `acknowledgments` section;
+completed requests use the `packfile` section and mandatory sideband framing.
+Shallow and partial-clone arguments are rejected and their capabilities are not
+advertised.
 
 The `upload_pack` example demonstrates stateless request handling:
 
 ```text
 cargo run --example upload_pack -- repository --advertise
 cargo run --example upload_pack -- repository < request.pkt > response.bin
+cargo run --example upload_pack -- repository --v2-advertise
+cargo run --example upload_pack -- repository --v2 < request.pkt > response.bin
 ```
 
 ## Git source comparison
@@ -71,3 +92,6 @@ The implementation was compared directly with:
 - `upload-pack.c:get_common_commits` for have/done ACK and NAK behavior;
 - `list-objects.c` and `revision.c` for commit/tree reachability boundaries;
 - `upload-pack.c:create_pack_file` for raw versus sideband pack delivery.
+- `Documentation/gitprotocol-v2.adoc`, `serve.c`, `ls-refs.c`, and
+  `upload-pack.c:upload_pack_v2` for v2 capabilities, command framing,
+  reference attributes, response sections, and fetch argument semantics.
