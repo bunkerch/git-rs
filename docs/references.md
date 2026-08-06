@@ -61,6 +61,12 @@ loose locks in bytewise order to avoid deadlocks, then checks every CAS
 precondition and prepares `packed-refs` before changing any destination. A
 preparation failure cleans every lock without changing a ref.
 
+`apply_mixed_reference_transaction` uses the same prepared-lock discipline for
+direct and symbolic targets, deletion, and verification-only edits in one
+transaction. Exact direct or symbolic `PreviousReferenceValue` preconditions
+are checked only after every lock is held. This is the atomic foundation for
+the mixed command set accepted by update-ref plumbing.
+
 ## Git source comparisons
 
 The implementation is independent Rust code. Behavior was derived and tests are

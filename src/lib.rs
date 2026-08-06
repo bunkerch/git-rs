@@ -174,7 +174,8 @@ pub use receive_pack::{
 };
 pub use refs::{
     PreviousReferenceValue, PreviousValue, Reference, ReferenceEdit, ReferenceName,
-    ReferenceTarget, ReflogEntry, ReflogRewriteOptions, ReflogRewriteResult,
+    ReferenceTarget, ReferenceTransactionChange, ReferenceTransactionEdit, ReflogEntry,
+    ReflogRewriteOptions, ReflogRewriteResult,
 };
 pub use refspec::{RefSpec, RefSpecKind};
 pub use remote::{Remote, RemoveRemoteResult};

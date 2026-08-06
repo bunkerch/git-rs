@@ -83,6 +83,69 @@ pub enum PreviousReferenceValue {
     MustExist(ReferenceTarget),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReferenceTransactionChange {
+    Update(ReferenceTarget),
+    Delete,
+    Verify,
+}
+
+/// One direct or symbolic edit in a mixed atomic reference transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceTransactionEdit {
+    name: String,
+    change: ReferenceTransactionChange,
+    previous: PreviousReferenceValue,
+}
+
+impl ReferenceTransactionEdit {
+    #[must_use]
+    pub fn update(
+        name: impl Into<String>,
+        target: ReferenceTarget,
+        previous: PreviousReferenceValue,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            change: ReferenceTransactionChange::Update(target),
+            previous,
+        }
+    }
+
+    #[must_use]
+    pub fn delete(name: impl Into<String>, previous: PreviousReferenceValue) -> Self {
+        Self {
+            name: name.into(),
+            change: ReferenceTransactionChange::Delete,
+            previous,
+        }
+    }
+
+    #[must_use]
+    pub fn verify(name: impl Into<String>, previous: PreviousReferenceValue) -> Self {
+        Self {
+            name: name.into(),
+            change: ReferenceTransactionChange::Verify,
+            previous,
+        }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn change(&self) -> &ReferenceTransactionChange {
+        &self.change
+    }
+
+    #[must_use]
+    pub const fn previous(&self) -> &PreviousReferenceValue {
+        &self.previous
+    }
+}
+
 /// One direct update or deletion in a batch reference transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReferenceEdit {
@@ -665,6 +728,178 @@ impl Repository {
             self.invalidate_replacements()?;
         }
         Ok(())
+    }
+
+    /// Apply direct and symbolic updates, deletions, and verifications using one
+    /// prepared set of loose-reference locks.
+    ///
+    /// Packed deletions are prepared under `packed-refs.lock`. Every
+    /// precondition is checked only after all locks have been acquired, and a
+    /// preparation failure publishes no change.
+    ///
+    /// # Errors
+    /// Returns an error for invalid or duplicate names, null direct targets,
+    /// stale target preconditions, absent deletes, lock contention, malformed
+    /// packed refs, or storage failure.
+    pub fn apply_mixed_reference_transaction(
+        &self,
+        edits: &[ReferenceTransactionEdit],
+    ) -> Result<()> {
+        if edits.is_empty() {
+            return Ok(());
+        }
+        let mut edits = edits.to_vec();
+        edits.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        if edits.windows(2).any(|pair| pair[0].name == pair[1].name) {
+            return Err(Error::InvalidReference(
+                "duplicate ref in transaction".into(),
+            ));
+        }
+        for edit in &edits {
+            validate_read_name(&edit.name)?;
+            if matches!(edit.change, ReferenceTransactionChange::Update(ReferenceTarget::Direct(id)) if id.is_null())
+            {
+                return Err(Error::InvalidReference(
+                    "a ref cannot point to the null object ID".into(),
+                ));
+            }
+        }
+
+        let mut prepared = Vec::with_capacity(edits.len());
+        for edit in edits {
+            let destination = self.git_path(&edit.name);
+            if let Some(parent) = destination.parent() {
+                self.filesystem().create_dir_all(parent)?;
+            }
+            if self
+                .filesystem()
+                .metadata(&destination)
+                .is_ok_and(crate::Metadata::is_dir)
+            {
+                cleanup_mixed_ref_locks(self, &prepared);
+                return Err(Error::ReferenceConflict(edit.name));
+            }
+            let lock = lock_path(&destination);
+            if let Err(error) = self.filesystem().write_new(&lock, b"") {
+                cleanup_mixed_ref_locks(self, &prepared);
+                return Err(error);
+            }
+            prepared.push(PreparedMixedReferenceEdit {
+                edit,
+                destination,
+                lock,
+            });
+        }
+
+        let deletes = prepared
+            .iter()
+            .any(|item| matches!(item.edit.change, ReferenceTransactionChange::Delete));
+        let packed_path = self.git_path("packed-refs");
+        let packed_lock = lock_path(&packed_path);
+        if deletes && let Err(error) = self.filesystem().write_new(&packed_lock, b"") {
+            cleanup_mixed_ref_locks(self, &prepared);
+            return Err(error);
+        }
+        let preparation =
+            self.prepare_mixed_reference_edits(&prepared, deletes, &packed_path, &packed_lock);
+        let packed_exists = match preparation {
+            Ok(value) => value,
+            Err(error) => {
+                cleanup_mixed_ref_locks(self, &prepared);
+                if deletes {
+                    let _ = self.filesystem().remove_file(&packed_lock);
+                }
+                return Err(error);
+            }
+        };
+        if deletes {
+            if packed_exists {
+                self.filesystem().rename(&packed_lock, &packed_path)?;
+            } else {
+                self.filesystem().remove_file(&packed_lock)?;
+            }
+        }
+        let touches_replacements = prepared
+            .iter()
+            .any(|item| item.edit.name.starts_with("refs/replace/"));
+        for item in &prepared {
+            match item.edit.change {
+                ReferenceTransactionChange::Update(_) => {
+                    self.filesystem().rename(&item.lock, &item.destination)?;
+                }
+                ReferenceTransactionChange::Delete => {
+                    match self.filesystem().remove_file(&item.destination) {
+                        Ok(()) | Err(Error::NotFound(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                    self.filesystem().remove_file(&item.lock)?;
+                    let log = self.git_path(Path::new("logs").join(&item.edit.name));
+                    match self.filesystem().remove_file(&log) {
+                        Ok(()) | Err(Error::NotFound(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                ReferenceTransactionChange::Verify => {
+                    self.filesystem().remove_file(&item.lock)?;
+                }
+            }
+        }
+        if touches_replacements {
+            self.invalidate_replacements()?;
+        }
+        Ok(())
+    }
+
+    fn prepare_mixed_reference_edits(
+        &self,
+        prepared: &[PreparedMixedReferenceEdit],
+        deletes: bool,
+        packed_path: &Path,
+        packed_lock: &Path,
+    ) -> Result<bool> {
+        for item in prepared {
+            let actual = match self.read_reference(&item.edit.name) {
+                Ok(reference) => Some(reference.target),
+                Err(Error::NotFound(_)) => None,
+                Err(error) => return Err(error),
+            };
+            if !previous_reference_matches(&item.edit.previous, actual.as_ref())
+                || (matches!(item.edit.change, ReferenceTransactionChange::Delete)
+                    && actual.is_none())
+            {
+                return Err(Error::ReferenceConflict(item.edit.name.clone()));
+            }
+            if let ReferenceTransactionChange::Update(ref target) = item.edit.change {
+                let contents = match target {
+                    ReferenceTarget::Direct(id) => format!("{id}\n"),
+                    ReferenceTarget::Symbolic(name) => format!("ref: {name}\n"),
+                };
+                self.filesystem().write(&item.lock, contents.as_bytes())?;
+            }
+        }
+        let packed = if deletes {
+            match self.filesystem().read(packed_path) {
+                Ok(contents) => Some(contents),
+                Err(Error::NotFound(_)) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let packed = packed
+            .map(|mut contents| {
+                for item in prepared {
+                    if matches!(item.edit.change, ReferenceTransactionChange::Delete) {
+                        contents = remove_packed_reference(&contents, &item.edit.name)?;
+                    }
+                }
+                Ok::<Vec<u8>, Error>(contents)
+            })
+            .transpose()?;
+        if let Some(contents) = &packed {
+            self.filesystem().write(packed_lock, contents)?;
+        }
+        Ok(packed.is_some())
     }
 
     fn direct_reference_value(&self, name: &str) -> Result<Option<ObjectId>> {
@@ -1457,7 +1692,19 @@ struct PreparedReferenceEdit {
     lock: PathBuf,
 }
 
+struct PreparedMixedReferenceEdit {
+    edit: ReferenceTransactionEdit,
+    destination: PathBuf,
+    lock: PathBuf,
+}
+
 fn cleanup_ref_locks(repository: &Repository, prepared: &[PreparedReferenceEdit]) {
+    for item in prepared {
+        let _ = repository.filesystem().remove_file(&item.lock);
+    }
+}
+
+fn cleanup_mixed_ref_locks(repository: &Repository, prepared: &[PreparedMixedReferenceEdit]) {
     for item in prepared {
         let _ = repository.filesystem().remove_file(&item.lock);
     }
@@ -1468,6 +1715,17 @@ fn previous_matches(previous: PreviousValue, actual: Option<ObjectId>) -> bool {
         PreviousValue::Any => true,
         PreviousValue::MustNotExist => actual.is_none(),
         PreviousValue::MustExist(expected) => actual == Some(expected),
+    }
+}
+
+fn previous_reference_matches(
+    previous: &PreviousReferenceValue,
+    actual: Option<&ReferenceTarget>,
+) -> bool {
+    match previous {
+        PreviousReferenceValue::Any => true,
+        PreviousReferenceValue::MustNotExist => actual.is_none(),
+        PreviousReferenceValue::MustExist(expected) => actual == Some(expected),
     }
 }
 
@@ -2229,5 +2487,65 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].new_id(), valid);
         assert_eq!(entries[0].old_id(), ObjectId::null());
+    }
+
+    #[test]
+    fn mixed_transaction_updates_direct_and_symbolic_refs_atomically() {
+        let (repository, fs) = repository();
+        let first = ObjectId::from_str(FIRST).unwrap();
+        let second = ObjectId::from_str(SECOND).unwrap();
+        let main = ReferenceName::branch("main").unwrap();
+        let topic = ReferenceName::branch("topic").unwrap();
+        repository
+            .update_reference(&main, first, PreviousValue::MustNotExist)
+            .unwrap();
+        repository
+            .update_symbolic_reference("HEAD", &main, PreviousReferenceValue::Any, None)
+            .unwrap();
+        repository
+            .apply_mixed_reference_transaction(&[
+                ReferenceTransactionEdit::update(
+                    main.as_str(),
+                    ReferenceTarget::Direct(second),
+                    PreviousReferenceValue::MustExist(ReferenceTarget::Direct(first)),
+                ),
+                ReferenceTransactionEdit::update(
+                    "HEAD",
+                    ReferenceTarget::Symbolic(topic.clone()),
+                    PreviousReferenceValue::MustExist(ReferenceTarget::Symbolic(main.clone())),
+                ),
+                ReferenceTransactionEdit::update(
+                    topic.as_str(),
+                    ReferenceTarget::Direct(first),
+                    PreviousReferenceValue::MustNotExist,
+                ),
+            ])
+            .unwrap();
+        assert_eq!(repository.resolve_reference(main.as_str()).unwrap(), second);
+        assert_eq!(repository.resolve_reference("HEAD").unwrap(), first);
+
+        assert!(
+            repository
+                .apply_mixed_reference_transaction(&[
+                    ReferenceTransactionEdit::update(
+                        main.as_str(),
+                        ReferenceTarget::Direct(first),
+                        PreviousReferenceValue::MustExist(ReferenceTarget::Direct(first)),
+                    ),
+                    ReferenceTransactionEdit::update(
+                        "HEAD",
+                        ReferenceTarget::Symbolic(main.clone()),
+                        PreviousReferenceValue::MustExist(ReferenceTarget::Symbolic(topic)),
+                    ),
+                ])
+                .is_err()
+        );
+        assert_eq!(repository.resolve_reference(main.as_str()).unwrap(), second);
+        assert_eq!(repository.resolve_reference("HEAD").unwrap(), first);
+        assert!(!fs.exists(Path::new("repo/.git/HEAD.lock")).unwrap());
+        assert!(
+            !fs.exists(Path::new("repo/.git/refs/heads/main.lock"))
+                .unwrap()
+        );
     }
 }
