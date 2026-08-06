@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+pub mod archive;
 pub mod branch;
 pub mod clean;
 pub mod commit;
@@ -36,6 +37,7 @@ pub mod tree;
 pub mod upload_pack;
 pub mod worktree;
 
+pub use archive::{ArchiveFormat, ArchiveOptions};
 pub use branch::{DeleteBranchOptions, RenameBranchOptions};
 pub use clean::{CleanEntry, CleanIgnoredMode, CleanOptions};
 pub use commit::{Commit, CommitBuilder, ExtraHeader, Signature};
