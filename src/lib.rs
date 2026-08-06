@@ -3,6 +3,7 @@
 pub mod am;
 pub mod apply;
 pub mod archive;
+pub mod attributes;
 pub mod bisect;
 pub mod blame;
 pub mod branch;
@@ -73,6 +74,7 @@ pub mod worktree;
 pub use am::{AmOptions, AmProgress, AmState};
 pub use apply::{ApplyOptions, ApplyReport};
 pub use archive::{ArchiveFormat, ArchiveOptions};
+pub use attributes::{AttributeResult, AttributeSource, AttributeValue, CheckAttributesOptions};
 pub use bisect::{BisectMark, BisectOptions, BisectOutcome, BisectState};
 pub use blame::{BlameLine, BlameOptions};
 pub use branch::{DeleteBranchOptions, RenameBranchOptions};
