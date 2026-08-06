@@ -762,14 +762,16 @@ fn detect_exact_renames(entries: &mut Vec<DiffEntry>) {
     let mut deletions = BTreeMap::<(u32, ObjectId), Vec<usize>>::new();
     for (index, entry) in entries.iter().enumerate() {
         match entry.kind {
-            DiffKind::Added => additions
-                .entry((entry.new_mode.unwrap(), entry.new_id.unwrap()))
-                .or_default()
-                .push(index),
-            DiffKind::Deleted => deletions
-                .entry((entry.old_mode.unwrap(), entry.old_id.unwrap()))
-                .or_default()
-                .push(index),
+            DiffKind::Added => {
+                if let (Some(mode), Some(id)) = (entry.new_mode, entry.new_id) {
+                    additions.entry((mode, id)).or_default().push(index);
+                }
+            }
+            DiffKind::Deleted => {
+                if let (Some(mode), Some(id)) = (entry.old_mode, entry.old_id) {
+                    deletions.entry((mode, id)).or_default().push(index);
+                }
+            }
             _ => {}
         }
     }
@@ -782,15 +784,10 @@ fn detect_exact_renames(entries: &mut Vec<DiffEntry>) {
         let mut candidates = deleted
             .iter()
             .flat_map(|deleted| {
-                added.iter().map(|added| {
-                    (
-                        path_similarity(
-                            entries[*deleted].old_path.as_deref().unwrap(),
-                            entries[*added].new_path.as_deref().unwrap(),
-                        ),
-                        *deleted,
-                        *added,
-                    )
+                added.iter().filter_map(|added| {
+                    let old = entries[*deleted].old_path.as_deref()?;
+                    let new = entries[*added].new_path.as_deref()?;
+                    Some((path_similarity(old, new), *deleted, *added))
                 })
             })
             .collect::<Vec<_>>();
@@ -1305,7 +1302,8 @@ fn backtrack<'a>(
         } else {
             k - 1
         };
-        let previous_x = previous[usize::try_from(offset + previous_k).unwrap()];
+        let previous_x = previous[usize::try_from(offset + previous_k)
+            .expect("offset covers backtrack diagonal")];
         let previous_y = previous_x - previous_k;
         while x > previous_x && y > previous_y {
             x -= 1;

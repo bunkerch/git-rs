@@ -193,13 +193,15 @@ impl Repository {
         max_file_size: usize,
     ) -> Result<(Vec<u8>, Option<u32>)> {
         let Some(old_path) = &patch.old_path else {
-            let target = root.join(worktree_path(patch.new_path.as_deref().unwrap())?);
+            let new_path = patch
+                .new_path
+                .as_deref()
+                .ok_or_else(|| Error::InvalidRepository("creation patch has no path".into()))?;
+            let target = root.join(worktree_path(new_path)?);
             if self.filesystem().exists(&target)? {
-                return Err(Error::AlreadyExists(worktree_path(
-                    patch.new_path.as_deref().unwrap(),
-                )?));
+                return Err(Error::AlreadyExists(worktree_path(new_path)?));
             }
-            ensure_safe_parents(self, root, patch.new_path.as_deref().unwrap())?;
+            ensure_safe_parents(self, root, new_path)?;
             return Ok((Vec::new(), None));
         };
         ensure_safe_parents(self, root, old_path)?;
@@ -264,12 +266,14 @@ impl Repository {
         if self.filesystem().exists(&full)? {
             self.filesystem().remove_file(&full)?;
         }
-        match plan.new_mode.unwrap() {
+        let mode = plan
+            .new_mode
+            .ok_or_else(|| Error::InvalidRepository("patch plan has no mode".into()))?;
+        match mode {
             0o120_000 => self.filesystem().create_symlink(&full, &plan.data),
             0o100_644 | 0o100_755 => {
                 self.filesystem().write(&full, &plan.data)?;
-                self.filesystem()
-                    .set_executable(&full, plan.new_mode == Some(0o100_755))
+                self.filesystem().set_executable(&full, mode == 0o100_755)
             }
             mode => invalid_patch(format!("unsupported patch mode {mode:o}")),
         }
@@ -290,9 +294,12 @@ impl Repository {
         for plan in plans {
             let Some(path) = &plan.new_path else { continue };
             let id = self.write_object(ObjectKind::Blob, &plan.data)?;
+            let mode = plan.new_mode.ok_or_else(|| {
+                Error::InvalidRepository("patch plan has no mode for index".into())
+            })?;
             entries.push(IndexEntry::new(
                 path.clone(),
-                plan.new_mode.unwrap(),
+                mode,
                 id,
                 StatData::default(),
             )?);
@@ -310,7 +317,11 @@ fn validate_index_preimage(
     options: &ApplyOptions,
 ) -> Result<()> {
     let Some(old_path) = &patch.old_path else {
-        if entries.contains_key(patch.new_path.as_deref().unwrap()) {
+        let new_path = patch
+            .new_path
+            .as_deref()
+            .ok_or_else(|| Error::InvalidRepository("validation patch has no path".into()))?;
+        if entries.contains_key(new_path) {
             return invalid_patch("new path already exists in index");
         }
         return Ok(());

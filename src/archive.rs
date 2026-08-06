@@ -600,8 +600,10 @@ fn encode_tar(
         if !tar_path_fits(&path) {
             pax.extend(pax_record(b"path", &path));
         }
-        if link.is_some_and(|value| value.len() > 100) {
-            pax.extend(pax_record(b"linkpath", link.unwrap()));
+        if link.is_some_and(|value| value.len() > 100)
+            && let Some(link) = link
+        {
+            pax.extend(pax_record(b"linkpath", link));
         }
         if !pax.is_empty() {
             let name = format!("PaxHeaders/{index}");

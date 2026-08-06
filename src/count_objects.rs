@@ -203,7 +203,7 @@ impl Repository {
                 && stem[5..].iter().all(u8::is_ascii_hexdigit);
             let pack = find_extension(&files, "pack");
             let index = find_extension(&files, "idx");
-            if !valid_stem || pack.is_none() || index.is_none() {
+            let (Some(pack), Some(index)) = (pack, index) else {
                 for file in files {
                     push_garbage(
                         self,
@@ -217,9 +217,9 @@ impl Repository {
                     )?;
                 }
                 continue;
-            }
-            let pack = directory.join(pack.expect("checked above"));
-            let index = directory.join(index.expect("checked above"));
+            };
+            let pack = directory.join(pack);
+            let index = directory.join(index);
             let Ok(parsed) = PackIndex::parse(&self.filesystem().read(&index)?) else {
                 push_garbage(self, &index, ObjectGarbageReason::InvalidPackIndex, report)?;
                 push_garbage(self, &pack, ObjectGarbageReason::InvalidPackIndex, report)?;

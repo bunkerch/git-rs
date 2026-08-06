@@ -568,13 +568,13 @@ impl Repository {
             }
             let index_path = directory.join(child);
             let index = self.cached_pack_index(&index_path)?;
-            if index.find(id).is_none() {
+            let Some(entry) = index.find(id) else {
                 continue;
-            }
+            };
             return self.read_indexed_object_at(
                 &index_path,
                 id,
-                index.find(id).expect("checked presence").offset,
+                entry.offset,
                 max_size,
             );
         }
@@ -1529,20 +1529,20 @@ const fn make_crc32_table() -> [u32; 256] {
 
 fn be_u32(data: &[u8], offset: usize) -> Result<u32> {
     let end = checked_add(offset, 4)?;
+    let slice = data
+        .get(offset..end)
+        .ok_or_else(|| pack_error("truncated integer"))?;
     Ok(u32::from_be_bytes(
-        data.get(offset..end)
-            .ok_or_else(|| pack_error("truncated integer"))?
-            .try_into()
-            .unwrap(),
+        slice.try_into().map_err(|_| pack_error("invalid integer length"))?,
     ))
 }
 fn be_u64(data: &[u8], offset: usize) -> Result<u64> {
     let end = checked_add(offset, 8)?;
+    let slice = data
+        .get(offset..end)
+        .ok_or_else(|| pack_error("truncated integer"))?;
     Ok(u64::from_be_bytes(
-        data.get(offset..end)
-            .ok_or_else(|| pack_error("truncated integer"))?
-            .try_into()
-            .unwrap(),
+        slice.try_into().map_err(|_| pack_error("invalid integer length"))?,
     ))
 }
 fn read_hash(data: &[u8], offset: usize) -> Result<[u8; HASH_SIZE]> {

@@ -1912,9 +1912,23 @@ mod tests {
             "refs/heads/a.lock",
             "refs/heads/a?b",
             "refs/heads/a\\b",
+            "refs/heads/a b",
+            "refs/heads/a~b",
+            "refs/heads/a^b",
+            "refs/heads/a:b",
+            "refs/heads/a[b",
+            "refs/heads/a\tb",
+            "refs/heads/a.b.",
+            "refs/heads/a.lock.lock",
+            "@",
         ] {
             assert!(ReferenceName::new(invalid).is_err(), "{invalid}");
         }
+        // Single-level refs are valid only with allow_one_level.
+        assert!(ReferenceName::new("main").is_err());
+        assert!(crate::refs::is_valid_refname("main", true));
+        assert!(!crate::refs::is_valid_refname(".hidden", true));
+        assert!(!crate::refs::is_valid_refname("a..b", true));
     }
 
     #[test]

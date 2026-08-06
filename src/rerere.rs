@@ -378,7 +378,9 @@ impl Repository {
         paths: &BTreeSet<Vec<u8>>,
         max_file_size: usize,
     ) -> Result<()> {
-        let work_tree = self.work_tree().expect("rerere validated worktree");
+        let work_tree = self.work_tree().ok_or_else(|| {
+            Error::InvalidRepository("worktree required for rerere".into())
+        })?;
         let mut entries = index.entries().to_vec();
         entries.retain(|entry| !paths.contains(entry.path()));
         for path in paths {

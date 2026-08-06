@@ -411,9 +411,9 @@ fn match_class(
         } else {
             (current, at + 1)
         };
-        if current == b'-' && previous.is_some() && pattern.get(next) != Some(&b']') {
+        if current == b'-' && let Some(start) = previous && pattern.get(next) != Some(&b']') {
             let end = *pattern.get(next)?;
-            matched |= previous.unwrap() <= value && value <= end;
+            matched |= start <= value && value <= end;
             previous = None;
             at = next + 1;
         } else {

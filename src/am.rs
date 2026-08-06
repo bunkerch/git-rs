@@ -600,8 +600,10 @@ fn decode_base64(data: &[u8]) -> Result<Vec<u8>> {
                 "invalid Base64 mail header".into(),
             ));
         }
-        let one = values[0].unwrap();
-        let two = values[1].unwrap();
+        let one = values[0]
+            .ok_or_else(|| Error::InvalidRepository("invalid Base64 mail header".into()))?;
+        let two = values[1]
+            .ok_or_else(|| Error::InvalidRepository("invalid Base64 mail header".into()))?;
         output.push((one << 2) | (two >> 4));
         if chunk[2] != b'=' {
             let three = values[2]

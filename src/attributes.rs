@@ -210,7 +210,9 @@ impl Repository {
         };
         let contents = match source {
             AttributeSource::WorktreeThenIndex => {
-                let work_tree = self.work_tree().expect("validated worktree");
+                let work_tree = self.work_tree().ok_or_else(|| {
+                    Error::InvalidRepository("worktree required for attributes".into())
+                })?;
                 let path = work_tree.join(worktree_path(&attribute_path)?);
                 match read_bounded(self.filesystem().read(&path), options.max_file_size)? {
                     Some(contents) => Some(contents),
