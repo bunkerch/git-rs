@@ -89,6 +89,7 @@ pub mod update_index;
 pub mod update_ref;
 pub mod upload_pack;
 pub mod upload_pack_v2;
+pub mod verify_signature;
 pub mod worktree;
 pub mod write_tree;
 
@@ -222,6 +223,10 @@ pub use update_index::{UpdateIndexCommand, UpdateIndexOptions, UpdateIndexReport
 pub use update_ref::{UpdateRefCommand, UpdateRefOptions};
 pub use upload_pack::{UploadPackOptions, UploadPackRequest};
 pub use upload_pack_v2::{FetchV2Request, LsRefsRequest, UploadPackV2Limits, UploadPackV2Request};
+pub use verify_signature::{
+    SignatureFormat, SignatureVerification, SignatureVerifier, SignedObjectKind, VerifiedSignature,
+    VerifySignatureOptions,
+};
 pub use worktree::{
     AddOptions, AddReport, AddTransactionOptions, CheckoutOptions, MoveOptions, RemoveOptions,
 };
