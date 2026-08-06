@@ -389,6 +389,24 @@ impl Repository {
         Err(Error::NotFound(self.git_path(object_label(id))))
     }
 
+    pub(crate) fn validate_indexed_pack(
+        &self,
+        index_path: &Path,
+        max_size: usize,
+    ) -> Result<Vec<ObjectId>> {
+        let index = self.cached_pack_index(index_path)?;
+        let pack = self.cached_pack_data(&index_path.with_extension("pack"), &index)?;
+        let mut ids = Vec::with_capacity(index.entries().len());
+        for entry in index.entries() {
+            let (kind, data) = resolve(&pack, &index, entry.id, max_size, 0)?;
+            if ObjectId::compute(kind, &data) != entry.id {
+                return invalid("resolved packed object hash mismatch");
+            }
+            ids.push(entry.id);
+        }
+        Ok(ids)
+    }
+
     fn cached_pack_index(&self, path: &Path) -> Result<Arc<PackIndex>> {
         if let Some(index) = self
             .pack_indexes

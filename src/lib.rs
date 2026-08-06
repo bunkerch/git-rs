@@ -9,6 +9,7 @@ pub mod diff;
 pub mod error;
 pub mod fetch;
 pub mod fs;
+pub mod fsck;
 pub mod ignore;
 pub mod index;
 pub mod linked_worktree;
@@ -46,6 +47,7 @@ pub use fetch::{
     UploadPackTransport,
 };
 pub use fs::{FileStat, FileSystem, HostFileSystem, MemoryFileSystem, Metadata};
+pub use fsck::{FsckOptions, FsckReport};
 pub use ignore::{IgnoreMatcher, IgnoreRule};
 pub use index::{Index, IndexEntry, IndexExtension, IndexVersion, StatData};
 pub use linked_worktree::{AddWorktreeOptions, LinkedWorktreeInfo, WorktreeTarget};
