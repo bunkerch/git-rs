@@ -133,6 +133,9 @@ pub struct Object {
 }
 
 impl Object {
+    pub(crate) fn from_parts(kind: ObjectKind, data: Vec<u8>) -> Self {
+        Self { kind, data }
+    }
     #[must_use]
     pub const fn kind(&self) -> ObjectKind {
         self.kind
@@ -180,7 +183,11 @@ impl Repository {
     /// Returns an error for missing, malformed, oversized, corrupt, or
     /// non-loose objects and for storage failures.
     pub fn read_object(&self, id: ObjectId, max_size: usize) -> Result<Object> {
-        let compressed = self.filesystem().read(&self.git_path(object_path(id)))?;
+        let compressed = match self.filesystem().read(&self.git_path(object_path(id))) {
+            Ok(compressed) => compressed,
+            Err(Error::NotFound(_)) => return self.read_packed_object(id, max_size),
+            Err(error) => return Err(error),
+        };
         let framing = 6 + 1 + 20 + 1;
         let encoded = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
             &compressed,

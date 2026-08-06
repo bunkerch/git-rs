@@ -21,7 +21,8 @@ See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/filesystems.md`](docs/filesystems.md) for the design and adapter contract.
 Reference and branch APIs are covered in
 [`docs/references.md`](docs/references.md).
-Loose objects are documented in [`docs/objects.md`](docs/objects.md).
+Loose objects are documented in [`docs/objects.md`](docs/objects.md), and packed
+object reads in [`docs/packfiles.md`](docs/packfiles.md).
 Typed trees and commits are documented in
 [`docs/trees-and-commits.md`](docs/trees-and-commits.md).
 Index versions 2–4 are documented in [`docs/index.md`](docs/index.md).

@@ -1,9 +1,9 @@
 # Filesystem adapters
 
 Implement `FileSystem` to store a repository anywhere. The trait works with
-complete byte buffers intentionally: loose objects, refs, indexes, and config
-files are bounded records, while pack streaming will use a separate random-access
-object interface so large packs are never forced into one allocation.
+complete byte buffers intentionally. Loose objects, refs, indexes, config, and
+packfiles all follow the same backend-neutral contract. Adapters remain free to
+cache or otherwise optimize how those complete values are obtained.
 
 All paths passed to an adapter are relative to its storage root. Adapters must
 reject absolute paths and parent traversal. Directory reads return child names,
