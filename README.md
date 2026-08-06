@@ -22,6 +22,8 @@ See [`docs/architecture.md`](docs/architecture.md) and
 Reference and branch APIs are covered in
 [`docs/references.md`](docs/references.md).
 Loose objects are documented in [`docs/objects.md`](docs/objects.md).
+Typed trees and commits are documented in
+[`docs/trees-and-commits.md`](docs/trees-and-commits.md).
 
 To create a host-backed repository with the included example:
 
