@@ -43,6 +43,8 @@ Wire-format primitives are documented in
 [`docs/protocol.md`](docs/protocol.md).
 Server-side fetch negotiation is documented in
 [`docs/upload-pack.md`](docs/upload-pack.md).
+Dumb/static HTTP reference and pack metadata generation is documented in
+[`docs/server-info.md`](docs/server-info.md).
 Server-side push ingestion is documented in
 [`docs/receive-pack.md`](docs/receive-pack.md).
 Transport-neutral cloning and fetching are documented in
