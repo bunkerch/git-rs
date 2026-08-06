@@ -57,6 +57,7 @@ pub mod repack;
 pub mod replace;
 pub mod repository;
 pub mod restore;
+pub mod rev_list;
 pub mod revision;
 pub mod revparse;
 pub mod server_info;
@@ -159,6 +160,10 @@ pub use repack::{RepackOptions, RepackResult};
 pub use replace::Replacement;
 pub use repository::{InitOptions, Repository};
 pub use restore::{RestoreOptions, RestoreTarget};
+pub use rev_list::{
+    RevListCommit, RevListObject, RevListOptions, RevListOrder, RevListParents, RevListResult,
+    RevListSide,
+};
 pub use revision::{ForkPointOptions, GraphOptions, Revision, RevisionWalkOptions};
 pub use revparse::{ResolvedObject, RevisionOptions};
 pub use server_info::{ServerInfoOptions, ServerInfoReport};
