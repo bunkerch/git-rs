@@ -2,6 +2,7 @@
 
 pub mod branch;
 pub mod commit;
+pub mod commit_operation;
 pub mod config;
 pub mod diff;
 pub mod error;
@@ -32,6 +33,7 @@ pub mod worktree;
 
 pub use branch::{DeleteBranchOptions, RenameBranchOptions};
 pub use commit::{Commit, CommitBuilder, ExtraHeader, Signature};
+pub use commit_operation::CommitOptions;
 pub use config::{Config, ConfigEntry};
 pub use diff::{DiffEntry, DiffKind, DiffOptions};
 pub use error::{Error, Result};

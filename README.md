@@ -35,6 +35,8 @@ Transport-neutral push orchestration is documented in
 [`docs/push.md`](docs/push.md).
 Typed trees and commits are documented in
 [`docs/trees-and-commits.md`](docs/trees-and-commits.md).
+Committing the index, including unborn, amend, merge, and detached behavior, is
+documented in [`docs/commit.md`](docs/commit.md).
 Index versions 2–4 are documented in [`docs/index.md`](docs/index.md).
 Worktree staging and index-to-tree writing are documented in
 [`docs/worktree.md`](docs/worktree.md).
