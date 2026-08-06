@@ -431,6 +431,37 @@ fn split_lines(data: &[u8]) -> Vec<&[u8]> {
     data.split_inclusive(|byte| *byte == b'\n').collect()
 }
 
+pub(crate) fn unchanged_line_map(
+    old_data: &[u8],
+    new_data: &[u8],
+    max_lines: usize,
+    max_trace_cells: usize,
+) -> Result<Vec<Option<usize>>> {
+    let old = split_lines(old_data);
+    let new = split_lines(new_data);
+    if old.len().max(new.len()) > max_lines {
+        return Err(Error::InvalidRepository(format!(
+            "diff exceeds {max_lines} lines"
+        )));
+    }
+    let edits = myers(&old, &new, max_trace_cells)?;
+    let mut old_line = 0;
+    let mut new_line = 0;
+    let mut mapping = vec![None; new.len()];
+    for edit in edits {
+        match edit {
+            Edit::Equal(_) => {
+                mapping[new_line] = Some(old_line);
+                old_line += 1;
+                new_line += 1;
+            }
+            Edit::Delete(_) => old_line += 1,
+            Edit::Insert(_) => new_line += 1,
+        }
+    }
+    Ok(mapping)
+}
+
 #[allow(clippy::many_single_char_names)]
 fn myers<'a>(old: &[&'a [u8]], new: &[&'a [u8]], max_cells: usize) -> Result<Vec<Edit<'a>>> {
     let n = isize::try_from(old.len())

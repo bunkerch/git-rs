@@ -2,6 +2,7 @@
 
 pub mod archive;
 pub mod bisect;
+pub mod blame;
 pub mod branch;
 pub mod bundle;
 pub mod clean;
@@ -51,6 +52,7 @@ pub mod worktree;
 
 pub use archive::{ArchiveFormat, ArchiveOptions};
 pub use bisect::{BisectMark, BisectOptions, BisectOutcome, BisectState};
+pub use blame::{BlameLine, BlameOptions};
 pub use branch::{DeleteBranchOptions, RenameBranchOptions};
 pub use bundle::{
     BundleCreateOptions, BundleParseOptions, BundlePrerequisite, BundleReference, BundleVersion,
