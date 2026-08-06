@@ -134,6 +134,32 @@ pub struct ReflogEntry {
     message: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReflogRewriteOptions {
+    pub dry_run: bool,
+    pub rewrite: bool,
+    pub update_reference: bool,
+    pub max_entries: usize,
+}
+
+impl Default for ReflogRewriteOptions {
+    fn default() -> Self {
+        Self {
+            dry_run: false,
+            rewrite: false,
+            update_reference: false,
+            max_entries: 10_000_000,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReflogRewriteResult {
+    pub removed: usize,
+    pub retained: usize,
+    pub new_tip: Option<ObjectId>,
+}
+
 impl ReflogEntry {
     #[must_use]
     pub const fn old_id(&self) -> ObjectId {
@@ -805,6 +831,15 @@ impl Repository {
     /// # Errors
     /// Returns an error for invalid names, malformed log lines, or storage failures.
     pub fn read_reflog(&self, name: &str) -> Result<Vec<ReflogEntry>> {
+        self.read_reflog_bounded(name, usize::MAX)
+    }
+
+    /// Read a reference log from oldest to newest with an entry bound.
+    ///
+    /// # Errors
+    /// Returns an error for invalid names, malformed log lines, an exceeded
+    /// entry limit, or storage failures.
+    pub fn read_reflog_bounded(&self, name: &str, max_entries: usize) -> Result<Vec<ReflogEntry>> {
         validate_read_name(name)?;
         let contents = match self
             .filesystem()
@@ -814,11 +849,151 @@ impl Repository {
             Err(Error::NotFound(_)) => return Ok(Vec::new()),
             Err(error) => return Err(error),
         };
-        contents
+        let mut entries = Vec::new();
+        for line in contents
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
-            .map(parse_reflog_line)
-            .collect()
+        {
+            entries.push(parse_reflog_line(line)?);
+            if entries.len() > max_entries {
+                return Err(Error::InvalidRepository(
+                    "reflog exceeds entry limit".into(),
+                ));
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Delete entries addressed by zero-based positions from the newest entry.
+    ///
+    /// # Errors
+    /// Returns an error for duplicate/out-of-range selectors, malformed state,
+    /// lock contention, a symbolic update target, or storage failures.
+    pub fn delete_reflog_entries(
+        &self,
+        name: &str,
+        newest_indices: &[usize],
+        options: &ReflogRewriteOptions,
+    ) -> Result<ReflogRewriteResult> {
+        let mut selected = std::collections::BTreeSet::new();
+        if newest_indices.iter().any(|index| !selected.insert(*index)) {
+            return Err(Error::InvalidReference(
+                "duplicate reflog deletion selector".into(),
+            ));
+        }
+        self.rewrite_reflog(
+            name,
+            options,
+            |index, len, _| selected.contains(&(len - index - 1)),
+            Some(selected.len()),
+        )
+    }
+
+    /// Expire every reflog entry strictly older than `timestamp`.
+    ///
+    /// # Errors
+    /// Returns an error for malformed state, lock contention, a symbolic update
+    /// target, exceeded limits, or storage failures.
+    pub fn expire_reflog_before(
+        &self,
+        name: &str,
+        timestamp: i64,
+        options: &ReflogRewriteOptions,
+    ) -> Result<ReflogRewriteResult> {
+        self.rewrite_reflog(
+            name,
+            options,
+            |_, _, entry| entry.committer.timestamp() < timestamp,
+            None,
+        )
+    }
+
+    fn rewrite_reflog(
+        &self,
+        name: &str,
+        options: &ReflogRewriteOptions,
+        mut remove: impl FnMut(usize, usize, &ReflogEntry) -> bool,
+        expected_removals: Option<usize>,
+    ) -> Result<ReflogRewriteResult> {
+        validate_read_name(name)?;
+        let reference_destination = self.git_path(name);
+        if let Some(parent) = reference_destination.parent() {
+            self.filesystem().create_dir_all(parent)?;
+        }
+        let reference_lock = lock_path(&reference_destination);
+        self.filesystem().write_new(&reference_lock, b"")?;
+        let log_destination = self.git_path(Path::new("logs").join(name));
+        let log_lock = lock_path(&log_destination);
+        let result = (|| {
+            let reference = self.read_reference(name)?;
+            if options.update_reference && matches!(reference.target, ReferenceTarget::Symbolic(_))
+            {
+                return Err(Error::InvalidReference(
+                    "cannot update a symbolic reference from its reflog".into(),
+                ));
+            }
+            let entries = self.read_reflog_bounded(name, options.max_entries)?;
+            let mut retained = Vec::with_capacity(entries.len());
+            let mut removed = 0;
+            for (index, entry) in entries.iter().enumerate() {
+                if remove(index, entries.len(), entry) {
+                    removed += 1;
+                } else {
+                    retained.push(entry.clone());
+                }
+            }
+            if expected_removals.is_some_and(|expected| removed != expected) {
+                return Err(Error::InvalidReference(
+                    "reflog deletion selector is out of range".into(),
+                ));
+            }
+            let new_tip = retained.last().map(|entry| entry.new);
+            let outcome = ReflogRewriteResult {
+                removed,
+                retained: retained.len(),
+                new_tip,
+            };
+            if options.dry_run || removed == 0 {
+                return Ok(outcome);
+            }
+            if let Some(parent) = log_destination.parent() {
+                self.filesystem().create_dir_all(parent)?;
+            }
+            self.filesystem().write_new(&log_lock, b"")?;
+            let mut contents = Vec::new();
+            let mut last_kept = ObjectId::null();
+            for entry in &retained {
+                append_reflog_line(
+                    &mut contents,
+                    if options.rewrite {
+                        last_kept
+                    } else {
+                        entry.old
+                    },
+                    entry.new,
+                    &entry.committer,
+                    &entry.message,
+                );
+                last_kept = entry.new;
+            }
+            self.filesystem().write(&log_lock, &contents)?;
+            if options.update_reference
+                && let Some(new_tip) = new_tip
+            {
+                let mut contents = new_tip.to_hex().to_vec();
+                contents.push(b'\n');
+                self.filesystem().write(&reference_lock, &contents)?;
+            }
+            self.filesystem().rename(&log_lock, &log_destination)?;
+            if options.update_reference && new_tip.is_some() {
+                self.filesystem()
+                    .rename(&reference_lock, &reference_destination)?;
+            }
+            Ok(outcome)
+        })();
+        let _ = self.filesystem().remove_file(&reference_lock);
+        let _ = self.filesystem().remove_file(&log_lock);
+        result
     }
 
     pub(crate) fn append_reflog(
@@ -1482,6 +1657,108 @@ mod tests {
         assert_eq!(entries[1].new_id(), second);
         assert_eq!(entries[1].message(), b"commit: second");
         assert!(entries[0].committer().has_unknown_timezone());
+        assert!(
+            !fs.exists(Path::new("repo/.git/logs/refs/heads/main.lock"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn deletes_expires_rewrites_and_updates_reflogs_transactionally() {
+        let (repository, fs) = repository();
+        let name = ReferenceName::branch("main").unwrap();
+        let first = ObjectId::from_str(FIRST).unwrap();
+        let second = ObjectId::from_str(SECOND).unwrap();
+        let third = ObjectId::compute(crate::ObjectKind::Blob, b"third");
+        for (index, (id, previous)) in [
+            (first, PreviousValue::MustNotExist),
+            (second, PreviousValue::MustExist(first)),
+            (third, PreviousValue::MustExist(second)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            repository
+                .update_reference_with_reflog(
+                    &name,
+                    id,
+                    previous,
+                    &Signature::new(
+                        "Test",
+                        "test@example.com",
+                        i64::try_from(index).unwrap() + 1,
+                        0,
+                    )
+                    .unwrap(),
+                    format!("entry {index}").as_bytes(),
+                )
+                .unwrap();
+        }
+
+        let before = fs
+            .read(Path::new("repo/.git/logs/refs/heads/main"))
+            .unwrap();
+        let dry_run = repository
+            .delete_reflog_entries(
+                name.as_str(),
+                &[1],
+                &ReflogRewriteOptions {
+                    dry_run: true,
+                    rewrite: true,
+                    update_reference: true,
+                    ..ReflogRewriteOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(dry_run.removed, 1);
+        assert_eq!(
+            fs.read(Path::new("repo/.git/logs/refs/heads/main"))
+                .unwrap(),
+            before
+        );
+
+        repository
+            .delete_reflog_entries(
+                name.as_str(),
+                &[1],
+                &ReflogRewriteOptions {
+                    rewrite: true,
+                    ..ReflogRewriteOptions::default()
+                },
+            )
+            .unwrap();
+        let entries = repository.read_reflog(name.as_str()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].old_id(), first);
+        assert_eq!(entries[1].new_id(), third);
+
+        let outcome = repository
+            .expire_reflog_before(
+                name.as_str(),
+                3,
+                &ReflogRewriteOptions {
+                    rewrite: true,
+                    update_reference: true,
+                    ..ReflogRewriteOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome.removed, 1);
+        assert_eq!(outcome.new_tip, Some(third));
+        let entries = repository.read_reflog(name.as_str()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].old_id(), ObjectId::null());
+        assert_eq!(repository.resolve_reference(name.as_str()).unwrap(), third);
+        assert!(repository.read_reflog_bounded(name.as_str(), 0).is_err());
+        assert!(
+            repository
+                .delete_reflog_entries(name.as_str(), &[9], &ReflogRewriteOptions::default())
+                .is_err()
+        );
+        assert!(
+            !fs.exists(Path::new("repo/.git/refs/heads/main.lock"))
+                .unwrap()
+        );
         assert!(
             !fs.exists(Path::new("repo/.git/logs/refs/heads/main.lock"))
                 .unwrap()

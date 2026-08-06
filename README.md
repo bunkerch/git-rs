@@ -23,6 +23,8 @@ Reference and branch APIs are covered in
 [`docs/references.md`](docs/references.md).
 Bounded resolved reference inventory and annotated-tag dereferencing are
 documented in [`docs/show-ref.md`](docs/show-ref.md).
+Bounded reflog reads and transactional deletion/expiration are documented in
+[`docs/reflogs.md`](docs/reflogs.md).
 Atomic loose-reference consolidation is documented in
 [`docs/pack-refs.md`](docs/pack-refs.md).
 Loose objects are documented in [`docs/objects.md`](docs/objects.md), and packed

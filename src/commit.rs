@@ -89,7 +89,9 @@ impl Signature {
         self.negative_zero
     }
 
-    pub(crate) fn encode(&self) -> String {
+    /// Encode the canonical `name <email> timestamp timezone` form used by Git.
+    #[must_use]
+    pub fn encode(&self) -> String {
         let absolute = self.offset_minutes.unsigned_abs();
         let sign = if self.offset_minutes < 0 || self.negative_zero {
             '-'
