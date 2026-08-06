@@ -621,6 +621,13 @@ impl Repository {
         Ok(ids)
     }
 
+    /// Validate pack/index framing and checksums without inflating objects.
+    pub(crate) fn validate_pack_pair(&self, index_path: &Path) -> Result<Vec<ObjectId>> {
+        let index = self.cached_pack_index(index_path)?;
+        self.cached_pack_data(&index_path.with_extension("pack"), &index)?;
+        Ok(index.entries().iter().map(|entry| entry.id).collect())
+    }
+
     fn cached_pack_index(&self, path: &Path) -> Result<Arc<PackIndex>> {
         if let Some(index) = self
             .pack_indexes
