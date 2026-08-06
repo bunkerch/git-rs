@@ -33,6 +33,13 @@ inventory and Myers trace storage. Resolve files through `add`, then call
 `continue_merge`.
 `abort_merge` restores the original commit tree and clears merge state.
 
+Exact rename pairing is identity-based and bounded by
+`max_rename_comparisons`. A rename on one side is aligned with edits on the
+original path from the other side. Identical destination renames coalesce;
+rename/delete and divergent rename/rename cases retain Git-compatible conflict
+stages and result-tree paths. Each `MergeTreeStage` carries its own `path`
+because stages 1, 2, and 3 can legitimately have different names.
+
 ## Non-checkout tree merges
 
 `Repository::merge_tree` is the library equivalent of modern
@@ -48,7 +55,10 @@ let result = repository.merge_tree(ours, theirs, &MergeTreeOptions::default())?;
 println!("tree={} clean={}", result.tree, result.is_clean());
 for conflict in result.conflicts {
     for stage in conflict.stages {
-        println!("stage={} mode={:06o} id={}", stage.stage, stage.mode, stage.id);
+        println!(
+            "path={} stage={} mode={:06o} id={}",
+            String::from_utf8_lossy(&stage.path), stage.stage, stage.mode, stage.id,
+        );
     }
 }
 # Ok(())
@@ -75,6 +85,7 @@ base tree; conflicting virtual-base content is preserved with marker blobs.
   abort, and ref/reflog sequencing.
 - `merge-ort.c` and `unpack-trees.c` define three-way path selection and index
   stage semantics.
+- `diffcore-rename.c` defines identity matching and rename candidate pairing.
 - `xdiff-interface.c` defines textual conflict-marker presentation.
 - `xdiff/xmerge.c` defines diff-derived region combination and overlapping
   change conflicts.

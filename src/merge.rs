@@ -26,6 +26,7 @@ pub struct MergeOptions {
     pub graph: GraphOptions,
     pub max_text_merge_lines: usize,
     pub max_diff_trace_cells: usize,
+    pub max_rename_comparisons: usize,
 }
 
 impl Default for MergeOptions {
@@ -37,6 +38,7 @@ impl Default for MergeOptions {
             graph: GraphOptions::default(),
             max_text_merge_lines: 1_000_000,
             max_diff_trace_cells: 10_000_000,
+            max_rename_comparisons: 1_000_000,
         }
     }
 }
@@ -61,6 +63,7 @@ pub struct MergeTreeOptions {
     pub graph: GraphOptions,
     pub max_text_merge_lines: usize,
     pub max_diff_trace_cells: usize,
+    pub max_rename_comparisons: usize,
 }
 
 impl Default for MergeTreeOptions {
@@ -71,13 +74,16 @@ impl Default for MergeTreeOptions {
             graph: GraphOptions::default(),
             max_text_merge_lines: 1_000_000,
             max_diff_trace_cells: 10_000_000,
+            max_rename_comparisons: 1_000_000,
         }
     }
 }
 
 /// One stage of a conflicted path returned by [`Repository::merge_tree`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MergeTreeStage {
+    /// Path associated with this stage; rename conflicts can use different paths.
+    pub path: Vec<u8>,
     pub stage: u8,
     pub mode: u32,
     pub id: ObjectId,
@@ -141,7 +147,7 @@ pub enum ReplayResult {
     Conflicted { paths: Vec<Vec<u8>> },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct MergeEntry {
     mode: u32,
     id: ObjectId,
@@ -150,10 +156,15 @@ struct MergeEntry {
 #[derive(Clone, Debug)]
 struct Conflict {
     path: Vec<u8>,
-    base: Option<MergeEntry>,
-    ours: Option<MergeEntry>,
-    theirs: Option<MergeEntry>,
-    working: MergeEntry,
+    stages: Vec<ConflictStage>,
+    working: Vec<(Vec<u8>, MergeEntry)>,
+}
+
+#[derive(Clone, Debug)]
+struct ConflictStage {
+    path: Vec<u8>,
+    stage: u8,
+    entry: MergeEntry,
 }
 
 struct TreeMerge {
@@ -203,6 +214,7 @@ impl Repository {
                         graph: options.graph.clone(),
                         max_text_merge_lines: options.max_text_merge_lines,
                         max_diff_trace_cells: options.max_diff_trace_cells,
+                        max_rename_comparisons: options.max_rename_comparisons,
                         ..MergeOptions::default()
                     },
                 )?
@@ -219,6 +231,7 @@ impl Repository {
                 graph: options.graph.clone(),
                 max_text_merge_lines: options.max_text_merge_lines,
                 max_diff_trace_cells: options.max_diff_trace_cells,
+                max_rename_comparisons: options.max_rename_comparisons,
                 ..MergeOptions::default()
             },
         )?;
@@ -228,14 +241,14 @@ impl Repository {
             .iter()
             .map(|conflict| MergeTreeConflict {
                 path: conflict.path.clone(),
-                stages: [(1, conflict.base), (2, conflict.ours), (3, conflict.theirs)]
-                    .into_iter()
-                    .filter_map(|(stage, entry)| {
-                        entry.map(|entry| MergeTreeStage {
-                            stage,
-                            mode: entry.mode,
-                            id: entry.id,
-                        })
+                stages: conflict
+                    .stages
+                    .iter()
+                    .map(|stage| MergeTreeStage {
+                        path: stage.path.clone(),
+                        stage: stage.stage,
+                        mode: stage.entry.mode,
+                        id: stage.entry.id,
                     })
                     .collect(),
             })
@@ -592,9 +605,15 @@ impl Repository {
         target: ObjectId,
         options: &MergeOptions,
     ) -> Result<TreeMerge> {
-        let base = self.tree_map(base, options.graph.max_object_size)?;
-        let ours = self.tree_map(ours, options.graph.max_object_size)?;
-        let theirs = self.tree_map(theirs, options.graph.max_object_size)?;
+        let mut base = self.tree_map(base, options.graph.max_object_size)?;
+        let mut ours = self.tree_map(ours, options.graph.max_object_size)?;
+        let mut theirs = self.tree_map(theirs, options.graph.max_object_size)?;
+        let mut conflicts = align_exact_renames(
+            &mut base,
+            &mut ours,
+            &mut theirs,
+            options.max_rename_comparisons,
+        )?;
         let paths = base
             .keys()
             .chain(ours.keys())
@@ -602,7 +621,6 @@ impl Repository {
             .cloned()
             .collect::<BTreeSet<_>>();
         let mut resolved = BTreeMap::new();
-        let mut conflicts = Vec::new();
         for path in paths {
             let base_entry = base.get(&path).copied();
             let ours_entry = ours.get(&path).copied();
@@ -631,11 +649,18 @@ impl Repository {
                 )?;
                 if content_conflict {
                     conflicts.push(Conflict {
+                        stages: [(1, base_entry), (2, ours_entry), (3, theirs_entry)]
+                            .into_iter()
+                            .filter_map(|(stage, entry)| {
+                                entry.map(|entry| ConflictStage {
+                                    path: path.clone(),
+                                    stage,
+                                    entry,
+                                })
+                            })
+                            .collect(),
+                        working: vec![(path.clone(), working)],
                         path,
-                        base: base_entry,
-                        ours: ours_entry,
-                        theirs: theirs_entry,
-                        working,
                     });
                 } else {
                     resolved.insert(path, working);
@@ -643,9 +668,11 @@ impl Repository {
             }
         }
         reject_file_directory_collisions(
-            resolved
-                .keys()
-                .chain(conflicts.iter().map(|conflict| &conflict.path)),
+            resolved.keys().chain(
+                conflicts
+                    .iter()
+                    .flat_map(|conflict| conflict.working.iter().map(|(path, _)| path)),
+            ),
         )?;
         Ok(TreeMerge {
             resolved,
@@ -776,7 +803,7 @@ impl Repository {
     ) -> Result<(ObjectId, Vec<Vec<u8>>)> {
         let mut material = merged.resolved.clone();
         for conflict in &merged.conflicts {
-            material.insert(conflict.path.clone(), conflict.working);
+            material.extend(conflict.working.iter().cloned());
         }
         let material_tree = self.write_entry_map_tree(&material)?;
         self.checkout_tree(
@@ -792,7 +819,13 @@ impl Repository {
         let conflict_paths = merged
             .conflicts
             .iter()
-            .map(|conflict| conflict.path.clone())
+            .flat_map(|conflict| {
+                conflict
+                    .stages
+                    .iter()
+                    .map(|stage| stage.path.clone())
+                    .chain(conflict.working.iter().map(|(path, _)| path.clone()))
+            })
             .collect::<BTreeSet<_>>();
         let mut entries = self
             .read_index()?
@@ -802,16 +835,14 @@ impl Repository {
             .cloned()
             .collect::<Vec<_>>();
         for conflict in &merged.conflicts {
-            for (stage, value) in [(1, conflict.base), (2, conflict.ours), (3, conflict.theirs)] {
-                if let Some(value) = value {
-                    entries.push(IndexEntry::with_stage(
-                        conflict.path.clone(),
-                        value.mode,
-                        value.id,
-                        StatData::default(),
-                        stage,
-                    )?);
-                }
+            for stage in &conflict.stages {
+                entries.push(IndexEntry::with_stage(
+                    stage.path.clone(),
+                    stage.entry.mode,
+                    stage.entry.id,
+                    StatData::default(),
+                    stage.stage,
+                )?);
             }
         }
         self.write_index(&Index::new(self.read_index()?.version(), entries)?)?;
@@ -824,7 +855,7 @@ impl Repository {
     fn write_merge_result_tree(&self, merged: &TreeMerge) -> Result<ObjectId> {
         let mut entries = merged.resolved.clone();
         for conflict in &merged.conflicts {
-            entries.insert(conflict.path.clone(), conflict.working);
+            entries.extend(conflict.working.iter().cloned());
         }
         self.write_entry_map_tree(&entries)
     }
@@ -1072,6 +1103,204 @@ fn reject_file_directory_collisions<'a>(paths: impl Iterator<Item = &'a Vec<u8>>
         }
     }
     Ok(())
+}
+
+fn align_exact_renames(
+    base: &mut BTreeMap<Vec<u8>, MergeEntry>,
+    ours: &mut BTreeMap<Vec<u8>, MergeEntry>,
+    theirs: &mut BTreeMap<Vec<u8>, MergeEntry>,
+    max_comparisons: usize,
+) -> Result<Vec<Conflict>> {
+    let ours_renames = exact_renames(base, ours, max_comparisons)?;
+    let theirs_renames = exact_renames(base, theirs, max_comparisons)?;
+    let old_paths = ours_renames
+        .keys()
+        .chain(theirs_renames.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut conflicts = Vec::new();
+    for old in old_paths {
+        let base_entry = base.get(&old).copied().ok_or_else(|| {
+            Error::InvalidRepository("rename source disappeared during merge".into())
+        })?;
+        match (ours_renames.get(&old), theirs_renames.get(&old)) {
+            (Some(ours_new), Some(theirs_new)) if ours_new == theirs_new => {
+                move_entry(base, &old, ours_new)?;
+            }
+            (Some(ours_new), Some(theirs_new)) => {
+                base.remove(&old);
+                let ours_entry = ours.remove(ours_new).ok_or_else(|| {
+                    Error::InvalidRepository("ours rename destination disappeared".into())
+                })?;
+                let theirs_entry = theirs.remove(theirs_new).ok_or_else(|| {
+                    Error::InvalidRepository("theirs rename destination disappeared".into())
+                })?;
+                conflicts.push(Conflict {
+                    path: old.clone(),
+                    stages: vec![
+                        ConflictStage {
+                            path: old,
+                            stage: 1,
+                            entry: base_entry,
+                        },
+                        ConflictStage {
+                            path: ours_new.clone(),
+                            stage: 2,
+                            entry: ours_entry,
+                        },
+                        ConflictStage {
+                            path: theirs_new.clone(),
+                            stage: 3,
+                            entry: theirs_entry,
+                        },
+                    ],
+                    working: vec![
+                        (ours_new.clone(), ours_entry),
+                        (theirs_new.clone(), theirs_entry),
+                    ],
+                });
+            }
+            (Some(new), None) => align_one_sided_rename(
+                base,
+                ours,
+                theirs,
+                &old,
+                new,
+                base_entry,
+                2,
+                &mut conflicts,
+            )?,
+            (None, Some(new)) => align_one_sided_rename(
+                base,
+                theirs,
+                ours,
+                &old,
+                new,
+                base_entry,
+                3,
+                &mut conflicts,
+            )?,
+            (None, None) => unreachable!("path came from a rename map"),
+        }
+    }
+    Ok(conflicts)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn align_one_sided_rename(
+    base: &mut BTreeMap<Vec<u8>, MergeEntry>,
+    renamed_side: &mut BTreeMap<Vec<u8>, MergeEntry>,
+    other_side: &mut BTreeMap<Vec<u8>, MergeEntry>,
+    old: &[u8],
+    new: &[u8],
+    base_entry: MergeEntry,
+    renamed_stage: u8,
+    conflicts: &mut Vec<Conflict>,
+) -> Result<()> {
+    let renamed_entry = renamed_side.get(new).copied().ok_or_else(|| {
+        Error::InvalidRepository("rename destination disappeared during merge".into())
+    })?;
+    if let Some(other_entry) = other_side.remove(old) {
+        move_entry(base, old, new)?;
+        if other_side.insert(new.to_vec(), other_entry).is_some() {
+            return Err(Error::InvalidRepository(format!(
+                "rename destination `{}` collides with another path",
+                String::from_utf8_lossy(new)
+            )));
+        }
+        return Ok(());
+    }
+    base.remove(old);
+    renamed_side.remove(new);
+    conflicts.push(Conflict {
+        path: new.to_vec(),
+        stages: vec![
+            ConflictStage {
+                path: new.to_vec(),
+                stage: 1,
+                entry: base_entry,
+            },
+            ConflictStage {
+                path: new.to_vec(),
+                stage: renamed_stage,
+                entry: renamed_entry,
+            },
+        ],
+        working: vec![(new.to_vec(), renamed_entry)],
+    });
+    Ok(())
+}
+
+fn move_entry(values: &mut BTreeMap<Vec<u8>, MergeEntry>, old: &[u8], new: &[u8]) -> Result<()> {
+    let value = values
+        .remove(old)
+        .ok_or_else(|| Error::InvalidRepository("rename source disappeared during merge".into()))?;
+    if values.insert(new.to_vec(), value).is_some() {
+        return Err(Error::InvalidRepository(format!(
+            "rename destination `{}` collides with another path",
+            String::from_utf8_lossy(new)
+        )));
+    }
+    Ok(())
+}
+
+fn exact_renames(
+    base: &BTreeMap<Vec<u8>, MergeEntry>,
+    side: &BTreeMap<Vec<u8>, MergeEntry>,
+    max_comparisons: usize,
+) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+    let mut additions = BTreeMap::<MergeEntry, Vec<&Vec<u8>>>::new();
+    for (path, entry) in side {
+        if !base.contains_key(path) {
+            additions.entry(*entry).or_default().push(path);
+        }
+    }
+    let mut used = BTreeSet::new();
+    let mut renames = BTreeMap::new();
+    let mut comparisons = 0usize;
+    for (old, entry) in base {
+        if side.contains_key(old) {
+            continue;
+        }
+        let Some(candidates) = additions.get(entry) else {
+            continue;
+        };
+        let mut ranked = Vec::new();
+        for candidate in candidates
+            .iter()
+            .copied()
+            .filter(|path| !used.contains(*path))
+        {
+            comparisons = comparisons.checked_add(1).ok_or_else(|| {
+                Error::InvalidRepository("rename comparison count overflow".into())
+            })?;
+            if comparisons > max_comparisons {
+                return Err(Error::InvalidRepository(format!(
+                    "exact rename detection exceeds {max_comparisons} comparisons"
+                )));
+            }
+            ranked.push((path_similarity(old, candidate), candidate));
+        }
+        ranked.sort_unstable_by(|left, right| right.cmp(left));
+        if let Some((_, new)) = ranked.first() {
+            used.insert((*new).clone());
+            renames.insert(old.clone(), (*new).clone());
+        }
+    }
+    Ok(renames)
+}
+
+fn path_similarity(left: &[u8], right: &[u8]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+        + left
+            .iter()
+            .rev()
+            .zip(right.iter().rev())
+            .take_while(|(left, right)| left == right)
+            .count()
 }
 
 fn merge_scalar<T: Copy + Eq>(base: T, ours: T, theirs: T) -> Option<T> {
@@ -1367,6 +1596,165 @@ mod tests {
                 .entries()
                 .iter()
                 .all(|entry| entry.stage() == 0)
+        );
+    }
+
+    #[test]
+    fn aligns_exact_renames_and_preserves_path_specific_conflict_stages() {
+        let (repository, _, _) = repository();
+        let base = commit(
+            &repository,
+            &[],
+            &[(&b"old"[..], b"line one\nline two\n")],
+            1,
+        );
+        let ours_rename = commit(
+            &repository,
+            &[base],
+            &[(&b"new"[..], b"line one\nline two\n")],
+            2,
+        );
+        let theirs_edit = commit(
+            &repository,
+            &[base],
+            &[(&b"old"[..], b"LINE ONE\nline two\n")],
+            3,
+        );
+        let result = repository
+            .merge_tree(ours_rename, theirs_edit, &MergeTreeOptions::default())
+            .unwrap();
+        assert!(result.is_clean());
+        let entries = repository.flattened_tree(result.tree, 4096).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, b"new");
+        assert_eq!(
+            repository.read_object(entries[0].id, 4096).unwrap().data(),
+            b"LINE ONE\nline two\n"
+        );
+
+        let ours = commit(
+            &repository,
+            &[base],
+            &[(&b"ours-name"[..], b"line one\nline two\n")],
+            4,
+        );
+        let theirs = commit(
+            &repository,
+            &[base],
+            &[(&b"theirs-name"[..], b"line one\nline two\n")],
+            5,
+        );
+        let result = repository
+            .merge_tree(ours, theirs, &MergeTreeOptions::default())
+            .unwrap();
+        assert!(!result.is_clean());
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(result.conflicts[0].path, b"old");
+        assert_eq!(
+            result.conflicts[0]
+                .stages
+                .iter()
+                .map(|stage| (stage.stage, stage.path.as_slice()))
+                .collect::<Vec<_>>(),
+            [
+                (1, &b"old"[..]),
+                (2, &b"ours-name"[..]),
+                (3, &b"theirs-name"[..])
+            ]
+        );
+        assert_eq!(
+            repository
+                .flattened_tree(result.tree, 4096)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>(),
+            [b"ours-name".to_vec(), b"theirs-name".to_vec()]
+        );
+
+        let deleted = commit(&repository, &[base], &[], 6);
+        let result = repository
+            .merge_tree(ours_rename, deleted, &MergeTreeOptions::default())
+            .unwrap();
+        assert!(!result.is_clean());
+        assert_eq!(result.conflicts[0].path, b"new");
+        assert_eq!(
+            result.conflicts[0]
+                .stages
+                .iter()
+                .map(|stage| (stage.stage, stage.path.as_slice()))
+                .collect::<Vec<_>>(),
+            [(1, &b"new"[..]), (2, &b"new"[..])]
+        );
+    }
+
+    #[test]
+    fn materializes_divergent_rename_stages_at_their_git_paths() {
+        let (repository, filesystem, signature) = repository();
+        let base = commit(&repository, &[], &[(&b"old"[..], b"content\n")], 1);
+        let ours = commit(
+            &repository,
+            &[base],
+            &[(&b"ours-name"[..], b"content\n")],
+            2,
+        );
+        let theirs = commit(
+            &repository,
+            &[base],
+            &[(&b"theirs-name"[..], b"content\n")],
+            3,
+        );
+        set_main(&repository, ours);
+        checkout(&repository, ours);
+        let result = repository
+            .merge(theirs, &MergeOptions::default(), &signature)
+            .unwrap();
+        assert!(matches!(result, MergeResult::Conflicted { .. }));
+        assert_eq!(
+            repository
+                .read_index()
+                .unwrap()
+                .entries()
+                .iter()
+                .map(|entry| (entry.stage(), entry.path()))
+                .collect::<Vec<_>>(),
+            [
+                (1, &b"old"[..]),
+                (2, &b"ours-name"[..]),
+                (3, &b"theirs-name"[..])
+            ]
+        );
+        assert!(filesystem.exists(Path::new("repo/ours-name")).unwrap());
+        assert!(filesystem.exists(Path::new("repo/theirs-name")).unwrap());
+        assert!(!filesystem.exists(Path::new("repo/old")).unwrap());
+    }
+
+    #[test]
+    fn bounds_exact_rename_candidate_comparisons() {
+        let (repository, _, _) = repository();
+        let base = commit(
+            &repository,
+            &[],
+            &[(&b"a"[..], b"same\n"), (&b"b"[..], b"same\n")],
+            1,
+        );
+        let renamed = commit(
+            &repository,
+            &[base],
+            &[(&b"c"[..], b"same\n"), (&b"d"[..], b"same\n")],
+            2,
+        );
+        assert!(
+            repository
+                .merge_tree(
+                    renamed,
+                    base,
+                    &MergeTreeOptions {
+                        max_rename_comparisons: 0,
+                        ..MergeTreeOptions::default()
+                    },
+                )
+                .is_err()
         );
     }
 

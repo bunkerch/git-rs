@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stage.mode,
                 stage.id,
                 stage.stage,
-                String::from_utf8_lossy(&conflict.path)
+                String::from_utf8_lossy(&stage.path)
             );
         }
     }
