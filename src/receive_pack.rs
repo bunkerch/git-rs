@@ -74,7 +74,7 @@ impl ReceivePackRequest {
     ///
     /// # Errors
     /// Returns an error for malformed commands, duplicate refs, unsupported
-    /// capabilities, deletions, or invalid pkt-line framing.
+    /// capabilities, or invalid pkt-line framing.
     pub fn parse(input: &[u8]) -> Result<Self> {
         let mut cursor = 0;
         let mut commands = Vec::new();
@@ -112,13 +112,6 @@ impl ReceivePackRequest {
                     if let Some(requested) = requested {
                         capabilities = Capability::parse_list(&requested)?;
                         validate_capabilities(&capabilities)?;
-                    }
-                    if command.new.is_null()
-                        && !capabilities
-                            .iter()
-                            .any(|capability| capability.name() == "delete-refs")
-                    {
-                        return protocol_error("ref deletion requires `delete-refs`");
                     }
                     commands.push(command);
                 }
@@ -363,6 +356,10 @@ impl Repository {
         incoming: Option<&ValidatedPack>,
         max_size: usize,
     ) -> Result<()> {
+        let shallow = self.shallow_commits(&crate::ShallowOptions {
+            max_commits: usize::MAX,
+            max_object_size: max_size,
+        })?;
         let mut seen = HashSet::new();
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
@@ -380,7 +377,9 @@ impl Repository {
                 ObjectKind::Commit => {
                     let commit = crate::Commit::parse(data)?;
                     stack.push(commit.tree());
-                    stack.extend(commit.parents().iter().copied());
+                    if !shallow.contains(&id) {
+                        stack.extend(commit.parents().iter().copied());
+                    }
                 }
                 ObjectKind::Tree => {
                     let tree = crate::Tree::parse(data)?;
@@ -391,7 +390,7 @@ impl Repository {
                             .map(crate::TreeEntry::id),
                     );
                 }
-                ObjectKind::Tag => stack.push(parse_tag_target(data)?),
+                ObjectKind::Tag => stack.push(crate::AnnotatedTag::parse(data)?.target()),
                 ObjectKind::Blob => {}
             }
         }
@@ -499,17 +498,6 @@ fn protocol_line_message(message: &str) -> String {
             }
         })
         .collect()
-}
-
-fn parse_tag_target(data: &[u8]) -> Result<ObjectId> {
-    let line = data
-        .split(|byte| *byte == b'\n')
-        .next()
-        .ok_or_else(|| Error::InvalidObject("tag has no object header".into()))?;
-    let value = line
-        .strip_prefix(b"object ")
-        .ok_or_else(|| Error::InvalidObject("tag has no object header".into()))?;
-    parse_id(value).map_err(|_| Error::InvalidObject("invalid tag target".into()))
 }
 
 fn append_packet(output: &mut Vec<u8>, data: &[u8]) -> Result<()> {
@@ -716,10 +704,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_deletion_and_duplicate_command_names_during_parsing() {
+    fn accepts_deletion_and_rejects_duplicate_command_names_during_parsing() {
         let old = ObjectId::compute(ObjectKind::Blob, b"old");
         let deletion = receive_input(old, ObjectId::null(), "refs/heads/main", "", &[]);
-        assert!(ReceivePackRequest::parse(&deletion).is_err());
+        assert!(ReceivePackRequest::parse(&deletion).is_ok());
 
         let new = ObjectId::compute(ObjectKind::Blob, b"new");
         let first = format!(
@@ -734,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn deletes_a_ref_when_delete_refs_was_negotiated() {
+    fn deletes_a_ref_when_delete_refs_was_advertised() {
         let repository = Repository::init(
             MemoryFileSystem::new(),
             "repo",
@@ -750,7 +738,7 @@ mod tests {
             old,
             ObjectId::null(),
             "refs/heads/obsolete",
-            "report-status delete-refs",
+            "report-status",
             &[],
         ))
         .unwrap();

@@ -40,16 +40,22 @@ impl EntryMode {
     }
 
     fn parse(value: &[u8]) -> Result<Self> {
-        match value {
-            b"100644" => Ok(Self::Blob),
-            b"100755" => Ok(Self::BlobExecutable),
-            b"120000" => Ok(Self::Link),
-            b"40000" | b"040000" => Ok(Self::Tree),
-            b"160000" => Ok(Self::Gitlink),
-            _ => Err(Error::InvalidTree(format!(
-                "unsupported mode `{}`",
-                String::from_utf8_lossy(value)
-            ))),
+        let raw = std::str::from_utf8(value)
+            .ok()
+            .and_then(|value| u32::from_str_radix(value, 8).ok())
+            .ok_or_else(|| {
+                Error::InvalidTree(format!(
+                    "unsupported mode `{}`",
+                    String::from_utf8_lossy(value)
+                ))
+            })?;
+        match raw & 0o170_000 {
+            0o100_000 if raw & 0o111 == 0 => Ok(Self::Blob),
+            0o100_000 => Ok(Self::BlobExecutable),
+            0o120_000 => Ok(Self::Link),
+            0o040_000 => Ok(Self::Tree),
+            0o160_000 => Ok(Self::Gitlink),
+            _ => Err(Error::InvalidTree(format!("unsupported mode `{raw:o}`"))),
         }
     }
 }

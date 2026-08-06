@@ -173,18 +173,35 @@ impl FileSystem for MemoryFileSystem {
         let from = validate(from)?;
         let to = validate(to)?;
         let mut entries = self.entries_mut();
-        let entry = entries
-            .remove(&from)
-            .ok_or_else(|| Error::NotFound(from.clone()))?;
-        if matches!(entry, Entry::Directory) {
-            entries.insert(from.clone(), entry);
-            return Err(Error::IsDirectory(from));
-        }
         let parent = to.parent().unwrap_or(Path::new(""));
         if !matches!(entries.get(parent), Some(Entry::Directory)) {
-            entries.insert(from, entry);
             return Err(Error::NotDirectory(parent.to_path_buf()));
         }
+        let entry = entries
+            .get(&from)
+            .cloned()
+            .ok_or_else(|| Error::NotFound(from.clone()))?;
+        if matches!(entry, Entry::Directory) {
+            if to.starts_with(&from) || entries.contains_key(&to) {
+                return Err(Error::AlreadyExists(to));
+            }
+            let moved = entries
+                .range(from.clone()..)
+                .take_while(|(path, _)| *path == &from || path.starts_with(&from))
+                .map(|(path, entry)| {
+                    let suffix = path.strip_prefix(&from).expect("selected prefix");
+                    (path.clone(), to.join(suffix), entry.clone())
+                })
+                .collect::<Vec<_>>();
+            for (old, _, _) in &moved {
+                entries.remove(old);
+            }
+            for (_, new, entry) in moved {
+                entries.insert(new, entry);
+            }
+            return Ok(());
+        }
+        entries.remove(&from);
         entries.insert(to, entry);
         Ok(())
     }
@@ -280,6 +297,23 @@ mod tests {
             .unwrap();
         assert_eq!(fs.read(Path::new("HEAD")).unwrap(), b"new");
         assert!(!fs.exists(Path::new("HEAD.lock")).unwrap());
+    }
+
+    #[test]
+    fn rename_atomically_moves_a_directory_tree() {
+        let fs = MemoryFileSystem::new();
+        fs.create_dir_all(Path::new("old/nested")).unwrap();
+        fs.write(Path::new("old/nested/file"), b"contents").unwrap();
+        fs.create_symlink(Path::new("old/link"), b"nested/file")
+            .unwrap();
+        fs.rename(Path::new("old"), Path::new("new")).unwrap();
+        assert_eq!(fs.read(Path::new("new/nested/file")).unwrap(), b"contents");
+        assert_eq!(fs.read_link(Path::new("new/link")).unwrap(), b"nested/file");
+        assert!(!fs.exists(Path::new("old")).unwrap());
+        assert!(matches!(
+            fs.rename(Path::new("new"), Path::new("new/inside")),
+            Err(Error::AlreadyExists(_))
+        ));
     }
 
     #[test]

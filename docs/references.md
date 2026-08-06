@@ -24,6 +24,16 @@ The lower-level `update_reference` API also supports exact compare-and-swap with
 `PreviousValue::MustExist`, which is useful when a caller must reject a stale
 write.
 
+`symbolic_reference(name, recurse)` reads symbolic refs without confusing a
+detached direct ref for a symbolic target. Recursive reads return the final
+symbolic target, including an unborn branch. `update_symbolic_reference` writes
+the canonical `ref: refs/...` form under a `.lock` and accepts
+`PreviousReferenceValue` so callers can compare-and-swap against a missing,
+direct, or symbolic current value. An optional identity/reason pair locks and
+updates the reflog with the old and new resolved IDs. `delete_symbolic_reference`
+deletes without dereferencing, checks the exact expected target, removes its
+reflog, and refuses to delete `HEAD`.
+
 Updates exclusively acquire `<ref>.lock`, inspect the current loose or packed
 value while holding that lock, write the new complete value, and atomically
 rename the lock over the loose ref. Failed transactions remove their lock.
@@ -33,11 +43,29 @@ expected old object ID, and removes both representations. This prevents a
 packed value hidden by a loose override from reappearing. An annotated tag's
 peeled line and the deleted ref's reflog are removed with it.
 
+The higher-level `delete_branch` additionally refuses to delete a branch that
+is checked out in the main or any linked worktree. Without `force`, its tip
+must be an ancestor of `HEAD`; the bounded `GraphOptions` make malformed or
+hostile histories fail predictably. Successful deletion also removes the
+branch's config subsection.
+
+`rename_branch` moves the ref with one compare-and-swap ref transaction,
+preserves and extends its reflog, renames its `[branch "..."]` config, and
+updates every main or linked-worktree `HEAD` that names the branch. A forced
+rename may replace another direct branch, but never one checked out by a
+worktree.
+
 `apply_reference_transaction` batches `ReferenceEdit::update` and
 `ReferenceEdit::delete` operations. It rejects duplicate names, acquires all
 loose locks in bytewise order to avoid deadlocks, then checks every CAS
 precondition and prepares `packed-refs` before changing any destination. A
 preparation failure cleans every lock without changing a ref.
+
+`apply_mixed_reference_transaction` uses the same prepared-lock discipline for
+direct and symbolic targets, deletion, and verification-only edits in one
+transaction. Exact direct or symbolic `PreviousReferenceValue` preconditions
+are checked only after every lock is held. This is the atomic foundation for
+the mixed command set accepted by update-ref plumbing.
 
 ## Git source comparisons
 
@@ -47,9 +75,18 @@ organized around these upstream contracts:
 - `refs.c:check_refname_component` and `check_refname_format` define forbidden
   bytes, components, `.lock`, `..`, and `@{` restrictions.
 - `refs/refs-internal.h:SYMREF_MAXDEPTH` defines the five-hop symbolic limit.
+- `builtin/symbolic-ref.c:check_symref` defines recursive/immediate reads and
+  `HEAD` deletion protection.
+- `refs.c:refs_update_symref_extended` defines no-dereference transactional
+  symbolic updates.
 - `refs/files-backend.c:read_ref_internal` defines loose-first, packed fallback.
 - `refs/files-backend.c` and `lockfile.c` define exclusive `.lock` acquisition
   and atomic publication.
+- `builtin/branch.c:delete_branches` defines mergedness and checked-out
+  deletion safeguards.
+- `builtin/branch.c:copy_or_rename_branch` and
+  `worktree.c:replace_each_worktree_head_symref` define branch rename behavior,
+  reflog migration, and linked-worktree `HEAD` updates.
 - `hex.c:get_oid_hex` and `hash_to_hex_algop_r` define object-ID parsing and
   canonical lowercase formatting.
 
@@ -57,8 +94,12 @@ The current repository format is version 0 and therefore uses 20-byte SHA-1
 object IDs. SHA-256 repository-format support will be represented explicitly
 rather than accepting ambiguous identifier lengths.
 
-The host-backed example opens an existing repository and creates a branch:
+The host-backed example opens an existing repository and manages branches:
 
 ```console
-cargo run --example branch -- my-repository feature/new <40-hex-object-id>
+cargo run --example branch -- my-repository create feature/new <40-hex-object-id>
+cargo run --example branch -- my-repository rename feature/new feature/ready
+cargo run --example branch -- my-repository delete feature/ready --force
+cargo run --example symbolic_ref -- my-repository HEAD
+cargo run --example symbolic_ref -- my-repository refs/meta/current refs/heads/main
 ```

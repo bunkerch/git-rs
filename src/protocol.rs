@@ -339,4 +339,24 @@ mod tests {
         assert!(Capability::parse_list(b"agent=a agent=b").is_err());
         assert!(Capability::parse_list(b"bad\nname").is_err());
     }
+
+    #[test]
+    fn rejects_pkt_line_with_oversized_length() {
+        let mut decoder = PktLineDecoder::new();
+        // FFFF hex = 65535 bytes - well above allowed max
+        decoder.extend(b"\xFF\xFF\x00\x00");
+        assert!(decoder.next_packet().is_err(), "oversized pkt-line should be rejected");
+    }
+
+    #[test]
+    fn pkt_line_decoder_accumulates_partial_data() {
+        let mut decoder = PktLineDecoder::new();
+        decoder.extend(b"00");
+        assert!(decoder.next_packet().unwrap().is_none(), "partial header should produce None");
+        decoder.extend(b"05");
+        assert!(decoder.next_packet().unwrap().is_none(), "partial body should produce None");
+        decoder.extend(b"a");
+        let packet = decoder.next_packet().unwrap();
+        assert_eq!(packet, Some(PktLine::Data(b"a".to_vec())));
+    }
 }

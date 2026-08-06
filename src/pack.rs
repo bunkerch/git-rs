@@ -38,6 +38,48 @@ pub struct IncomingPackOptions {
     pub use_deltas: bool,
 }
 
+/// Resource limits for verifying an indexed pack.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifyPackOptions {
+    pub max_pack_size: usize,
+    pub max_object_size: usize,
+    pub max_total_inflated_size: usize,
+    pub max_objects: usize,
+    pub max_delta_depth: usize,
+}
+
+impl Default for VerifyPackOptions {
+    fn default() -> Self {
+        Self {
+            max_pack_size: 1024 * 1024 * 1024,
+            max_object_size: 1024 * 1024 * 1024,
+            max_total_inflated_size: 2 * 1024 * 1024 * 1024,
+            max_objects: 10_000_000,
+            max_delta_depth: MAX_DELTA_DEPTH,
+        }
+    }
+}
+
+/// One object row from Git's verbose `verify-pack` report.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedPackObject {
+    pub id: ObjectId,
+    pub kind: ObjectKind,
+    pub size: usize,
+    pub packed_size: usize,
+    pub offset: u64,
+    pub delta_depth: usize,
+    pub base: Option<ObjectId>,
+}
+
+/// Integrity result and delta-chain statistics for one pack/index pair.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifyPackReport {
+    pub objects: Vec<VerifiedPackObject>,
+    pub delta_histogram: std::collections::BTreeMap<usize, usize>,
+    pub pack_size: usize,
+}
+
 impl Default for IncomingPackOptions {
     fn default() -> Self {
         Self {
@@ -111,6 +153,21 @@ impl ValidatedPack {
     #[must_use]
     pub fn contains(&self, id: ObjectId) -> bool {
         self.objects.contains_key(&id)
+    }
+
+    #[must_use]
+    pub const fn checksum(&self) -> &[u8; HASH_SIZE] {
+        self.bundle.checksum()
+    }
+
+    #[must_use]
+    pub fn pack_size(&self) -> usize {
+        self.bundle.pack().len()
+    }
+
+    #[must_use]
+    pub fn index_size(&self) -> usize {
+        self.bundle.index().len()
     }
 
     pub(crate) fn object(&self, id: ObjectId) -> Option<(ObjectKind, &[u8])> {
@@ -252,6 +309,81 @@ impl PackIndex {
 }
 
 impl Repository {
+    /// Verify an index and its sibling pack and return verbose object metadata.
+    ///
+    /// `index_path` is relative to the configured filesystem root, as are paths
+    /// returned by [`Repository::write_pack`]. No host filesystem access occurs.
+    ///
+    /// # Errors
+    /// Returns an error for unsafe paths, missing/corrupt index or pack data,
+    /// checksum/CRC/object-ID disagreement, malformed deltas, or exceeded limits.
+    pub fn verify_pack(
+        &self,
+        index_path: impl AsRef<Path>,
+        options: &VerifyPackOptions,
+    ) -> Result<VerifyPackReport> {
+        let index_path = crate::fs::normalize_path(index_path.as_ref())?;
+        if index_path.extension().and_then(|value| value.to_str()) != Some("idx") {
+            return invalid("verify-pack requires an .idx path");
+        }
+        let index = self.cached_pack_index(&index_path)?;
+        if index.entries().len() > options.max_objects {
+            return invalid("pack object count exceeds verification limit");
+        }
+        let pack_path = index_path.with_extension("pack");
+        let declared_pack_size = self.filesystem().metadata(&pack_path)?.len();
+        if declared_pack_size > options.max_pack_size as u64 {
+            return Err(Error::ObjectTooLarge {
+                declared: declared_pack_size,
+                limit: options.max_pack_size,
+            });
+        }
+        let pack = self.cached_pack_data(&pack_path, &index)?;
+        let mut objects = Vec::with_capacity(index.entries().len());
+        let mut delta_histogram = std::collections::BTreeMap::new();
+        let mut total = 0_usize;
+        for entry in index.entries() {
+            let (kind, data) = resolve(&pack, &index, entry.id, options.max_object_size, 0)?;
+            if ObjectId::compute(kind, &data) != entry.id {
+                return invalid("resolved packed object hash mismatch");
+            }
+            total = total.checked_add(data.len()).ok_or(Error::ObjectTooLarge {
+                declared: u64::MAX,
+                limit: options.max_total_inflated_size,
+            })?;
+            if total > options.max_total_inflated_size {
+                return Err(Error::ObjectTooLarge {
+                    declared: total as u64,
+                    limit: options.max_total_inflated_size,
+                });
+            }
+            let (delta_depth, base) =
+                delta_metadata(&pack, &index, *entry, options.max_delta_depth)?;
+            if delta_depth > 0 {
+                *delta_histogram.entry(delta_depth).or_insert(0) += 1;
+            }
+            let end = index.object_end(entry.offset, pack.len() - HASH_SIZE)?;
+            let start = usize::try_from(entry.offset).map_err(|_| pack_error("offset overflow"))?;
+            objects.push(VerifiedPackObject {
+                id: entry.id,
+                kind,
+                size: data.len(),
+                packed_size: end
+                    .checked_sub(start)
+                    .ok_or_else(|| pack_error("invalid object bounds"))?,
+                offset: entry.offset,
+                delta_depth,
+                base,
+            });
+        }
+        objects.sort_unstable_by_key(|object| object.offset);
+        Ok(VerifyPackReport {
+            objects,
+            delta_histogram,
+            pack_size: pack.len(),
+        })
+    }
+
     /// Build a deterministic pack containing the requested objects.
     ///
     /// Duplicate IDs are emitted once. Source objects may be loose or packed,
@@ -315,6 +447,38 @@ impl Repository {
         self.publish_bundle(&pack.bundle)
     }
 
+    pub(crate) fn publish_validated_pack_with_markers(
+        &self,
+        pack: &ValidatedPack,
+        keep: Option<&[u8]>,
+        promisor: Option<&[u8]>,
+    ) -> Result<WrittenPack> {
+        let bundle = &pack.bundle;
+        let stem = bundle.stem();
+        let pack_relative = Path::new("objects/pack").join(format!("{stem}.pack"));
+        let index_relative = Path::new("objects/pack").join(format!("{stem}.idx"));
+        self.publish_pack_file(&pack_relative, bundle.pack())?;
+        if let Some(contents) = keep {
+            self.publish_pack_file(
+                &Path::new("objects/pack").join(format!("{stem}.keep")),
+                contents,
+            )?;
+        }
+        if let Some(contents) = promisor {
+            self.publish_pack_file(
+                &Path::new("objects/pack").join(format!("{stem}.promisor")),
+                contents,
+            )?;
+        }
+        self.publish_pack_file(&index_relative, bundle.index())?;
+        Ok(WrittenPack {
+            pack_path: self.git_path(&pack_relative),
+            index_path: self.git_path(&index_relative),
+            checksum: bundle.checksum,
+            object_count: bundle.object_count,
+        })
+    }
+
     fn publish_bundle(&self, bundle: &PackBundle) -> Result<WrittenPack> {
         let stem = bundle.stem();
         let pack_relative = Path::new("objects/pack").join(format!("{stem}.pack"));
@@ -360,7 +524,36 @@ impl Repository {
         Ok(())
     }
 
+    pub(crate) fn contains_packed_object(&self, id: ObjectId) -> Result<bool> {
+        if self.midx_object_location(id)?.is_some() {
+            return Ok(true);
+        }
+        let directory = self.git_path("objects/pack");
+        let paths = match self.filesystem().read_dir(&directory) {
+            Ok(paths) => paths,
+            Err(Error::NotFound(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        for child in paths {
+            if child.extension().and_then(|value| value.to_str()) != Some("idx") {
+                continue;
+            }
+            let index = self.cached_pack_index(&directory.join(child))?;
+            if index.find(id).is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn read_packed_object(&self, id: ObjectId, max_size: usize) -> Result<Object> {
+        if let Some((index_path, expected_offset)) = self.midx_object_location(id)? {
+            match self.read_indexed_object_at(&index_path, id, expected_offset, max_size) {
+                Ok(object) => return Ok(object),
+                Err(Error::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
         let directory = self.git_path("objects/pack");
         let paths = match self.filesystem().read_dir(&directory) {
             Ok(paths) => paths,
@@ -375,18 +568,64 @@ impl Repository {
             }
             let index_path = directory.join(child);
             let index = self.cached_pack_index(&index_path)?;
-            if index.find(id).is_none() {
+            let Some(entry) = index.find(id) else {
                 continue;
-            }
-            let pack_path = index_path.with_extension("pack");
-            let pack = self.cached_pack_data(&pack_path, &index)?;
-            let (kind, data) = resolve(&pack, &index, id, max_size, 0)?;
-            if ObjectId::compute(kind, &data) != id {
-                return invalid("resolved packed object hash mismatch");
-            }
-            return Ok(Object::from_parts(kind, data));
+            };
+            return self.read_indexed_object_at(
+                &index_path,
+                id,
+                entry.offset,
+                max_size,
+            );
         }
         Err(Error::NotFound(self.git_path(object_label(id))))
+    }
+
+    fn read_indexed_object_at(
+        &self,
+        index_path: &Path,
+        id: ObjectId,
+        expected_offset: u64,
+        max_size: usize,
+    ) -> Result<Object> {
+        let index = self.cached_pack_index(index_path)?;
+        let entry = index
+            .find(id)
+            .ok_or_else(|| Error::NotFound(index_path.to_path_buf()))?;
+        if entry.offset != expected_offset {
+            return invalid("multi-pack-index offset disagrees with pack index");
+        }
+        let pack = self.cached_pack_data(&index_path.with_extension("pack"), &index)?;
+        let (kind, data) = resolve(&pack, &index, id, max_size, 0)?;
+        if ObjectId::compute(kind, &data) != id {
+            return invalid("resolved packed object hash mismatch");
+        }
+        Ok(Object::from_parts(kind, data))
+    }
+
+    pub(crate) fn validate_indexed_pack(
+        &self,
+        index_path: &Path,
+        max_size: usize,
+    ) -> Result<Vec<ObjectId>> {
+        let index = self.cached_pack_index(index_path)?;
+        let pack = self.cached_pack_data(&index_path.with_extension("pack"), &index)?;
+        let mut ids = Vec::with_capacity(index.entries().len());
+        for entry in index.entries() {
+            let (kind, data) = resolve(&pack, &index, entry.id, max_size, 0)?;
+            if ObjectId::compute(kind, &data) != entry.id {
+                return invalid("resolved packed object hash mismatch");
+            }
+            ids.push(entry.id);
+        }
+        Ok(ids)
+    }
+
+    /// Validate pack/index framing and checksums without inflating objects.
+    pub(crate) fn validate_pack_pair(&self, index_path: &Path) -> Result<Vec<ObjectId>> {
+        let index = self.cached_pack_index(index_path)?;
+        self.cached_pack_data(&index_path.with_extension("pack"), &index)?;
+        Ok(index.entries().iter().map(|entry| entry.id).collect())
     }
 
     fn cached_pack_index(&self, path: &Path) -> Result<Arc<PackIndex>> {
@@ -431,6 +670,65 @@ impl Repository {
             .or_insert_with(|| Arc::clone(&bytes))
             .clone())
     }
+}
+
+fn delta_metadata(
+    pack: &[u8],
+    index: &PackIndex,
+    entry: PackIndexEntry,
+    max_depth: usize,
+) -> Result<(usize, Option<ObjectId>)> {
+    let mut current = entry;
+    let mut first_base = None;
+    let mut depth = 0_usize;
+    let mut seen = std::collections::BTreeSet::new();
+    while seen.insert(current.id) {
+        let start = usize::try_from(current.offset).map_err(|_| pack_error("offset overflow"))?;
+        let end = index.object_end(current.offset, pack.len() - HASH_SIZE)?;
+        let encoded = pack
+            .get(start..end)
+            .ok_or_else(|| pack_error("object bounds outside pack"))?;
+        let (object_type, _, mut cursor) = parse_object_header(encoded)?;
+        let base = match object_type {
+            1..=4 => return Ok((depth, first_base)),
+            6 => {
+                let distance = parse_ofs_distance(encoded, &mut cursor)?;
+                let base_offset = current
+                    .offset
+                    .checked_sub(distance)
+                    .ok_or_else(|| pack_error("invalid OFS_DELTA base"))?;
+                index
+                    .entries()
+                    .iter()
+                    .find(|candidate| candidate.offset == base_offset)
+                    .copied()
+                    .ok_or_else(|| pack_error("OFS_DELTA base is absent"))?
+            }
+            7 => {
+                let bytes = encoded
+                    .get(cursor..cursor + HASH_SIZE)
+                    .ok_or_else(|| pack_error("truncated REF_DELTA"))?;
+                let id = ObjectId::from_bytes(
+                    bytes
+                        .try_into()
+                        .map_err(|_| pack_error("invalid REF_DELTA base length"))?,
+                );
+                index
+                    .find(id)
+                    .ok_or_else(|| pack_error("REF_DELTA base is absent"))?
+            }
+            _ => return invalid("reserved packed object type"),
+        };
+        first_base.get_or_insert(base.id);
+        depth = depth
+            .checked_add(1)
+            .ok_or_else(|| pack_error("delta depth overflow"))?;
+        if depth > max_depth {
+            return invalid("delta chain exceeds verification limit");
+        }
+        current = base;
+    }
+    invalid("delta cycle")
 }
 
 struct PackSource {
@@ -601,7 +899,7 @@ fn validate_incoming_pack(
             let IncomingRepresentation::RefDelta { base_id, .. } = &entry.representation else {
                 continue;
             };
-            let base = match repository.read_object(*base_id, options.max_object_size) {
+            let base = match repository.read_object_raw(*base_id, options.max_object_size) {
                 Ok(base) => base,
                 Err(Error::NotFound(_)) => continue,
                 Err(error) => return Err(error),
@@ -1231,20 +1529,20 @@ const fn make_crc32_table() -> [u32; 256] {
 
 fn be_u32(data: &[u8], offset: usize) -> Result<u32> {
     let end = checked_add(offset, 4)?;
+    let slice = data
+        .get(offset..end)
+        .ok_or_else(|| pack_error("truncated integer"))?;
     Ok(u32::from_be_bytes(
-        data.get(offset..end)
-            .ok_or_else(|| pack_error("truncated integer"))?
-            .try_into()
-            .unwrap(),
+        slice.try_into().map_err(|_| pack_error("invalid integer length"))?,
     ))
 }
 fn be_u64(data: &[u8], offset: usize) -> Result<u64> {
     let end = checked_add(offset, 8)?;
+    let slice = data
+        .get(offset..end)
+        .ok_or_else(|| pack_error("truncated integer"))?;
     Ok(u64::from_be_bytes(
-        data.get(offset..end)
-            .ok_or_else(|| pack_error("truncated integer"))?
-            .try_into()
-            .unwrap(),
+        slice.try_into().map_err(|_| pack_error("invalid integer length"))?,
     ))
 }
 fn read_hash(data: &[u8], offset: usize) -> Result<[u8; HASH_SIZE]> {
@@ -1286,8 +1584,8 @@ mod tests {
     use super::{PackIndex, apply_delta, crc32};
     use crate::object::sha1;
     use crate::{
-        FileSystem, IncomingPackOptions, InitOptions, MemoryFileSystem, ObjectId, ObjectKind,
-        PackOptions, Repository,
+        Error, FileSystem, IncomingPackOptions, InitOptions, MemoryFileSystem, ObjectId,
+        ObjectKind, PackOptions, Repository,
     };
 
     #[test]
@@ -1379,6 +1677,87 @@ mod tests {
     }
 
     #[test]
+    fn verifies_pack_objects_and_delta_histogram() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs, "repo", &InitOptions::default()).unwrap();
+        let base_data = vec![b'a'; 4096];
+        let mut target_data = base_data.clone();
+        target_data[2048..2052].copy_from_slice(b"rust");
+        let base = repository
+            .write_object(ObjectKind::Blob, &base_data)
+            .unwrap();
+        let target = repository
+            .write_object(ObjectKind::Blob, &target_data)
+            .unwrap();
+        let written = repository
+            .write_pack(&[base, target], &PackOptions::default())
+            .unwrap();
+
+        let report = repository
+            .verify_pack(&written.index_path, &super::VerifyPackOptions::default())
+            .unwrap();
+        assert_eq!(report.objects.len(), 2);
+        let base_row = report.objects.iter().find(|row| row.id == base).unwrap();
+        assert_eq!(
+            (
+                base_row.kind,
+                base_row.size,
+                base_row.delta_depth,
+                base_row.base
+            ),
+            (ObjectKind::Blob, 4096, 0, None)
+        );
+        let target_row = report.objects.iter().find(|row| row.id == target).unwrap();
+        assert_eq!(
+            (
+                target_row.kind,
+                target_row.size,
+                target_row.delta_depth,
+                target_row.base
+            ),
+            (ObjectKind::Blob, 4096, 1, Some(base))
+        );
+        assert_eq!(report.delta_histogram.get(&1), Some(&1));
+        assert!(report.objects.iter().all(|row| row.packed_size > 0));
+        assert!(
+            report
+                .objects
+                .windows(2)
+                .all(|rows| rows[0].offset < rows[1].offset)
+        );
+    }
+
+    #[test]
+    fn verify_pack_rejects_corruption_and_resource_exhaustion() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let id = repository
+            .write_object(ObjectKind::Blob, &[b'x'; 128])
+            .unwrap();
+        let written = repository
+            .write_pack(&[id], &PackOptions::default())
+            .unwrap();
+        let limited = super::VerifyPackOptions {
+            max_object_size: 64,
+            ..super::VerifyPackOptions::default()
+        };
+        assert!(matches!(
+            repository.verify_pack(&written.index_path, &limited),
+            Err(Error::ObjectTooLarge { .. })
+        ));
+
+        let mut pack = fs.read(&written.pack_path).unwrap();
+        pack[12] ^= 1;
+        fs.write(&written.pack_path, &pack).unwrap();
+        let reopened = Repository::open(fs, "repo").unwrap();
+        assert!(
+            reopened
+                .verify_pack(&written.index_path, &super::VerifyPackOptions::default())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn builds_a_valid_empty_pack_and_index() {
         let fs = MemoryFileSystem::new();
         let repository = Repository::init(fs, "repo", &InitOptions::default()).unwrap();
@@ -1452,7 +1831,22 @@ mod tests {
             )
             .unwrap();
         assert!(validated.contains(target));
-        repository.publish_validated_pack(&validated).unwrap();
+        let indexed = repository
+            .index_pack(
+                &pack,
+                &crate::IndexPackOptions {
+                    dry_run: true,
+                    ..crate::IndexPackOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(indexed.objects, vec![target]);
+        assert!(indexed.pack_size >= super::PACK_HEADER_SIZE + super::HASH_SIZE);
+        let unpacked = repository
+            .unpack_objects(&pack, &crate::UnpackObjectsOptions::default())
+            .unwrap();
+        assert_eq!(unpacked.written, vec![target]);
+        assert!(repository.contains_loose_object(target).unwrap());
         assert_eq!(
             repository.read_object(target, 1024).unwrap().data(),
             b"hello rust"
@@ -1475,6 +1869,121 @@ mod tests {
         let checksum = sha1::digest(&index);
         index.extend_from_slice(&checksum);
         index
+    }
+
+    #[test]
+    fn rejects_pack_with_bad_trailer_checksum() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let id = repository
+            .write_object(ObjectKind::Blob, b"valid")
+            .unwrap();
+        let source = repository.build_pack(&[id], &PackOptions::default()).unwrap();
+        let mut corrupt = source.pack().to_vec();
+        let len = corrupt.len();
+        corrupt[len - 1] ^= 1;
+        assert!(
+            repository
+                .validate_incoming_pack(
+                    &corrupt,
+                    &IncomingPackOptions {
+                        max_pack_size: 4096,
+                        max_object_size: 4096,
+                        max_total_inflated_size: 4096,
+                        use_deltas: false,
+                    },
+                )
+                .is_err(),
+            "bad checksum should be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_pack_with_truncated_trailer() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let id = repository
+            .write_object(ObjectKind::Blob, b"truncated")
+            .unwrap();
+        let source = repository.build_pack(&[id], &PackOptions::default()).unwrap();
+        let truncated = &source.pack()[..source.pack().len() - super::HASH_SIZE - 1];
+        assert!(
+            repository
+                .validate_incoming_pack(
+                    truncated,
+                    &IncomingPackOptions {
+                        max_pack_size: 4096,
+                        max_object_size: 4096,
+                        max_total_inflated_size: 4096,
+                        use_deltas: false,
+                    },
+                )
+                .is_err(),
+            "truncated pack should be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_pack_object_with_bad_crc32() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let contents = b"crc check";
+        let id = ObjectId::compute(ObjectKind::Blob, contents);
+        let size = u8::try_from(contents.len()).unwrap();
+        let mut entry = vec![0xb0 | (size & 15), size >> 4];
+        entry.extend(miniz_oxide::deflate::compress_to_vec_zlib(contents, 6));
+        let mut pack = b"PACK\0\0\0\x02\0\0\0\x01".to_vec();
+        pack.extend_from_slice(&entry);
+        let pack_checksum = sha1::digest(&pack);
+        pack.extend_from_slice(&pack_checksum);
+        let index = one_object_index(id, crc32(&entry) ^ 1, 12, pack_checksum);
+        fs.write(Path::new("repo/.git/objects/pack/badcrc.pack"), &pack)
+            .unwrap();
+        fs.write(Path::new("repo/.git/objects/pack/badcrc.idx"), &index)
+            .unwrap();
+
+        let reopened = Repository::open(fs, "repo").unwrap();
+        assert!(reopened.read_object(id, 1024).is_err());
+    }
+
+    #[test]
+    fn rejects_thin_ref_delta_when_base_is_missing() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let base = ObjectId::compute(ObjectKind::Blob, b"missing base");
+        let delta = [11, 10, 0x90, 6, 4, b'r', b'u', b's', b't'];
+        let mut entry = super::encode_object_header(7, delta.len() as u64);
+        entry.extend_from_slice(base.as_bytes());
+        entry.extend(miniz_oxide::deflate::compress_to_vec_zlib(&delta, 6));
+        let mut pack = b"PACK\0\0\0\x02\0\0\0\x01".to_vec();
+        pack.extend(entry);
+        pack.extend_from_slice(&sha1::digest(&pack));
+
+        assert!(
+            repository
+                .validate_incoming_pack(
+                    &pack,
+                    &IncomingPackOptions {
+                        max_pack_size: 1024,
+                        max_object_size: 1024,
+                        max_total_inflated_size: 1024,
+                        use_deltas: true,
+                    },
+                )
+                .is_err(),
+            "thin pack without base should be rejected"
+        );
+    }
+
+    #[test]
+    fn ofs_distance_encodes_and_decodes_large_offsets() {
+        for distance in [1, 127, 128, 16383, 16384, 1_000_000, 10_000_000, 1_000_000_000] {
+            let encoded = super::encode_ofs_distance(distance);
+            let mut cursor = 0;
+            let decoded = super::parse_ofs_distance(&encoded, &mut cursor).unwrap();
+            assert_eq!(decoded, distance, "OFS_DELTA round-trip failed for {distance}");
+            assert_eq!(cursor, encoded.len(), "OFS_DELTA consumed all bytes for {distance}");
+        }
     }
 
     fn remove_loose(fs: &MemoryFileSystem, id: ObjectId) {

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 pub use host::HostFileSystem;
 pub use memory::MemoryFileSystem;
+pub(crate) use path::validate as normalize_path;
 
 use crate::Result;
 
@@ -174,7 +175,9 @@ pub trait FileSystem: Send + Sync + 'static {
     /// # Errors
     /// Returns an error when the path is not a regular file or storage fails.
     fn set_executable(&self, path: &Path, executable: bool) -> Result<()>;
-    /// Atomically move `from` to `to`, replacing a file at `to`.
+    /// Atomically move a file, symlink, or complete directory tree from `from`
+    /// to `to`. File destinations may be replaced; callers must require an
+    /// unoccupied destination before moving a directory.
     ///
     /// # Errors
     /// Returns an error when either path is invalid or the move cannot be completed.

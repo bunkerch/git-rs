@@ -4,14 +4,107 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use crate::{
-    EntryMode, Error, FileStat, Index, IndexEntry, ObjectId, ObjectKind, Repository, Result,
-    StatData, Tree, TreeEntry,
+    EntryMode, Error, FileStat, IgnoreMatcher, Index, IndexEntry, ObjectId, ObjectKind, Repository,
+    Result, StatData, Tree, TreeEntry,
 };
 
 #[derive(Clone, Debug)]
 pub struct CheckoutOptions {
     pub force: bool,
     pub max_object_size: usize,
+}
+
+/// Controls worktree-to-index staging.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AddOptions {
+    /// Include ignored untracked paths, equivalent to `git add --force`.
+    pub force: bool,
+}
+
+/// Selection, mutation, and resource policy for an atomic multi-path add.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AddTransactionOptions {
+    pub force: bool,
+    /// Update tracked paths but do not add untracked paths.
+    pub update_only: bool,
+    /// Stage tracked paths missing from the worktree as deletions.
+    pub include_removals: bool,
+    /// Record new paths with the empty-blob ID and intent-to-add flag.
+    pub intent_to_add: bool,
+    /// Override the executable bit for regular files.
+    pub executable: Option<bool>,
+    /// Validate and report without writing objects or the index.
+    pub dry_run: bool,
+    pub max_file_size: usize,
+    pub max_paths: usize,
+}
+
+impl Default for AddTransactionOptions {
+    fn default() -> Self {
+        Self {
+            force: false,
+            update_only: false,
+            include_removals: true,
+            intent_to_add: false,
+            executable: None,
+            dry_run: false,
+            max_file_size: 1024 * 1024 * 1024,
+            max_paths: 1_000_000,
+        }
+    }
+}
+
+/// Paths staged, removed, or skipped by an add transaction.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AddReport {
+    pub staged: Vec<Vec<u8>>,
+    pub removed: Vec<Vec<u8>>,
+    pub ignored: Vec<Vec<u8>>,
+}
+
+/// Safety, selection, and mutation policy for tracked-path removal.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoveOptions {
+    /// Remove only from the index and leave worktree files in place.
+    pub cached: bool,
+    /// Override staged and local modification checks.
+    pub force: bool,
+    /// Permit a selected directory prefix to remove all tracked descendants.
+    pub recursive: bool,
+    /// Succeed when a requested path matches no tracked entry.
+    pub ignore_unmatched: bool,
+    /// Include entries marked `skip-worktree`.
+    pub include_sparse: bool,
+    /// Validate and return selected paths without changing index or worktree.
+    pub dry_run: bool,
+    pub max_object_size: usize,
+}
+
+impl Default for RemoveOptions {
+    fn default() -> Self {
+        Self {
+            cached: false,
+            force: false,
+            recursive: false,
+            ignore_unmatched: false,
+            include_sparse: false,
+            dry_run: false,
+            max_object_size: 1024 * 1024 * 1024,
+        }
+    }
+}
+
+/// Collision, sparse-index, and mutation policy for a tracked move.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MoveOptions {
+    /// Replace an existing regular file/symlink destination and its index entry.
+    pub force: bool,
+    /// Include source entries marked `skip-worktree`.
+    pub include_sparse: bool,
+    /// Perform full validation without changing the worktree or index.
+    pub dry_run: bool,
 }
 
 impl Default for CheckoutOptions {
@@ -34,19 +127,61 @@ impl Repository {
     /// Returns an error for bare repositories, unsafe paths, unsupported file
     /// types, filesystem failures, object-write failures, or index contention.
     pub fn add(&self, path: impl AsRef<Path>) -> Result<usize> {
+        self.add_with_options(path, &AddOptions::default())
+    }
+
+    /// Add with explicit ignore policy.
+    ///
+    /// # Errors
+    /// Returns [`Error::IgnoredPath`] for an explicitly selected ignored file
+    /// unless `force` is enabled, plus the errors documented by [`Self::add`].
+    pub fn add_with_options(&self, path: impl AsRef<Path>, options: &AddOptions) -> Result<usize> {
         let relative = normalize_relative(path.as_ref())?;
         let work_tree = self
             .work_tree()
             .ok_or_else(|| Error::InvalidRepository("cannot add from a bare repository".into()))?;
+        let existing = self.read_index()?;
+        let tracked = existing
+            .entries()
+            .iter()
+            .map(|entry| entry.path().to_vec())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut ignores = self.ignore_matcher()?;
+        ignores.add_worktree_patterns(self, work_tree, b"")?;
+        let mut ignore_base = PathBuf::new();
+        if let Some(parent) = relative.parent() {
+            for component in parent.components() {
+                if let Component::Normal(component) = component {
+                    ignore_base.push(component);
+                    ignores.add_worktree_patterns(self, work_tree, &index_path(&ignore_base)?)?;
+                }
+            }
+        }
         let mut added = Vec::new();
         let target = work_tree.join(&relative);
         match self.filesystem().metadata(&target) {
-            Ok(_) => self.collect_entries(work_tree, &relative, &mut added)?,
+            Ok(metadata) => {
+                let selected = index_path(&relative)?;
+                if !options.force
+                    && !metadata.is_dir()
+                    && !tracked.contains(&selected)
+                    && ignores.is_ignored(&selected, false)
+                {
+                    return Err(Error::IgnoredPath(relative));
+                }
+                self.collect_entries(
+                    work_tree,
+                    &relative,
+                    &tracked,
+                    &mut ignores,
+                    options.force,
+                    &mut added,
+                )?;
+            }
             Err(Error::NotFound(_)) => {}
             Err(error) => return Err(error),
         }
 
-        let existing = self.read_index()?;
         let prefix = index_path(&relative)?;
         let mut entries = existing.entries().to_vec();
         entries.retain(|entry| !path_is_selected(entry.path(), &prefix));
@@ -54,6 +189,475 @@ impl Repository {
         entries.extend(added);
         self.write_index(&Index::new(existing.version(), entries)?)?;
         Ok(count)
+    }
+
+    /// Atomically stage multiple literal files/directories and their deletions.
+    ///
+    /// All paths, ignores, metadata, and file contents are preflighted before
+    /// object or index publication. Selections are literal repository-relative
+    /// paths; a selected directory recursively covers its descendants.
+    ///
+    /// # Errors
+    /// Returns an error for an empty or excessive selection, unmatched paths,
+    /// unsafe paths, ignored explicit files, oversized inputs, bare repositories,
+    /// unsupported file types, or object/index storage failures.
+    #[allow(clippy::too_many_lines)]
+    pub fn add_paths<P: AsRef<Path>>(
+        &self,
+        paths: &[P],
+        options: &AddTransactionOptions,
+    ) -> Result<AddReport> {
+        if paths.is_empty() || paths.len() > options.max_paths {
+            return Err(Error::InvalidRepository("invalid add path count".into()));
+        }
+        let work_tree = self
+            .work_tree()
+            .ok_or_else(|| Error::InvalidRepository("cannot add from a bare repository".into()))?;
+        let existing = self.read_index()?;
+        let tracked = existing
+            .entries()
+            .iter()
+            .map(|entry| entry.path().to_vec())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut selections = Vec::with_capacity(paths.len());
+        let mut pending = BTreeMap::<Vec<u8>, PendingAdd>::new();
+        let mut ignored = std::collections::BTreeSet::new();
+        for path in paths {
+            let relative = normalize_relative(path.as_ref())?;
+            let prefix = index_path(&relative)?;
+            let tracked_match = tracked
+                .iter()
+                .any(|candidate| path_is_selected(candidate, &prefix));
+            let target = work_tree.join(&relative);
+            let metadata = match self.filesystem().metadata(&target) {
+                Ok(metadata) => Some(metadata),
+                Err(Error::NotFound(_)) => None,
+                Err(error) => return Err(error),
+            };
+            if metadata.is_none() && !tracked_match {
+                return Err(Error::InvalidPath(relative));
+            }
+            let mut matcher = self.ignore_matcher()?;
+            matcher.add_worktree_patterns(self, work_tree, b"")?;
+            self.collect_add_plan(
+                work_tree,
+                &relative,
+                &tracked,
+                &mut matcher,
+                options,
+                true,
+                &mut pending,
+                &mut ignored,
+            )?;
+            selections.push(prefix);
+        }
+
+        let removed = existing
+            .entries()
+            .iter()
+            .filter(|entry| {
+                selections
+                    .iter()
+                    .any(|prefix| path_is_selected(entry.path(), prefix))
+                    && !pending.contains_key(entry.path())
+                    && options.include_removals
+            })
+            .map(|entry| entry.path().to_vec())
+            .collect::<std::collections::BTreeSet<_>>();
+        if pending
+            .len()
+            .saturating_add(removed.len())
+            .saturating_add(ignored.len())
+            > options.max_paths
+        {
+            return Err(Error::InvalidRepository(
+                "add result exceeds path limit".into(),
+            ));
+        }
+        let staged = pending.keys().cloned().collect::<Vec<_>>();
+        if !options.dry_run {
+            let mut entries = existing.entries().to_vec();
+            entries.retain(|entry| {
+                !pending.contains_key(entry.path()) && !removed.contains(entry.path())
+            });
+            for (path, plan) in pending {
+                let is_new = !tracked.contains(&path);
+                let (id, stat) = if options.intent_to_add && is_new {
+                    (
+                        ObjectId::compute(ObjectKind::Blob, b""),
+                        StatData::default(),
+                    )
+                } else {
+                    (
+                        self.write_object(ObjectKind::Blob, &plan.contents)?,
+                        plan.stat,
+                    )
+                };
+                entries.push(
+                    IndexEntry::new(path, plan.mode, id, stat)?
+                        .with_intent_to_add(options.intent_to_add && is_new),
+                );
+            }
+            let version = if options.intent_to_add && existing.version() == crate::IndexVersion::V2
+            {
+                crate::IndexVersion::V3
+            } else {
+                existing.version()
+            };
+            self.write_index(&Index::new(version, entries)?)?;
+        }
+        Ok(AddReport {
+            staged,
+            removed: removed.iter().cloned().collect(),
+            ignored: ignored.into_iter().collect(),
+        })
+    }
+
+    /// Remove one or more literal tracked paths from the index and worktree.
+    ///
+    /// A path naming a tracked directory prefix requires `recursive`. All
+    /// selections and content-safety checks finish before the first mutation.
+    /// This method intentionally accepts literal repository paths rather than
+    /// CLI pathspec syntax; callers can perform their own pattern expansion.
+    ///
+    /// # Errors
+    /// Returns an error for no paths, unsafe/unmatched/recursive selections,
+    /// sparse entries without opt-in, local or staged changes without force,
+    /// object bounds, index contention, or filesystem failures.
+    #[allow(clippy::too_many_lines)]
+    pub fn remove<P: AsRef<Path>>(
+        &self,
+        paths: &[P],
+        options: &RemoveOptions,
+    ) -> Result<Vec<Vec<u8>>> {
+        if paths.is_empty() {
+            return Err(Error::InvalidPath(PathBuf::new()));
+        }
+        let work_tree = if options.cached {
+            self.work_tree()
+        } else {
+            Some(self.work_tree().ok_or_else(|| {
+                Error::InvalidRepository("worktree removal requires a non-bare repository".into())
+            })?)
+        };
+        let index = self.read_index()?;
+        let requested = paths
+            .iter()
+            .map(|path| normalize_relative(path.as_ref()).and_then(|path| index_path(&path)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut selected = BTreeMap::<Vec<u8>, Vec<&IndexEntry>>::new();
+        for prefix in &requested {
+            let matches = index
+                .entries()
+                .iter()
+                .filter(|entry| path_is_selected(entry.path(), prefix))
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                if !options.ignore_unmatched {
+                    return Err(Error::NotFound(worktree_path(prefix)?));
+                }
+                continue;
+            }
+            let recursive_match = matches.iter().any(|entry| entry.path() != prefix);
+            if recursive_match && !options.recursive {
+                return Err(Error::InvalidRepository(format!(
+                    "not removing `{}` recursively without recursive=true",
+                    String::from_utf8_lossy(prefix)
+                )));
+            }
+            for entry in matches {
+                if entry.skip_worktree() && !options.include_sparse {
+                    return Err(Error::InvalidRepository(format!(
+                        "path `{}` is outside the sparse worktree",
+                        String::from_utf8_lossy(entry.path())
+                    )));
+                }
+                selected
+                    .entry(entry.path().to_vec())
+                    .or_default()
+                    .push(entry);
+            }
+        }
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let head = match self.resolve_reference("HEAD") {
+            Ok(id) => self
+                .flattened_tree(
+                    self.read_commit(id, options.max_object_size)?.tree(),
+                    options.max_object_size,
+                )?
+                .into_iter()
+                .map(|entry| (entry.path, (entry.raw_mode, entry.id)))
+                .collect::<BTreeMap<_, _>>(),
+            Err(Error::NotFound(_)) => BTreeMap::new(),
+            Err(error) => return Err(error),
+        };
+        if !options.force {
+            let mut conflicts = Vec::new();
+            for (path, entries) in &selected {
+                let conflict_stages = entries
+                    .iter()
+                    .map(|entry| entry.stage())
+                    .collect::<std::collections::BTreeSet<_>>();
+                if conflict_stages.iter().any(|stage| *stage != 0) {
+                    continue;
+                }
+                let entry = entries[0];
+                let staged = head
+                    .get(path)
+                    .is_none_or(|(mode, id)| *mode != entry.mode() || *id != entry.id());
+                let local = match work_tree {
+                    Some(root) => {
+                        let full = root.join(worktree_path(path)?);
+                        match self.filesystem().metadata(&full) {
+                            Ok(metadata) if metadata.is_dir() && entry.mode() != 0o160_000 => None,
+                            Ok(_) => Some(!self.worktree_matches(entry, &full)?),
+                            Err(Error::NotFound(_)) => None,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    None => Some(false),
+                };
+                let Some(local) = local else { continue };
+                let unsafe_removal = if options.cached {
+                    local && staged && !entry.intent_to_add()
+                } else {
+                    local || staged
+                };
+                if unsafe_removal {
+                    conflicts.push(String::from_utf8_lossy(path).into_owned());
+                }
+            }
+            if !conflicts.is_empty() {
+                return Err(Error::CheckoutConflict(conflicts));
+            }
+        }
+
+        let removed = selected.keys().cloned().collect::<Vec<_>>();
+        if options.dry_run {
+            return Ok(removed);
+        }
+        let mut mutation_error = None;
+        if !options.cached {
+            let root = work_tree.ok_or_else(|| {
+                Error::InvalidRepository("worktree removal requires a non-bare repository".into())
+            })?;
+            for (removed_from_worktree, path) in removed.iter().enumerate() {
+                let full = root.join(worktree_path(path)?);
+                let entry = selected[path][0];
+                let result = match self.filesystem().metadata(&full) {
+                    Ok(metadata) if metadata.is_dir() && entry.mode() == 0o160_000 => {
+                        remove_worktree_tree(self, &full, options.force)
+                    }
+                    Ok(metadata) if metadata.is_dir() => Ok(()),
+                    Ok(_) => self.filesystem().remove_file(&full),
+                    Err(Error::NotFound(_)) => Ok(()),
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
+                    if removed_from_worktree == 0 {
+                        return Err(error);
+                    }
+                    mutation_error = Some(error);
+                    break;
+                }
+                if let Err(error) = self.prune_empty_parents(root, worktree_path(path)?.parent()) {
+                    mutation_error = Some(error);
+                    break;
+                }
+            }
+        }
+        let remaining = index
+            .entries()
+            .iter()
+            .filter(|entry| !selected.contains_key(entry.path()))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.write_index(&Index::new(index.version(), remaining)?)?;
+        if let Some(error) = mutation_error {
+            return Err(error);
+        }
+        Ok(removed)
+    }
+
+    /// Move one literal tracked file, gitlink, or directory prefix.
+    ///
+    /// Staged object IDs, stat data, stages, and extended index flags are
+    /// preserved under the destination path. Local worktree modifications and
+    /// untracked files inside a moved directory travel with it. The destination
+    /// is interpreted literally (not as the CLI's multi-source directory form).
+    ///
+    /// # Errors
+    /// Returns an error for unsafe paths, a missing/untracked source, unresolved
+    /// stages, sparse entries without opt-in, self-nesting, file/directory or
+    /// index collisions, unavailable destination parents, transfer failure, or
+    /// index publication failure.
+    #[allow(clippy::too_many_lines)]
+    pub fn move_path(
+        &self,
+        source: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+        options: &MoveOptions,
+    ) -> Result<usize> {
+        let work_tree = self.work_tree().ok_or_else(|| {
+            Error::InvalidRepository("moving paths requires a non-bare repository".into())
+        })?;
+        let source = normalize_relative(source.as_ref())?;
+        let destination = normalize_relative(destination.as_ref())?;
+        let source_index = index_path(&source)?;
+        let destination_index = index_path(&destination)?;
+        if source_index.is_empty()
+            || destination_index.is_empty()
+            || source_index == destination_index
+        {
+            return Err(Error::InvalidPath(destination));
+        }
+        let index = self.read_index()?;
+        let selected = index
+            .entries()
+            .iter()
+            .filter(|entry| path_is_selected(entry.path(), &source_index))
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            return Err(Error::NotFound(source));
+        }
+        if selected.iter().any(|entry| entry.stage() != 0) {
+            return Err(Error::InvalidRepository(format!(
+                "cannot move unresolved path `{}`",
+                String::from_utf8_lossy(&source_index)
+            )));
+        }
+        if selected.iter().any(|entry| entry.skip_worktree()) && !options.include_sparse {
+            return Err(Error::InvalidRepository(format!(
+                "path `{}` is outside the sparse worktree",
+                String::from_utf8_lossy(&source_index)
+            )));
+        }
+        let exact = selected.iter().find(|entry| entry.path() == source_index);
+        let source_path = work_tree.join(&source);
+        let source_metadata = match self.filesystem().metadata(&source_path) {
+            Ok(metadata) => Some(metadata),
+            Err(Error::NotFound(_))
+                if options.include_sparse && selected.iter().all(|entry| entry.skip_worktree()) =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let directory = source_metadata.is_some_and(crate::Metadata::is_dir)
+            || (source_metadata.is_none() && exact.is_none());
+        if source_metadata.is_some_and(crate::Metadata::is_dir)
+            && exact.is_some_and(|entry| entry.mode() != 0o160_000)
+        {
+            return Err(Error::InvalidRepository(
+                "tracked file source was replaced by a directory".into(),
+            ));
+        }
+        if directory
+            && destination_index.starts_with(&source_index)
+            && destination_index.get(source_index.len()) == Some(&b'/')
+        {
+            return Err(Error::InvalidRepository(
+                "cannot move a directory into itself".into(),
+            ));
+        }
+        if !directory && selected.len() != 1 {
+            return Err(Error::InvalidRepository(
+                "file source also has tracked descendants".into(),
+            ));
+        }
+
+        let destination_path = work_tree.join(&destination);
+        let destination_metadata = match self.filesystem().metadata(&destination_path) {
+            Ok(metadata) => Some(metadata),
+            Err(Error::NotFound(_)) => None,
+            Err(error) => return Err(error),
+        };
+        if directory && destination_metadata.is_some() {
+            return Err(Error::AlreadyExists(destination));
+        }
+        if !directory {
+            if destination_metadata.is_some_and(crate::Metadata::is_dir) {
+                return Err(Error::IsDirectory(destination));
+            }
+            if destination_metadata.is_some() && !options.force {
+                return Err(Error::AlreadyExists(destination));
+            }
+        }
+        if source_metadata.is_some() {
+            let parent = destination_path
+                .parent()
+                .ok_or_else(|| Error::InvalidPath(destination.clone()))?;
+            if !self.filesystem().metadata(parent)?.is_dir() {
+                return Err(Error::NotDirectory(parent.to_path_buf()));
+            }
+        }
+
+        let selected_paths = selected
+            .iter()
+            .map(|entry| entry.path().to_vec())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mappings = selected
+            .iter()
+            .map(|entry| {
+                let suffix = entry
+                    .path()
+                    .strip_prefix(source_index.as_slice())
+                    .ok_or_else(|| {
+                        Error::InvalidRepository("selected path escaped source prefix".into())
+                    })?;
+                let mut path = destination_index.clone();
+                path.extend_from_slice(suffix);
+                Ok((entry.path().to_vec(), path))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut replace_destination = false;
+        for entry in index
+            .entries()
+            .iter()
+            .filter(|entry| !selected_paths.contains(entry.path()))
+        {
+            for (_, new_path) in &mappings {
+                if entry.path() == new_path && !directory && options.force {
+                    if entry.stage() != 0 {
+                        return Err(Error::InvalidRepository(
+                            "cannot overwrite an unresolved destination".into(),
+                        ));
+                    }
+                    replace_destination = true;
+                    continue;
+                }
+                if paths_collide(entry.path(), new_path) {
+                    return Err(Error::AlreadyExists(worktree_path(new_path)?));
+                }
+            }
+        }
+        if options.dry_run {
+            return Ok(mappings.len());
+        }
+
+        if source_metadata.is_some() {
+            if directory {
+                move_worktree_tree(self, &source_path, &destination_path)?;
+            } else {
+                self.filesystem().rename(&source_path, &destination_path)?;
+            }
+            self.prune_empty_parents(work_tree, source.parent())?;
+        }
+        let mapping = mappings.into_iter().collect::<BTreeMap<_, _>>();
+        let mut entries = Vec::with_capacity(index.entries().len());
+        for entry in index.entries() {
+            if let Some(path) = mapping.get(entry.path()) {
+                entries.push(entry.clone().with_path(path.clone())?);
+            } else if !(replace_destination && entry.path() == destination_index) {
+                entries.push(entry.clone());
+            }
+        }
+        let moved = mapping.len();
+        self.write_index(&Index::new(index.version(), entries)?)?;
+        Ok(moved)
     }
 
     /// Write the stage-zero index as a hierarchy of tree objects.
@@ -275,7 +879,7 @@ impl Repository {
         Ok(())
     }
 
-    fn worktree_matches(&self, entry: &IndexEntry, full_path: &Path) -> Result<bool> {
+    pub(crate) fn worktree_matches(&self, entry: &IndexEntry, full_path: &Path) -> Result<bool> {
         let metadata = self.filesystem().metadata(full_path)?;
         let (contents, mode) = if metadata.is_symlink() {
             (self.filesystem().read_link(full_path)?, 0o120_000)
@@ -296,7 +900,11 @@ impl Repository {
         Ok(mode == entry.mode() && ObjectId::compute(ObjectKind::Blob, &contents) == entry.id())
     }
 
-    fn prune_empty_parents(&self, work_tree: &Path, mut parent: Option<&Path>) -> Result<()> {
+    pub(crate) fn prune_empty_parents(
+        &self,
+        work_tree: &Path,
+        mut parent: Option<&Path>,
+    ) -> Result<()> {
         while let Some(relative) = parent {
             if relative.as_os_str().is_empty() {
                 break;
@@ -329,18 +937,38 @@ impl Repository {
         &self,
         work_tree: &Path,
         relative: &Path,
+        tracked: &std::collections::BTreeSet<Vec<u8>>,
+        ignores: &mut IgnoreMatcher,
+        force: bool,
         output: &mut Vec<IndexEntry>,
     ) -> Result<()> {
         let path = work_tree.join(relative);
         let metadata = self.filesystem().metadata(&path)?;
+        let index_path = index_path(relative)?;
         if metadata.is_dir() {
+            ignores.add_worktree_patterns(self, work_tree, &index_path)?;
+            if !force
+                && !index_path.is_empty()
+                && ignores.is_ignored(&index_path, true)
+                && !tracked
+                    .iter()
+                    .any(|tracked| path_is_selected(tracked, &index_path))
+            {
+                return Ok(());
+            }
             for child in self.filesystem().read_dir(&path)? {
                 let child_relative = relative.join(child);
-                if work_tree.join(&child_relative) == self.git_dir() {
+                if child_relative == Path::new(".git")
+                    || work_tree.join(&child_relative) == self.git_dir()
+                {
                     continue;
                 }
-                self.collect_entries(work_tree, &child_relative, output)?;
+                self.collect_entries(work_tree, &child_relative, tracked, ignores, force, output)?;
             }
+            return Ok(());
+        }
+
+        if !force && !tracked.contains(&index_path) && ignores.is_ignored(&index_path, false) {
             return Ok(());
         }
 
@@ -365,13 +993,118 @@ impl Repository {
         };
         let id = self.write_object(kind, &contents)?;
         output.push(IndexEntry::new(
-            index_path(relative)?,
+            index_path,
             mode,
             id,
             index_stat(metadata.stat(), metadata.len()),
         )?);
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_add_plan(
+        &self,
+        work_tree: &Path,
+        relative: &Path,
+        tracked: &std::collections::BTreeSet<Vec<u8>>,
+        ignores: &mut IgnoreMatcher,
+        options: &AddTransactionOptions,
+        explicit: bool,
+        output: &mut BTreeMap<Vec<u8>, PendingAdd>,
+        skipped: &mut std::collections::BTreeSet<Vec<u8>>,
+    ) -> Result<()> {
+        let path = work_tree.join(relative);
+        let metadata = match self.filesystem().metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(Error::NotFound(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let index_path = index_path(relative)?;
+        if metadata.is_dir() {
+            ignores.add_worktree_patterns(self, work_tree, &index_path)?;
+            if !options.force
+                && !index_path.is_empty()
+                && ignores.is_ignored(&index_path, true)
+                && !tracked
+                    .iter()
+                    .any(|candidate| path_is_selected(candidate, &index_path))
+            {
+                if explicit {
+                    return Err(Error::IgnoredPath(relative.to_path_buf()));
+                }
+                skipped.insert(index_path);
+                return Ok(());
+            }
+            for child in self.filesystem().read_dir(&path)? {
+                let child_relative = relative.join(child);
+                if child_relative == Path::new(".git")
+                    || work_tree.join(&child_relative) == self.git_dir()
+                {
+                    continue;
+                }
+                self.collect_add_plan(
+                    work_tree,
+                    &child_relative,
+                    tracked,
+                    ignores,
+                    options,
+                    false,
+                    output,
+                    skipped,
+                )?;
+            }
+            return Ok(());
+        }
+        let is_tracked = tracked.contains(&index_path);
+        if options.update_only && !is_tracked {
+            return Ok(());
+        }
+        if !options.force && !is_tracked && ignores.is_ignored(&index_path, false) {
+            if explicit {
+                return Err(Error::IgnoredPath(relative.to_path_buf()));
+            }
+            skipped.insert(index_path);
+            return Ok(());
+        }
+        if metadata.len() > options.max_file_size as u64 {
+            return Err(Error::ObjectTooLarge {
+                declared: metadata.len(),
+                limit: options.max_file_size,
+            });
+        }
+        let (contents, mode) = if metadata.is_symlink() {
+            (self.filesystem().read_link(&path)?, 0o120_000)
+        } else if metadata.is_file() {
+            let executable = options.executable.unwrap_or(metadata.is_executable());
+            (
+                self.filesystem().read(&path)?,
+                if executable { 0o100_755 } else { 0o100_644 },
+            )
+        } else {
+            return Err(Error::InvalidPath(path));
+        };
+        if contents.len() > options.max_file_size {
+            return Err(Error::ObjectTooLarge {
+                declared: contents.len() as u64,
+                limit: options.max_file_size,
+            });
+        }
+        output.insert(
+            index_path,
+            PendingAdd {
+                contents,
+                mode,
+                stat: index_stat(metadata.stat(), metadata.len()),
+            },
+        );
+        Ok(())
+    }
+}
+
+struct PendingAdd {
+    contents: Vec<u8>,
+    mode: u32,
+    stat: StatData,
 }
 
 #[derive(Clone, Debug)]
@@ -456,7 +1189,7 @@ fn normalize_relative(path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-fn index_stat(stat: FileStat, len: u64) -> StatData {
+pub(crate) fn index_stat(stat: FileStat, len: u64) -> StatData {
     StatData {
         ctime_seconds: stat.ctime_seconds,
         ctime_nanoseconds: stat.ctime_nanoseconds,
@@ -474,6 +1207,105 @@ fn path_is_selected(candidate: &[u8], prefix: &[u8]) -> bool {
     prefix.is_empty()
         || candidate == prefix
         || (candidate.starts_with(prefix) && candidate.get(prefix.len()) == Some(&b'/'))
+}
+
+fn paths_collide(left: &[u8], right: &[u8]) -> bool {
+    path_is_selected(left, right) || path_is_selected(right, left)
+}
+
+fn move_worktree_tree(repository: &Repository, source: &Path, destination: &Path) -> Result<()> {
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+    collect_worktree_move(
+        repository,
+        source,
+        destination,
+        &mut directories,
+        &mut files,
+    )?;
+    let mut created: Vec<PathBuf> = Vec::new();
+    for (_, directory) in &directories {
+        if let Err(error) = repository.filesystem().create_dir_all(directory) {
+            for path in created.iter().rev() {
+                let _ = repository.filesystem().remove_dir(path);
+            }
+            return Err(error);
+        }
+        created.push(directory.clone());
+    }
+    let mut moved = Vec::new();
+    for (from, to) in &files {
+        if let Err(error) = repository.filesystem().rename(from, to) {
+            rollback_worktree_move(repository, &directories, &moved, &created);
+            return Err(error);
+        }
+        moved.push((from.clone(), to.clone()));
+    }
+    for (directory, _) in directories.iter().rev() {
+        if let Err(error) = repository.filesystem().remove_dir(directory) {
+            rollback_worktree_move(repository, &directories, &moved, &created);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn collect_worktree_move(
+    repository: &Repository,
+    source: &Path,
+    destination: &Path,
+    directories: &mut Vec<(PathBuf, PathBuf)>,
+    files: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<()> {
+    directories.push((source.to_path_buf(), destination.to_path_buf()));
+    for child in repository.filesystem().read_dir(source)? {
+        let from = source.join(&child);
+        let to = destination.join(child);
+        if repository.filesystem().metadata(&from)?.is_dir() {
+            collect_worktree_move(repository, &from, &to, directories, files)?;
+        } else {
+            files.push((from, to));
+        }
+    }
+    Ok(())
+}
+
+fn rollback_worktree_move(
+    repository: &Repository,
+    directories: &[(PathBuf, PathBuf)],
+    moved: &[(PathBuf, PathBuf)],
+    created: &[PathBuf],
+) {
+    for (source, _) in directories {
+        let _ = repository.filesystem().create_dir_all(source);
+    }
+    for (from, to) in moved.iter().rev() {
+        let _ = repository.filesystem().rename(to, from);
+    }
+    for path in created.iter().rev() {
+        let _ = repository.filesystem().remove_dir(path);
+    }
+}
+
+pub(crate) fn remove_worktree_tree(
+    repository: &Repository,
+    path: &Path,
+    force: bool,
+) -> Result<()> {
+    let children = repository.filesystem().read_dir(path)?;
+    if !force && !children.is_empty() {
+        return Err(Error::DirectoryNotEmpty(path.to_path_buf()));
+    }
+    for child in children {
+        let child_path = path.join(child);
+        let metadata = repository.filesystem().metadata(&child_path)?;
+        if metadata.is_dir() {
+            remove_worktree_tree(repository, &child_path, true)?;
+        } else {
+            repository.filesystem().remove_file(&child_path)?;
+        }
+    }
+    repository.filesystem().remove_dir(path)
 }
 
 #[cfg(unix)]
@@ -495,7 +1327,7 @@ fn index_path(path: &Path) -> Result<Vec<u8>> {
 
 #[cfg(unix)]
 #[allow(clippy::unnecessary_wraps)]
-fn worktree_path(path: &[u8]) -> Result<PathBuf> {
+pub(crate) fn worktree_path(path: &[u8]) -> Result<PathBuf> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
@@ -507,7 +1339,7 @@ fn worktree_path(path: &[u8]) -> Result<PathBuf> {
 }
 
 #[cfg(not(unix))]
-fn worktree_path(path: &[u8]) -> Result<PathBuf> {
+pub(crate) fn worktree_path(path: &[u8]) -> Result<PathBuf> {
     let text = std::str::from_utf8(path)
         .map_err(|_| Error::InvalidPath(PathBuf::from("non-UTF-8 index path")))?;
     Ok(text.split('/').collect())
@@ -535,7 +1367,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::{FileSystem, InitOptions, MemoryFileSystem};
+    use crate::{FileSystem, IndexVersion, InitOptions, MemoryFileSystem};
 
     #[test]
     fn recursively_adds_files_executables_and_symlinks_in_memory() {
@@ -590,11 +1422,193 @@ mod tests {
     }
 
     #[test]
+    fn multi_add_updates_adds_and_removes_in_one_index_write() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.create_dir_all(Path::new("repo/dir")).unwrap();
+        fs.write(Path::new("repo/dir/keep"), b"old").unwrap();
+        fs.write(Path::new("repo/dir/remove"), b"gone").unwrap();
+        repository.add("dir").unwrap();
+        fs.write(Path::new("repo/dir/keep"), b"new").unwrap();
+        fs.remove_file(Path::new("repo/dir/remove")).unwrap();
+        fs.write(Path::new("repo/dir/add"), b"added").unwrap();
+
+        let report = repository
+            .add_paths(&["dir"], &AddTransactionOptions::default())
+            .unwrap();
+        assert_eq!(report.staged, [b"dir/add".to_vec(), b"dir/keep".to_vec()]);
+        assert_eq!(report.removed, [b"dir/remove".to_vec()]);
+        let index = repository.read_index().unwrap();
+        assert_eq!(index.entries().len(), 2);
+        assert_eq!(
+            repository
+                .read_object(index.entries()[1].id(), 32)
+                .unwrap()
+                .data(),
+            b"new"
+        );
+    }
+
+    #[test]
+    fn add_transaction_supports_dry_run_update_intent_chmod_and_limits() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.write(Path::new("repo/tracked"), b"old").unwrap();
+        repository.add("tracked").unwrap();
+        fs.write(Path::new("repo/tracked"), b"new").unwrap();
+        fs.write(Path::new("repo/untracked"), b"value").unwrap();
+        let before = repository.read_index().unwrap().encode().unwrap();
+        let dry = repository
+            .add_paths(
+                &["tracked", "untracked"],
+                &AddTransactionOptions {
+                    dry_run: true,
+                    executable: Some(true),
+                    ..AddTransactionOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(dry.staged.len(), 2);
+        assert_eq!(repository.read_index().unwrap().encode().unwrap(), before);
+
+        repository
+            .add_paths(
+                &["tracked", "untracked"],
+                &AddTransactionOptions {
+                    update_only: true,
+                    executable: Some(true),
+                    ..AddTransactionOptions::default()
+                },
+            )
+            .unwrap();
+        let index = repository.read_index().unwrap();
+        assert_eq!(index.entries().len(), 1);
+        assert_eq!(index.entries()[0].mode(), 0o100_755);
+
+        repository
+            .add_paths(
+                &["untracked"],
+                &AddTransactionOptions {
+                    intent_to_add: true,
+                    ..AddTransactionOptions::default()
+                },
+            )
+            .unwrap();
+        let intent = repository
+            .read_index()
+            .unwrap()
+            .entries()
+            .iter()
+            .find(|entry| entry.path() == b"untracked")
+            .unwrap()
+            .clone();
+        assert!(intent.intent_to_add());
+        assert_eq!(intent.id(), ObjectId::compute(ObjectKind::Blob, b""));
+        assert!(matches!(
+            repository.add_paths(
+                &["untracked"],
+                &AddTransactionOptions {
+                    max_file_size: 4,
+                    ..AddTransactionOptions::default()
+                }
+            ),
+            Err(Error::ObjectTooLarge { .. })
+        ));
+    }
+
+    #[test]
     fn never_adds_repository_metadata() {
         let fs = MemoryFileSystem::new();
         let repository = Repository::init(fs, "repo", &InitOptions::default()).unwrap();
         assert_eq!(repository.add(".").unwrap(), 0);
         assert!(repository.read_index().unwrap().entries().is_empty());
+    }
+
+    #[test]
+    fn recursive_add_skips_ignored_untracked_but_updates_tracked_files() {
+        let filesystem = MemoryFileSystem::new();
+        let repository =
+            Repository::init(filesystem.clone(), "repo", &InitOptions::default()).unwrap();
+        filesystem
+            .write(Path::new("repo/tracked.log"), b"old")
+            .unwrap();
+        repository.add("tracked.log").unwrap();
+        filesystem
+            .write(Path::new("repo/.gitignore"), b"*.log\nbuild/\n")
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/tracked.log"), b"new")
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/untracked.log"), b"skip")
+            .unwrap();
+        filesystem.create_dir_all(Path::new("repo/build")).unwrap();
+        filesystem
+            .write(Path::new("repo/build/output"), b"skip")
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/visible.txt"), b"add")
+            .unwrap();
+
+        assert!(matches!(
+            repository.add("untracked.log"),
+            Err(Error::IgnoredPath(_))
+        ));
+        assert!(
+            repository
+                .read_index()
+                .unwrap()
+                .entries()
+                .iter()
+                .all(|entry| { entry.path() != b"untracked.log" })
+        );
+
+        repository
+            .add_with_options("untracked.log", &AddOptions { force: true })
+            .unwrap();
+        assert!(
+            repository
+                .read_index()
+                .unwrap()
+                .entries()
+                .iter()
+                .any(|entry| { entry.path() == b"untracked.log" })
+        );
+        let force_index = repository.read_index().unwrap();
+        let retained = force_index
+            .entries()
+            .iter()
+            .filter(|entry| entry.path() != b"untracked.log")
+            .cloned()
+            .collect();
+        repository
+            .write_index(&Index::new(force_index.version(), retained).unwrap())
+            .unwrap();
+
+        repository.add(".").unwrap();
+        let index = repository.read_index().unwrap();
+        let paths = index
+            .entries()
+            .iter()
+            .map(|entry| entry.path().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                b".gitignore".to_vec(),
+                b"tracked.log".to_vec(),
+                b"visible.txt".to_vec()
+            ]
+        );
+        let tracked = index
+            .entries()
+            .iter()
+            .find(|entry| entry.path() == b"tracked.log")
+            .unwrap();
+        assert_eq!(
+            repository.read_object(tracked.id(), 1024).unwrap().data(),
+            b"new"
+        );
     }
 
     #[test]
@@ -748,5 +1762,424 @@ mod tests {
         ));
         assert_eq!(fs.read(Path::new("repo/untracked")).unwrap(), b"local");
         assert!(repository.read_index().unwrap().entries().is_empty());
+    }
+
+    fn removal_fixture() -> (Repository, MemoryFileSystem) {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.create_dir_all(Path::new("repo/dir")).unwrap();
+        fs.write(Path::new("repo/dir/one"), b"one").unwrap();
+        fs.write(Path::new("repo/dir/two"), b"two").unwrap();
+        fs.write(Path::new("repo/root"), b"root").unwrap();
+        repository.add("dir").unwrap();
+        repository.add("root").unwrap();
+        let signature = crate::Signature::new("Remove", "remove@example.com", 100, 0).unwrap();
+        repository
+            .commit_index(
+                b"base",
+                &signature,
+                &signature,
+                &crate::CommitOptions::default(),
+            )
+            .unwrap();
+        (repository, fs)
+    }
+
+    #[test]
+    fn removes_clean_files_and_requires_recursive_for_prefixes() {
+        let (repository, fs) = removal_fixture();
+        assert!(
+            repository
+                .remove(&["dir"], &RemoveOptions::default())
+                .is_err()
+        );
+        assert!(fs.exists(Path::new("repo/dir/one")).unwrap());
+        let removed = repository
+            .remove(
+                &["dir"],
+                &RemoveOptions {
+                    recursive: true,
+                    ..RemoveOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(removed, vec![b"dir/one".to_vec(), b"dir/two".to_vec()]);
+        assert!(!fs.exists(Path::new("repo/dir")).unwrap());
+        assert_eq!(repository.read_index().unwrap().entries().len(), 1);
+    }
+
+    #[test]
+    fn protects_local_and_staged_changes_unless_forced() {
+        let (repository, fs) = removal_fixture();
+        fs.write(Path::new("repo/root"), b"local").unwrap();
+        assert!(matches!(
+            repository.remove(&["root"], &RemoveOptions::default()),
+            Err(Error::CheckoutConflict(_))
+        ));
+        assert!(fs.exists(Path::new("repo/root")).unwrap());
+        repository
+            .remove(
+                &["root"],
+                &RemoveOptions {
+                    force: true,
+                    ..RemoveOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(!fs.exists(Path::new("repo/root")).unwrap());
+
+        let (repository, fs) = removal_fixture();
+        fs.write(Path::new("repo/root"), b"staged").unwrap();
+        repository.add("root").unwrap();
+        assert!(
+            repository
+                .remove(&["root"], &RemoveOptions::default())
+                .is_err()
+        );
+        repository
+            .remove(
+                &["root"],
+                &RemoveOptions {
+                    cached: true,
+                    ..RemoveOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(fs.read(Path::new("repo/root")).unwrap(), b"staged");
+    }
+
+    #[test]
+    fn cached_removal_requires_index_to_match_head_or_worktree() {
+        let (repository, fs) = removal_fixture();
+        fs.write(Path::new("repo/root"), b"staged").unwrap();
+        repository.add("root").unwrap();
+        fs.write(Path::new("repo/root"), b"different local")
+            .unwrap();
+        assert!(
+            repository
+                .remove(
+                    &["root"],
+                    &RemoveOptions {
+                        cached: true,
+                        ..RemoveOptions::default()
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            repository
+                .read_index()
+                .unwrap()
+                .entries()
+                .iter()
+                .any(|entry| entry.path() == b"root")
+        );
+
+        let (repository, fs) = removal_fixture();
+        fs.write(Path::new("repo/root"), b"local only").unwrap();
+        repository
+            .remove(
+                &["root"],
+                &RemoveOptions {
+                    cached: true,
+                    ..RemoveOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(fs.read(Path::new("repo/root")).unwrap(), b"local only");
+    }
+
+    #[test]
+    fn accepts_missing_and_unmerged_paths_and_preflights_dry_run() {
+        let (repository, fs) = removal_fixture();
+        fs.write(Path::new("repo/root"), b"staged then missing")
+            .unwrap();
+        repository.add("root").unwrap();
+        fs.remove_file(Path::new("repo/root")).unwrap();
+        repository
+            .remove(&["root"], &RemoveOptions::default())
+            .unwrap();
+
+        let blob = repository.write_object(ObjectKind::Blob, b"ours").unwrap();
+        let mut entries = repository.read_index().unwrap().entries().to_vec();
+        entries.push(
+            IndexEntry::with_stage("conflict", 0o100_644, blob, StatData::default(), 2).unwrap(),
+        );
+        entries.push(
+            IndexEntry::with_stage("conflict", 0o100_644, blob, StatData::default(), 3).unwrap(),
+        );
+        repository
+            .write_index(&Index::new(IndexVersion::V3, entries).unwrap())
+            .unwrap();
+        repository
+            .remove(&["conflict"], &RemoveOptions::default())
+            .unwrap();
+        assert!(
+            repository
+                .read_index()
+                .unwrap()
+                .entries()
+                .iter()
+                .all(|entry| entry.path() != b"conflict")
+        );
+
+        let before = repository.read_index().unwrap();
+        let selected = repository
+            .remove(
+                &["dir/one", "absent"],
+                &RemoveOptions {
+                    dry_run: true,
+                    ignore_unmatched: true,
+                    ..RemoveOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(selected, vec![b"dir/one".to_vec()]);
+        assert_eq!(repository.read_index().unwrap(), before);
+        assert!(fs.exists(Path::new("repo/dir/one")).unwrap());
+    }
+
+    #[test]
+    fn sparse_entries_require_explicit_inclusion() {
+        let (repository, fs) = removal_fixture();
+        let entries = repository
+            .read_index()
+            .unwrap()
+            .entries()
+            .iter()
+            .cloned()
+            .map(|entry| {
+                if entry.path() == b"root" {
+                    entry.with_skip_worktree(true)
+                } else {
+                    entry
+                }
+            })
+            .collect::<Vec<_>>();
+        repository
+            .write_index(&Index::new(IndexVersion::V3, entries).unwrap())
+            .unwrap();
+        assert!(
+            repository
+                .remove(
+                    &["root"],
+                    &RemoveOptions {
+                        cached: true,
+                        ..RemoveOptions::default()
+                    }
+                )
+                .is_err()
+        );
+        repository
+            .remove(
+                &["root"],
+                &RemoveOptions {
+                    cached: true,
+                    include_sparse: true,
+                    ..RemoveOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(fs.exists(Path::new("repo/root")).unwrap());
+    }
+
+    #[test]
+    fn moves_file_with_staged_and_local_layers_intact() {
+        let (repository, fs) = removal_fixture();
+        fs.write(Path::new("repo/root"), b"staged").unwrap();
+        repository.add("root").unwrap();
+        let staged = repository
+            .read_index()
+            .unwrap()
+            .entries()
+            .iter()
+            .find(|entry| entry.path() == b"root")
+            .unwrap()
+            .id();
+        fs.write(Path::new("repo/root"), b"local").unwrap();
+        assert_eq!(
+            repository
+                .move_path("root", "renamed", &MoveOptions::default())
+                .unwrap(),
+            1
+        );
+        assert!(!fs.exists(Path::new("repo/root")).unwrap());
+        assert_eq!(fs.read(Path::new("repo/renamed")).unwrap(), b"local");
+        let entry = repository
+            .read_index()
+            .unwrap()
+            .entries()
+            .iter()
+            .find(|entry| entry.path() == b"renamed")
+            .unwrap()
+            .clone();
+        assert_eq!(entry.id(), staged);
+    }
+
+    #[test]
+    fn moves_directory_with_tracked_and_untracked_contents() {
+        let (repository, fs) = removal_fixture();
+        fs.write(Path::new("repo/dir/untracked"), b"extra").unwrap();
+        assert_eq!(
+            repository
+                .move_path("dir", "moved", &MoveOptions::default())
+                .unwrap(),
+            2
+        );
+        assert!(!fs.exists(Path::new("repo/dir")).unwrap());
+        assert_eq!(fs.read(Path::new("repo/moved/one")).unwrap(), b"one");
+        assert_eq!(
+            fs.read(Path::new("repo/moved/untracked")).unwrap(),
+            b"extra"
+        );
+        assert_eq!(
+            repository
+                .read_index()
+                .unwrap()
+                .entries()
+                .iter()
+                .map(|entry| entry.path().to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                b"moved/one".to_vec(),
+                b"moved/two".to_vec(),
+                b"root".to_vec()
+            ]
+        );
+        assert!(
+            repository
+                .move_path("moved", "moved/inside", &MoveOptions::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn force_replaces_only_file_destinations_and_dry_run_is_immutable() {
+        let (repository, fs) = removal_fixture();
+        assert!(
+            repository
+                .move_path("root", "dir/one", &MoveOptions::default())
+                .is_err()
+        );
+        assert_eq!(fs.read(Path::new("repo/root")).unwrap(), b"root");
+        let before = repository.read_index().unwrap();
+        assert_eq!(
+            repository
+                .move_path(
+                    "root",
+                    "dir/one",
+                    &MoveOptions {
+                        force: true,
+                        dry_run: true,
+                        ..MoveOptions::default()
+                    }
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(repository.read_index().unwrap(), before);
+        repository
+            .move_path(
+                "root",
+                "dir/one",
+                &MoveOptions {
+                    force: true,
+                    ..MoveOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(fs.read(Path::new("repo/dir/one")).unwrap(), b"root");
+        assert!(
+            !repository
+                .read_index()
+                .unwrap()
+                .entries()
+                .iter()
+                .any(|entry| entry.path() == b"root")
+        );
+
+        let (repository, fs) = removal_fixture();
+        fs.write(Path::new("repo/untracked"), b"occupied").unwrap();
+        assert!(
+            repository
+                .move_path("root", "untracked", &MoveOptions::default())
+                .is_err()
+        );
+        repository
+            .move_path(
+                "root",
+                "untracked",
+                &MoveOptions {
+                    force: true,
+                    ..MoveOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(fs.read(Path::new("repo/untracked")).unwrap(), b"root");
+    }
+
+    #[test]
+    fn rejects_unresolved_and_handles_opted_in_sparse_index_only_move() {
+        let (repository, fs) = removal_fixture();
+        let blob = repository
+            .write_object(ObjectKind::Blob, b"conflict")
+            .unwrap();
+        let mut entries = repository.read_index().unwrap().entries().to_vec();
+        entries.push(
+            IndexEntry::with_stage("conflict", 0o100_644, blob, StatData::default(), 2).unwrap(),
+        );
+        repository
+            .write_index(&Index::new(IndexVersion::V3, entries).unwrap())
+            .unwrap();
+        assert!(
+            repository
+                .move_path("conflict", "resolved", &MoveOptions::default())
+                .is_err()
+        );
+
+        let entries = repository
+            .read_index()
+            .unwrap()
+            .entries()
+            .iter()
+            .filter(|entry| entry.path() != b"conflict")
+            .cloned()
+            .map(|entry| {
+                if entry.path() == b"root" {
+                    entry.with_skip_worktree(true)
+                } else {
+                    entry
+                }
+            })
+            .collect::<Vec<_>>();
+        repository
+            .write_index(&Index::new(IndexVersion::V3, entries).unwrap())
+            .unwrap();
+        fs.remove_file(Path::new("repo/root")).unwrap();
+        assert!(
+            repository
+                .move_path("root", "renamed", &MoveOptions::default())
+                .is_err()
+        );
+        repository
+            .move_path(
+                "root",
+                "renamed",
+                &MoveOptions {
+                    include_sparse: true,
+                    ..MoveOptions::default()
+                },
+            )
+            .unwrap();
+        let renamed = repository
+            .read_index()
+            .unwrap()
+            .entries()
+            .iter()
+            .find(|entry| entry.path() == b"renamed")
+            .unwrap()
+            .clone();
+        assert!(renamed.skip_worktree());
+        assert!(!fs.exists(Path::new("repo/renamed")).unwrap());
     }
 }

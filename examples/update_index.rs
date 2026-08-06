@@ -1,42 +1,41 @@
 use std::env;
 
-use git_rs::{HostFileSystem, Index, IndexEntry, IndexVersion, ObjectKind, Repository, StatData};
+use git_rs::{HostFileSystem, IndexVersion, Repository, UpdateIndexCommand, UpdateIndexOptions};
 
 fn main() -> git_rs::Result<()> {
-    let repository_path = env::args().nth(1).unwrap_or_else(|| ".".to_owned());
-    let path = env::args()
-        .nth(2)
-        .expect("usage: update_index <repository> <path> <contents>");
-    let contents = env::args().nth(3).unwrap_or_default().into_bytes();
-    let requested_version = env::args().nth(4);
-    let repository = Repository::open(HostFileSystem::new(".")?, repository_path)?;
-    let id = repository.write_object(ObjectKind::Blob, &contents)?;
-    let path = path.into_bytes();
-    let entry = IndexEntry::new(
-        path.clone(),
-        0o100_644,
-        id,
-        StatData {
-            size: u32::try_from(contents.len()).unwrap_or(u32::MAX),
-            ..StatData::default()
-        },
-    )?;
-    let existing = repository.read_index()?;
-    let version = match requested_version.as_deref() {
-        None => existing.version(),
-        Some("2") => IndexVersion::V2,
-        Some("3") => IndexVersion::V3,
-        Some("4") => IndexVersion::V4,
-        Some(value) => {
-            return Err(git_rs::Error::InvalidRepository(format!(
-                "unsupported requested index version {value}"
-            )));
+    let mut arguments = env::args().skip(1);
+    let repository_path = arguments.next().unwrap_or_else(|| ".".to_owned());
+    let path = arguments
+        .next()
+        .expect("usage: update_index <repository> <path> [--add] [--remove] [--replace] [--info-only] [--index-version=2|3|4]");
+    let mut options = UpdateIndexOptions::default();
+    for argument in arguments {
+        match argument.as_str() {
+            "--add" => options.allow_add = true,
+            "--remove" => options.allow_remove = true,
+            "--replace" => options.allow_replace = true,
+            "--info-only" => options.info_only = true,
+            "--index-version=2" => options.version = Some(IndexVersion::V2),
+            "--index-version=3" => options.version = Some(IndexVersion::V3),
+            "--index-version=4" => options.version = Some(IndexVersion::V4),
+            value => {
+                return Err(git_rs::Error::InvalidRepository(format!(
+                    "unsupported update-index option `{value}`"
+                )));
+            }
         }
-    };
-    let mut entries = existing.entries().to_vec();
-    entries.retain(|existing| existing.path() != path);
-    entries.push(entry);
-    repository.write_index(&Index::new(version, entries)?)?;
-    println!("{id}");
+    }
+    let repository = Repository::open(HostFileSystem::new(&repository_path)?, ".")?;
+    let report = repository.update_index(
+        &[UpdateIndexCommand::Worktree {
+            path: path.into_bytes(),
+        }],
+        &options,
+    )?;
+    println!(
+        "updated={} removed={}",
+        report.updated.len(),
+        report.removed.len()
+    );
     Ok(())
 }

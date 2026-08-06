@@ -11,6 +11,7 @@ pub struct Signature {
     timestamp: i64,
     offset_minutes: i16,
     negative_zero: bool,
+    timezone: [u8; 5],
 }
 
 impl Signature {
@@ -27,26 +28,29 @@ impl Signature {
     ) -> Result<Self> {
         let name = name.into();
         let email = email.into();
-        if name.is_empty()
-            || email.is_empty()
-            || name.contains(['<', '>', '\n', '\r', '\0'])
-            || email.contains(['<', '>', '\n', '\r', '\0'])
-        {
-            return Err(Error::InvalidCommit(
-                "invalid identity name or email".into(),
-            ));
-        }
+        validate_identity(&name, &email)?;
         if !(-1439..=1439).contains(&offset_minutes) {
             return Err(Error::InvalidCommit(
                 "timezone offset is out of range".into(),
             ));
         }
+        let absolute = offset_minutes.unsigned_abs();
+        let timezone = format!(
+            "{}{:02}{:02}",
+            if offset_minutes < 0 { '-' } else { '+' },
+            absolute / 60,
+            absolute % 60
+        )
+        .into_bytes()
+        .try_into()
+        .map_err(|_| Error::InvalidCommit("invalid generated timezone".into()))?;
         Ok(Self {
             name,
             email,
             timestamp,
             offset_minutes,
             negative_zero: false,
+            timezone,
         })
     }
 
@@ -61,6 +65,7 @@ impl Signature {
     ) -> Result<Self> {
         let mut signature = Self::new(name, email, timestamp, 0)?;
         signature.negative_zero = true;
+        signature.timezone = *b"-0000";
         Ok(signature)
     }
 
@@ -89,20 +94,13 @@ impl Signature {
         self.negative_zero
     }
 
-    pub(crate) fn encode(&self) -> String {
-        let absolute = self.offset_minutes.unsigned_abs();
-        let sign = if self.offset_minutes < 0 || self.negative_zero {
-            '-'
-        } else {
-            '+'
-        };
+    /// Encode the canonical `name <email> timestamp timezone` form used by Git.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        let timezone = std::str::from_utf8(&self.timezone).unwrap_or("+0000");
         format!(
-            "{} <{}> {} {sign}{:02}{:02}",
-            self.name,
-            self.email,
-            self.timestamp,
-            absolute / 60,
-            absolute % 60
+            "{} <{}> {} {timezone}",
+            self.name, self.email, self.timestamp
         )
     }
 
@@ -123,6 +121,12 @@ impl Signature {
         }
         let name = &identity[..email_start];
         let email = &identity[email_start + 2..identity.len() - 1];
+        if timestamp.is_empty()
+            || !timestamp.bytes().all(|byte| byte.is_ascii_digit())
+            || (timestamp.len() > 1 && timestamp.starts_with('0'))
+        {
+            return Err(Error::InvalidCommit("invalid identity timestamp".into()));
+        }
         let timestamp = timestamp
             .parse::<i64>()
             .map_err(|_| Error::InvalidCommit("invalid identity timestamp".into()))?;
@@ -135,17 +139,33 @@ impl Signature {
         }
         let hours = i16::from(bytes[1] - b'0') * 10 + i16::from(bytes[2] - b'0');
         let minutes = i16::from(bytes[3] - b'0') * 10 + i16::from(bytes[4] - b'0');
-        if minutes >= 60 {
-            return Err(Error::InvalidCommit("invalid timezone minutes".into()));
-        }
         let mut offset = hours * 60 + minutes;
         if bytes[0] == b'-' {
             offset = -offset;
         }
-        let mut signature = Self::new(name, email, timestamp, offset)?;
-        signature.negative_zero = bytes[0] == b'-' && offset == 0;
-        Ok(signature)
+        validate_identity(name, email)?;
+        Ok(Self {
+            name: name.to_owned(),
+            email: email.to_owned(),
+            timestamp,
+            offset_minutes: offset,
+            negative_zero: bytes[0] == b'-' && offset == 0,
+            timezone: bytes.try_into().expect("validated timezone length"),
+        })
     }
+}
+
+fn validate_identity(name: &str, email: &str) -> Result<()> {
+    if name.is_empty()
+        || email.is_empty()
+        || name.contains(['<', '>', '\n', '\r', '\0'])
+        || email.contains(['<', '>', '\n', '\r', '\0'])
+    {
+        return Err(Error::InvalidCommit(
+            "invalid identity name or email".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -462,7 +482,9 @@ mod tests {
         assert!(
             Commit::parse(b"tree 1111111111111111111111111111111111111111\n\nmessage").is_err()
         );
-        assert!(Signature::parse(b"Name <a@example.com> 123 +1260").is_err());
+        let historical = Signature::parse(b"Name <a@example.com> 123 +9999").unwrap();
+        assert_eq!(historical.encode(), "Name <a@example.com> 123 +9999");
+        assert!(Signature::parse(b"Name <a@example.com> 0123 +0000").is_err());
         assert!(Commit::parse(b" continuation\n\nmessage").is_err());
     }
 }

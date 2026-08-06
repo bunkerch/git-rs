@@ -10,9 +10,11 @@ reject absolute paths and parent traversal. Directory reads return child names,
 not recursively expanded paths.
 
 `write_new` is lock acquisition and must fail if the path exists. `rename(from,
-to)` is the publication boundary and must atomically replace a file at `to`.
-Remote adapters can implement these with a database transaction, object
-generation plus compare-and-swap, or another storage-native atomic primitive.
+to)` is the publication boundary: it atomically replaces file destinations and
+must also atomically relocate complete directory subtrees to unoccupied paths.
+Remote adapters can implement these with a database transaction, namespace
+prefix swap, object generation plus compare-and-swap, or another storage-native
+atomic primitive. Directory rename is required for linked-worktree moves.
 
 Metadata is no-follow: adapters distinguish regular files, directories, and
 symbolic links. `read_link` returns target bytes, and executable state plus

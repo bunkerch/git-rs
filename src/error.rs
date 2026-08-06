@@ -19,10 +19,14 @@ pub enum Error {
     Protocol(String),
     InvalidTree(String),
     InvalidCommit(String),
+    EmptyReplay,
     InvalidReferenceName(String),
     InvalidReference(String),
+    InvalidRevision(String),
+    AmbiguousRevision(String),
     ReferenceConflict(String),
     CheckoutConflict(Vec<String>),
+    IgnoredPath(PathBuf),
     SymbolicReferenceLoop(String),
     InvalidRepository(String),
 }
@@ -51,8 +55,11 @@ impl fmt::Display for Error {
             Self::Protocol(message) => write!(f, "Git protocol error: {message}"),
             Self::InvalidTree(message) => write!(f, "invalid tree: {message}"),
             Self::InvalidCommit(message) => write!(f, "invalid commit: {message}"),
+            Self::EmptyReplay => write!(f, "replayed commit would be empty"),
             Self::InvalidReferenceName(name) => write!(f, "invalid reference name: {name}"),
             Self::InvalidReference(message) => write!(f, "invalid reference: {message}"),
+            Self::InvalidRevision(message) => write!(f, "invalid revision: {message}"),
+            Self::AmbiguousRevision(value) => write!(f, "ambiguous revision: {value}"),
             Self::ReferenceConflict(name) => {
                 write!(f, "reference changed concurrently: {name}")
             }
@@ -63,6 +70,7 @@ impl fmt::Display for Error {
                     paths.join(", ")
                 )
             }
+            Self::IgnoredPath(path) => write!(f, "path is ignored: {}", path.display()),
             Self::SymbolicReferenceLoop(name) => {
                 write!(
                     f,

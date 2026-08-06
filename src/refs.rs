@@ -76,6 +76,77 @@ pub enum PreviousValue {
     MustExist(ObjectId),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PreviousReferenceValue {
+    Any,
+    MustNotExist,
+    MustExist(ReferenceTarget),
+    MustResolveTo(ObjectId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReferenceTransactionChange {
+    Update(ReferenceTarget),
+    Delete,
+    Verify,
+}
+
+/// One direct or symbolic edit in a mixed atomic reference transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceTransactionEdit {
+    name: String,
+    change: ReferenceTransactionChange,
+    previous: PreviousReferenceValue,
+}
+
+impl ReferenceTransactionEdit {
+    #[must_use]
+    pub fn update(
+        name: impl Into<String>,
+        target: ReferenceTarget,
+        previous: PreviousReferenceValue,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            change: ReferenceTransactionChange::Update(target),
+            previous,
+        }
+    }
+
+    #[must_use]
+    pub fn delete(name: impl Into<String>, previous: PreviousReferenceValue) -> Self {
+        Self {
+            name: name.into(),
+            change: ReferenceTransactionChange::Delete,
+            previous,
+        }
+    }
+
+    #[must_use]
+    pub fn verify(name: impl Into<String>, previous: PreviousReferenceValue) -> Self {
+        Self {
+            name: name.into(),
+            change: ReferenceTransactionChange::Verify,
+            previous,
+        }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn change(&self) -> &ReferenceTransactionChange {
+        &self.change
+    }
+
+    #[must_use]
+    pub const fn previous(&self) -> &PreviousReferenceValue {
+        &self.previous
+    }
+}
+
 /// One direct update or deletion in a batch reference transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReferenceEdit {
@@ -125,6 +196,36 @@ pub struct ReflogEntry {
     new: ObjectId,
     committer: Signature,
     message: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReflogRewriteOptions {
+    pub dry_run: bool,
+    pub rewrite: bool,
+    pub update_reference: bool,
+    pub max_entries: usize,
+    pub max_reference_depth: usize,
+    pub max_stale_objects: usize,
+}
+
+impl Default for ReflogRewriteOptions {
+    fn default() -> Self {
+        Self {
+            dry_run: false,
+            rewrite: false,
+            update_reference: false,
+            max_entries: 10_000_000,
+            max_reference_depth: 4096,
+            max_stale_objects: 10_000_000,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReflogRewriteResult {
+    pub removed: usize,
+    pub retained: usize,
+    pub new_tip: Option<ObjectId>,
 }
 
 impl ReflogEntry {
@@ -187,22 +288,7 @@ impl Repository {
     /// Returns an error for malformed references or storage failures.
     #[allow(clippy::case_sensitive_file_extension_comparisons)]
     pub fn branches(&self) -> Result<Vec<Reference>> {
-        let mut branches = self.packed_references_with_prefix("refs/heads/")?;
-        let root = self.git_path("refs/heads");
-        let mut directories = vec![(root, String::from("refs/heads"))];
-        while let Some((directory, prefix)) = directories.pop() {
-            for child in self.filesystem().read_dir(&directory)? {
-                let path = directory.join(&child);
-                let name = format!("{prefix}/{}", child.to_string_lossy());
-                let metadata = self.filesystem().metadata(&path)?;
-                if metadata.is_dir() {
-                    directories.push((path, name));
-                } else if metadata.is_file() && !name.ends_with(".lock") {
-                    branches.insert(name.clone(), self.read_loose_reference(&name)?);
-                }
-            }
-        }
-        Ok(branches.into_values().collect())
+        self.references_with_prefix_bounded("refs/heads/", usize::MAX, usize::MAX)
     }
 
     /// List every loose and packed reference below `refs/` in bytewise order.
@@ -214,18 +300,47 @@ impl Repository {
     /// Returns an error for malformed references or storage failures.
     #[allow(clippy::case_sensitive_file_extension_comparisons)]
     pub fn references(&self) -> Result<Vec<Reference>> {
-        let mut references = self.packed_references_with_prefix("refs/")?;
+        self.references_with_prefix_bounded("refs/", usize::MAX, usize::MAX)
+    }
+
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    pub(crate) fn references_with_prefix_bounded(
+        &self,
+        prefix: &str,
+        max_references: usize,
+        max_depth: usize,
+    ) -> Result<Vec<Reference>> {
+        let mut references = self.packed_references_with_prefix_bounded(prefix, max_references)?;
+        if references.len() > max_references {
+            return Err(Error::InvalidRepository(
+                "reference enumeration exceeds limit".into(),
+            ));
+        }
         let root = self.git_path("refs");
-        let mut directories = vec![(root, String::from("refs"))];
-        while let Some((directory, prefix)) = directories.pop() {
+        let mut directories = vec![(root, String::from("refs"), 0usize)];
+        while let Some((directory, directory_name, depth)) = directories.pop() {
+            if depth > max_depth {
+                return Err(Error::InvalidRepository(
+                    "reference enumeration exceeds depth limit".into(),
+                ));
+            }
             for child in self.filesystem().read_dir(&directory)? {
                 let path = directory.join(&child);
-                let name = format!("{prefix}/{}", child.to_string_lossy());
+                let name = format!("{directory_name}/{}", child.to_string_lossy());
                 let metadata = self.filesystem().metadata(&path)?;
                 if metadata.is_dir() {
-                    directories.push((path, name));
-                } else if metadata.is_file() && !name.ends_with(".lock") {
+                    let directory_prefix = format!("{name}/");
+                    if prefix.starts_with(&directory_prefix) || name.starts_with(prefix) {
+                        directories.push((path, name, depth.saturating_add(1)));
+                    }
+                } else if metadata.is_file() && !name.ends_with(".lock") && name.starts_with(prefix)
+                {
                     references.insert(name.clone(), self.read_loose_reference(&name)?);
+                    if references.len() > max_references {
+                        return Err(Error::InvalidRepository(
+                            "reference enumeration exceeds limit".into(),
+                        ));
+                    }
                 }
             }
         }
@@ -263,6 +378,161 @@ impl Repository {
             }
         }
         Err(Error::SymbolicReferenceLoop(name.to_owned()))
+    }
+
+    /// Return the target name of a symbolic reference.
+    ///
+    /// With `recurse`, symbolic chains are followed and the final symbolic
+    /// target is returned, including when that target is unborn.
+    ///
+    /// # Errors
+    /// Returns an error when `name` is missing, direct, malformed, or exceeds
+    /// Git's five-hop symbolic-reference limit.
+    pub fn symbolic_reference(&self, name: &str, recurse: bool) -> Result<ReferenceName> {
+        validate_read_name(name)?;
+        let mut current = name.to_owned();
+        for _ in 0..SYMBOLIC_REF_MAX_DEPTH {
+            let reference = self.read_reference(&current)?;
+            let ReferenceTarget::Symbolic(target) = reference.target else {
+                return Err(Error::InvalidReference(format!(
+                    "{name} is not a symbolic reference"
+                )));
+            };
+            if !recurse {
+                return Ok(target);
+            }
+            current.clone_from(&target.0);
+            match self.read_reference(&current) {
+                Ok(next) if matches!(next.target, ReferenceTarget::Symbolic(_)) => {}
+                Ok(_) | Err(Error::NotFound(_)) => return Ok(target),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::SymbolicReferenceLoop(name.to_owned()))
+    }
+
+    /// Atomically create or replace a symbolic reference without dereferencing it.
+    ///
+    /// If `reflog` is supplied, its lock is acquired before checking the CAS
+    /// precondition and the old/new resolved IDs are appended atomically with
+    /// the reference update. Unborn targets are represented by the null ID.
+    ///
+    /// # Errors
+    /// Returns an error for invalid names/messages, a stale previous value,
+    /// lock contention, malformed refs, or storage failures.
+    pub fn update_symbolic_reference(
+        &self,
+        name: &str,
+        target: &ReferenceName,
+        previous: PreviousReferenceValue,
+        reflog: Option<(&Signature, &[u8])>,
+    ) -> Result<()> {
+        validate_read_name(name)?;
+        if let Some((_, message)) = reflog {
+            validate_reflog_message(message)?;
+        }
+        let destination = self.git_path(name);
+        if let Some(parent) = destination.parent() {
+            self.filesystem().create_dir_all(parent)?;
+        }
+        let lock = lock_path(&destination);
+        self.filesystem().write_new(&lock, b"")?;
+        let log_destination = self.git_path(Path::new("logs").join(name));
+        let log_lock = lock_path(&log_destination);
+        if reflog.is_some() {
+            if let Some(parent) = log_destination.parent() {
+                self.filesystem().create_dir_all(parent)?;
+            }
+            if let Err(error) = self.filesystem().write_new(&log_lock, b"") {
+                let _ = self.filesystem().remove_file(&lock);
+                return Err(error);
+            }
+        }
+
+        let result = (|| {
+            let actual = match self.read_reference(name) {
+                Ok(reference) => Some(reference.target),
+                Err(Error::NotFound(_)) => None,
+                Err(error) => return Err(error),
+            };
+            let matches = match previous {
+                PreviousReferenceValue::Any => true,
+                PreviousReferenceValue::MustNotExist => actual.is_none(),
+                PreviousReferenceValue::MustExist(expected) => actual == Some(expected),
+                PreviousReferenceValue::MustResolveTo(expected) => {
+                    actual.is_some() && resolved_target(self, actual.as_ref()) == expected
+                }
+            };
+            if !matches {
+                return Err(Error::ReferenceConflict(name.to_owned()));
+            }
+            if let Some((committer, message)) = reflog {
+                let old = resolved_target(self, actual.as_ref());
+                let new = self
+                    .resolve_reference(target.as_str())
+                    .unwrap_or_else(|_| ObjectId::null());
+                let mut contents = match self.filesystem().read(&log_destination) {
+                    Ok(contents) => contents,
+                    Err(Error::NotFound(_)) => Vec::new(),
+                    Err(error) => return Err(error),
+                };
+                append_reflog_line(&mut contents, old, new, committer, message);
+                self.filesystem().write(&log_lock, &contents)?;
+            }
+            let contents = format!("ref: {target}\n");
+            self.filesystem().write(&lock, contents.as_bytes())?;
+            if reflog.is_some() {
+                self.filesystem().rename(&log_lock, &log_destination)?;
+            }
+            self.filesystem().rename(&lock, &destination)
+        })();
+        if result.is_err() {
+            let _ = self.filesystem().remove_file(&lock);
+            if reflog.is_some() {
+                let _ = self.filesystem().remove_file(&log_lock);
+            }
+        }
+        result
+    }
+
+    /// Delete a symbolic ref without dereferencing its target.
+    ///
+    /// `HEAD` cannot be deleted. The expected target provides compare-and-swap
+    /// protection, and a successful deletion also removes the ref's log.
+    ///
+    /// # Errors
+    /// Returns an error for `HEAD`, a missing/direct/stale ref, lock contention,
+    /// malformed storage, or filesystem failures.
+    pub fn delete_symbolic_reference(&self, name: &str, expected: &ReferenceName) -> Result<()> {
+        validate_read_name(name)?;
+        if name == "HEAD" {
+            return Err(Error::InvalidReference(
+                "deleting HEAD is not allowed".into(),
+            ));
+        }
+        let destination = self.git_path(name);
+        if let Some(parent) = destination.parent() {
+            self.filesystem().create_dir_all(parent)?;
+        }
+        let lock = lock_path(&destination);
+        self.filesystem().write_new(&lock, b"")?;
+        let result = (|| {
+            let reference = self.read_reference(name)?;
+            if reference.target != ReferenceTarget::Symbolic(expected.clone()) {
+                return Err(Error::ReferenceConflict(name.to_owned()));
+            }
+            self.filesystem().remove_file(&destination)?;
+            self.filesystem().remove_file(&lock)?;
+            let log = self.git_path(Path::new("logs").join(name));
+            match self.filesystem().remove_file(&log) {
+                Ok(()) | Err(Error::NotFound(_)) => Ok(()),
+                Err(error) => Err(error),
+            }
+        })();
+        if result.is_err() {
+            let _ = self.filesystem().remove_file(&lock);
+        }
+        result
     }
 
     /// Atomically create or update a direct reference.
@@ -346,7 +616,11 @@ impl Repository {
             let _ = self.filesystem().remove_file(&loose_lock);
             let _ = self.filesystem().remove_file(&packed_lock);
         }
-        result
+        result?;
+        if name.as_str().starts_with("refs/replace/") {
+            self.invalidate_replacements()?;
+        }
+        Ok(())
     }
 
     /// Apply several direct ref updates/deletions as one prepared transaction.
@@ -435,6 +709,9 @@ impl Repository {
                 self.filesystem().remove_file(&packed_lock)?;
             }
         }
+        let touches_replacements = prepared
+            .iter()
+            .any(|item| item.edit.name.as_str().starts_with("refs/replace/"));
         for item in &prepared {
             if item.edit.new.is_some() {
                 self.filesystem().rename(&item.lock, &item.destination)?;
@@ -451,7 +728,183 @@ impl Repository {
                 }
             }
         }
+        if touches_replacements {
+            self.invalidate_replacements()?;
+        }
         Ok(())
+    }
+
+    /// Apply direct and symbolic updates, deletions, and verifications using one
+    /// prepared set of loose-reference locks.
+    ///
+    /// Packed deletions are prepared under `packed-refs.lock`. Every
+    /// precondition is checked only after all locks have been acquired, and a
+    /// preparation failure publishes no change.
+    ///
+    /// # Errors
+    /// Returns an error for invalid or duplicate names, null direct targets,
+    /// stale target preconditions, absent deletes, lock contention, malformed
+    /// packed refs, or storage failure.
+    #[allow(clippy::too_many_lines)]
+    pub fn apply_mixed_reference_transaction(
+        &self,
+        edits: &[ReferenceTransactionEdit],
+    ) -> Result<()> {
+        if edits.is_empty() {
+            return Ok(());
+        }
+        let mut edits = edits.to_vec();
+        edits.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        if edits.windows(2).any(|pair| pair[0].name == pair[1].name) {
+            return Err(Error::InvalidReference(
+                "duplicate ref in transaction".into(),
+            ));
+        }
+        for edit in &edits {
+            validate_read_name(&edit.name)?;
+            if matches!(edit.change, ReferenceTransactionChange::Update(ReferenceTarget::Direct(id)) if id.is_null())
+            {
+                return Err(Error::InvalidReference(
+                    "a ref cannot point to the null object ID".into(),
+                ));
+            }
+        }
+
+        let mut prepared = Vec::with_capacity(edits.len());
+        for edit in edits {
+            let destination = self.git_path(&edit.name);
+            if let Some(parent) = destination.parent() {
+                self.filesystem().create_dir_all(parent)?;
+            }
+            if self
+                .filesystem()
+                .metadata(&destination)
+                .is_ok_and(crate::Metadata::is_dir)
+            {
+                cleanup_mixed_ref_locks(self, &prepared);
+                return Err(Error::ReferenceConflict(edit.name));
+            }
+            let lock = lock_path(&destination);
+            if let Err(error) = self.filesystem().write_new(&lock, b"") {
+                cleanup_mixed_ref_locks(self, &prepared);
+                return Err(error);
+            }
+            prepared.push(PreparedMixedReferenceEdit {
+                edit,
+                destination,
+                lock,
+            });
+        }
+
+        let deletes = prepared
+            .iter()
+            .any(|item| matches!(item.edit.change, ReferenceTransactionChange::Delete));
+        let packed_path = self.git_path("packed-refs");
+        let packed_lock = lock_path(&packed_path);
+        if deletes && let Err(error) = self.filesystem().write_new(&packed_lock, b"") {
+            cleanup_mixed_ref_locks(self, &prepared);
+            return Err(error);
+        }
+        let preparation =
+            self.prepare_mixed_reference_edits(&prepared, deletes, &packed_path, &packed_lock);
+        let packed_exists = match preparation {
+            Ok(value) => value,
+            Err(error) => {
+                cleanup_mixed_ref_locks(self, &prepared);
+                if deletes {
+                    let _ = self.filesystem().remove_file(&packed_lock);
+                }
+                return Err(error);
+            }
+        };
+        if deletes {
+            if packed_exists {
+                self.filesystem().rename(&packed_lock, &packed_path)?;
+            } else {
+                self.filesystem().remove_file(&packed_lock)?;
+            }
+        }
+        let touches_replacements = prepared
+            .iter()
+            .any(|item| item.edit.name.starts_with("refs/replace/"));
+        for item in &prepared {
+            match item.edit.change {
+                ReferenceTransactionChange::Update(_) => {
+                    self.filesystem().rename(&item.lock, &item.destination)?;
+                }
+                ReferenceTransactionChange::Delete => {
+                    match self.filesystem().remove_file(&item.destination) {
+                        Ok(()) | Err(Error::NotFound(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                    self.filesystem().remove_file(&item.lock)?;
+                    let log = self.git_path(Path::new("logs").join(&item.edit.name));
+                    match self.filesystem().remove_file(&log) {
+                        Ok(()) | Err(Error::NotFound(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                ReferenceTransactionChange::Verify => {
+                    self.filesystem().remove_file(&item.lock)?;
+                }
+            }
+        }
+        if touches_replacements {
+            self.invalidate_replacements()?;
+        }
+        Ok(())
+    }
+
+    fn prepare_mixed_reference_edits(
+        &self,
+        prepared: &[PreparedMixedReferenceEdit],
+        deletes: bool,
+        packed_path: &Path,
+        packed_lock: &Path,
+    ) -> Result<bool> {
+        for item in prepared {
+            let actual = match self.read_reference(&item.edit.name) {
+                Ok(reference) => Some(reference.target),
+                Err(Error::NotFound(_)) => None,
+                Err(error) => return Err(error),
+            };
+            if !previous_reference_matches(self, &item.edit.previous, actual.as_ref())
+                || (matches!(item.edit.change, ReferenceTransactionChange::Delete)
+                    && actual.is_none())
+            {
+                return Err(Error::ReferenceConflict(item.edit.name.clone()));
+            }
+            if let ReferenceTransactionChange::Update(ref target) = item.edit.change {
+                let contents = match target {
+                    ReferenceTarget::Direct(id) => format!("{id}\n"),
+                    ReferenceTarget::Symbolic(name) => format!("ref: {name}\n"),
+                };
+                self.filesystem().write(&item.lock, contents.as_bytes())?;
+            }
+        }
+        let packed = if deletes {
+            match self.filesystem().read(packed_path) {
+                Ok(contents) => Some(contents),
+                Err(Error::NotFound(_)) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let packed = packed
+            .map(|mut contents| {
+                for item in prepared {
+                    if matches!(item.edit.change, ReferenceTransactionChange::Delete) {
+                        contents = remove_packed_reference(&contents, &item.edit.name)?;
+                    }
+                }
+                Ok::<Vec<u8>, Error>(contents)
+            })
+            .transpose()?;
+        if let Some(contents) = &packed {
+            self.filesystem().write(packed_lock, contents)?;
+        }
+        Ok(packed.is_some())
     }
 
     fn direct_reference_value(&self, name: &str) -> Result<Option<ObjectId>> {
@@ -610,7 +1063,11 @@ impl Repository {
                 let _ = self.filesystem().remove_file(&log_lock);
             }
         }
-        result
+        result?;
+        if name.as_str().starts_with("refs/replace/") {
+            self.invalidate_replacements()?;
+        }
+        Ok(())
     }
 
     /// Read a reference log from oldest to newest.
@@ -618,6 +1075,15 @@ impl Repository {
     /// # Errors
     /// Returns an error for invalid names, malformed log lines, or storage failures.
     pub fn read_reflog(&self, name: &str) -> Result<Vec<ReflogEntry>> {
+        self.read_reflog_bounded(name, usize::MAX)
+    }
+
+    /// Read a reference log from oldest to newest with an entry bound.
+    ///
+    /// # Errors
+    /// Returns an error for invalid names, malformed log lines, an exceeded
+    /// entry limit, or storage failures.
+    pub fn read_reflog_bounded(&self, name: &str, max_entries: usize) -> Result<Vec<ReflogEntry>> {
         validate_read_name(name)?;
         let contents = match self
             .filesystem()
@@ -627,11 +1093,479 @@ impl Repository {
             Err(Error::NotFound(_)) => return Ok(Vec::new()),
             Err(error) => return Err(error),
         };
-        contents
+        let mut entries = Vec::new();
+        for line in contents
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
-            .map(parse_reflog_line)
-            .collect()
+        {
+            entries.push(parse_reflog_line(line)?);
+            if entries.len() > max_entries {
+                return Err(Error::InvalidRepository(
+                    "reflog exceeds entry limit".into(),
+                ));
+            }
+        }
+        Ok(entries)
+    }
+
+    /// List reflogs in bytewise reference-name order.
+    ///
+    /// # Errors
+    /// Returns an error for malformed/non-UTF-8 names, exceeded count/depth
+    /// limits, or storage failures.
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    pub fn reflogs(&self, max_reflogs: usize, max_depth: usize) -> Result<Vec<String>> {
+        let root = self.git_path("logs");
+        match self.filesystem().metadata(&root) {
+            Err(Error::NotFound(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        let mut pending = vec![(root, String::new(), 0usize)];
+        let mut output = Vec::new();
+        while let Some((directory, prefix, depth)) = pending.pop() {
+            if depth > max_depth {
+                return Err(Error::InvalidRepository(
+                    "reflog enumeration exceeds depth limit".into(),
+                ));
+            }
+            for child in self.filesystem().read_dir(&directory)? {
+                let component = child
+                    .to_str()
+                    .ok_or_else(|| Error::InvalidReference("non-UTF-8 reflog name".into()))?;
+                let name = if prefix.is_empty() {
+                    component.to_owned()
+                } else {
+                    format!("{prefix}/{component}")
+                };
+                let path = directory.join(child);
+                let metadata = self.filesystem().metadata(&path)?;
+                if metadata.is_dir() {
+                    pending.push((path, name, depth.saturating_add(1)));
+                } else if metadata.is_file() && !name.ends_with(".lock") {
+                    validate_read_name(&name)?;
+                    output.push(name);
+                    if output.len() > max_reflogs {
+                        return Err(Error::InvalidRepository(
+                            "reflog enumeration exceeds limit".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        output.sort_unstable();
+        Ok(output)
+    }
+
+    /// Remove one complete reflog while holding its canonical log lock.
+    ///
+    /// Returns `false` when no log exists.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid name, lock contention, or storage failure.
+    pub fn drop_reflog(&self, name: &str) -> Result<bool> {
+        validate_read_name(name)?;
+        let destination = self.git_path(Path::new("logs").join(name));
+        if !self.filesystem().exists(&destination)? {
+            return Ok(false);
+        }
+        let lock = lock_path(&destination);
+        self.filesystem().write_new(&lock, b"")?;
+        let result = self.filesystem().remove_file(&destination);
+        let _ = self.filesystem().remove_file(&lock);
+        result.map(|()| true)
+    }
+
+    /// Delete entries addressed by zero-based positions from the newest entry.
+    ///
+    /// # Errors
+    /// Returns an error for duplicate/out-of-range selectors, malformed state,
+    /// lock contention, a symbolic update target, or storage failures.
+    pub fn delete_reflog_entries(
+        &self,
+        name: &str,
+        newest_indices: &[usize],
+        options: &ReflogRewriteOptions,
+    ) -> Result<ReflogRewriteResult> {
+        let mut selected = std::collections::BTreeSet::new();
+        if newest_indices.iter().any(|index| !selected.insert(*index)) {
+            return Err(Error::InvalidReference(
+                "duplicate reflog deletion selector".into(),
+            ));
+        }
+        self.rewrite_reflog(
+            name,
+            options,
+            |index, len, _| Ok(selected.contains(&(len - index - 1))),
+            Some(selected.len()),
+        )
+    }
+
+    /// Expire every reflog entry strictly older than `timestamp`.
+    ///
+    /// # Errors
+    /// Returns an error for malformed state, lock contention, a symbolic update
+    /// target, exceeded limits, or storage failures.
+    pub fn expire_reflog_before(
+        &self,
+        name: &str,
+        timestamp: i64,
+        options: &ReflogRewriteOptions,
+    ) -> Result<ReflogRewriteResult> {
+        self.rewrite_reflog(
+            name,
+            options,
+            |_, _, entry| Ok(entry.committer.timestamp() < timestamp),
+            None,
+        )
+    }
+
+    /// Expire old entries whose old or new commit is unreachable from the
+    /// current reference tip. For `HEAD`, all reference tips are roots.
+    ///
+    /// Non-commit object IDs are retained, matching Git's gentle commit lookup;
+    /// when a non-commit direct reference is the root, all old entries expire.
+    ///
+    /// # Errors
+    /// Returns an error for malformed references/objects, graph or storage
+    /// failures, exceeded limits, or lock contention.
+    pub fn expire_reflog_unreachable_before(
+        &self,
+        name: &str,
+        timestamp: i64,
+        graph: &crate::GraphOptions,
+        options: &ReflogRewriteOptions,
+    ) -> Result<ReflogRewriteResult> {
+        let (reachable, expire_all) = self.reflog_reachable_commits(name, graph, options)?;
+        self.rewrite_reflog(
+            name,
+            options,
+            |_, _, entry| {
+                if entry.committer.timestamp() >= timestamp {
+                    return Ok(false);
+                }
+                if expire_all {
+                    return Ok(true);
+                }
+                Ok(self.reflog_commit_is_unreachable(
+                    entry.old,
+                    &reachable,
+                    graph.max_object_size,
+                )? || self.reflog_commit_is_unreachable(
+                    entry.new,
+                    &reachable,
+                    graph.max_object_size,
+                )?)
+            },
+            None,
+        )
+    }
+
+    /// Expire the union of total-age and unreachable-age reflog policies in
+    /// one rewrite, so entries matching both policies are removed once.
+    ///
+    /// # Errors
+    /// Returns an error for malformed references/objects, graph or storage
+    /// failures, exceeded limits, or lock contention.
+    pub fn expire_reflog_with_policy(
+        &self,
+        name: &str,
+        total_before: Option<i64>,
+        unreachable_before: Option<i64>,
+        graph: &crate::GraphOptions,
+        options: &ReflogRewriteOptions,
+    ) -> Result<ReflogRewriteResult> {
+        let reachability = unreachable_before
+            .map(|_| self.reflog_reachable_commits(name, graph, options))
+            .transpose()?;
+        self.rewrite_reflog(
+            name,
+            options,
+            |_, _, entry| {
+                if total_before.is_some_and(|expiry| entry.committer.timestamp() < expiry) {
+                    return Ok(true);
+                }
+                let Some(expiry) = unreachable_before else {
+                    return Ok(false);
+                };
+                if entry.committer.timestamp() >= expiry {
+                    return Ok(false);
+                }
+                let Some((reachable, expire_all)) = reachability.as_ref() else {
+                    return Ok(false);
+                };
+                if *expire_all {
+                    return Ok(true);
+                }
+                Ok(self.reflog_commit_is_unreachable(
+                    entry.old,
+                    reachable,
+                    graph.max_object_size,
+                )? || self.reflog_commit_is_unreachable(
+                    entry.new,
+                    reachable,
+                    graph.max_object_size,
+                )?)
+            },
+            None,
+        )
+    }
+
+    /// Remove entries whose old or new commit has an incomplete object closure.
+    ///
+    /// Null endpoints are valid. Non-commit endpoints, missing/corrupt parents,
+    /// trees, or blobs make an entry stale. Successfully verified objects are
+    /// cached across entries.
+    ///
+    /// # Errors
+    /// Returns an error for storage failures, object size/count limits, malformed
+    /// reference state, or lock contention.
+    pub fn prune_stale_reflog_entries(
+        &self,
+        name: &str,
+        graph: &crate::GraphOptions,
+        options: &ReflogRewriteOptions,
+    ) -> Result<ReflogRewriteResult> {
+        let mut verified = std::collections::HashSet::new();
+        self.rewrite_reflog(
+            name,
+            options,
+            |_, _, entry| {
+                Ok(!self.reflog_commit_closure_complete(
+                    entry.old,
+                    graph.max_object_size,
+                    options.max_stale_objects,
+                    &mut verified,
+                )? || !self.reflog_commit_closure_complete(
+                    entry.new,
+                    graph.max_object_size,
+                    options.max_stale_objects,
+                    &mut verified,
+                )?)
+            },
+            None,
+        )
+    }
+
+    fn reflog_commit_closure_complete(
+        &self,
+        root: ObjectId,
+        max_object_size: usize,
+        max_objects: usize,
+        verified: &mut std::collections::HashSet<ObjectId>,
+    ) -> Result<bool> {
+        if root.is_null() || verified.contains(&root) {
+            return Ok(true);
+        }
+        let mut pending = vec![(root, crate::ObjectKind::Commit)];
+        let mut discovered = std::collections::HashSet::new();
+        while let Some((id, expected)) = pending.pop() {
+            if verified.contains(&id) || !discovered.insert(id) {
+                continue;
+            }
+            if verified.len().saturating_add(discovered.len()) > max_objects {
+                return Err(Error::InvalidRepository(
+                    "stale reflog verification exceeds object limit".into(),
+                ));
+            }
+            let object = match self.read_object(id, max_object_size) {
+                Ok(object) => object,
+                Err(error) if reflog_broken_object_error(&error) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if object.kind() != expected {
+                return Ok(false);
+            }
+            match expected {
+                crate::ObjectKind::Blob => {}
+                crate::ObjectKind::Commit => {
+                    let commit = match crate::Commit::parse(object.data()) {
+                        Ok(commit) => commit,
+                        Err(error) if reflog_broken_object_error(&error) => return Ok(false),
+                        Err(error) => return Err(error),
+                    };
+                    pending.push((commit.tree(), crate::ObjectKind::Tree));
+                    pending.extend(
+                        commit
+                            .parents()
+                            .iter()
+                            .copied()
+                            .map(|parent| (parent, crate::ObjectKind::Commit)),
+                    );
+                }
+                crate::ObjectKind::Tree => {
+                    let tree = match crate::Tree::parse(object.data()) {
+                        Ok(tree) => tree,
+                        Err(error) if reflog_broken_object_error(&error) => return Ok(false),
+                        Err(error) => return Err(error),
+                    };
+                    pending.extend(
+                        tree.entries()
+                            .iter()
+                            .filter(|entry| entry.mode() != crate::EntryMode::Gitlink)
+                            .map(|entry| (entry.id(), entry.mode().object_kind())),
+                    );
+                }
+                crate::ObjectKind::Tag => return Ok(false),
+            }
+        }
+        verified.extend(discovered);
+        Ok(true)
+    }
+
+    fn reflog_reachable_commits(
+        &self,
+        name: &str,
+        graph: &crate::GraphOptions,
+        options: &ReflogRewriteOptions,
+    ) -> Result<(std::collections::HashSet<ObjectId>, bool)> {
+        let mut roots = Vec::new();
+        if name == "HEAD" {
+            for reference in self.references_with_prefix_bounded(
+                "refs/",
+                options.max_entries,
+                options.max_reference_depth,
+            )? {
+                let id = match reference.target() {
+                    ReferenceTarget::Direct(id) => *id,
+                    ReferenceTarget::Symbolic(_) => self.resolve_reference(reference.name())?,
+                };
+                if self.read_object(id, graph.max_object_size)?.kind() == crate::ObjectKind::Commit
+                {
+                    roots.push(id);
+                }
+            }
+        } else {
+            let id = self.resolve_reference(name)?;
+            if self.read_object(id, graph.max_object_size)?.kind() != crate::ObjectKind::Commit {
+                return Ok((std::collections::HashSet::new(), true));
+            }
+            roots.push(id);
+        }
+        if roots.is_empty() {
+            return Ok((std::collections::HashSet::new(), false));
+        }
+        let revisions = self.walk_revisions(
+            &roots,
+            &[],
+            &crate::RevisionWalkOptions {
+                graph: graph.clone(),
+                ..crate::RevisionWalkOptions::default()
+            },
+        )?;
+        Ok((
+            revisions
+                .into_iter()
+                .map(|revision| revision.id())
+                .collect(),
+            false,
+        ))
+    }
+
+    fn reflog_commit_is_unreachable(
+        &self,
+        id: ObjectId,
+        reachable: &std::collections::HashSet<ObjectId>,
+        max_object_size: usize,
+    ) -> Result<bool> {
+        if id.is_null() {
+            return Ok(false);
+        }
+        match self.read_object(id, max_object_size) {
+            Ok(object) if object.kind() == crate::ObjectKind::Commit => {
+                Ok(!reachable.contains(&id))
+            }
+            Ok(_) | Err(Error::NotFound(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn rewrite_reflog(
+        &self,
+        name: &str,
+        options: &ReflogRewriteOptions,
+        mut remove: impl FnMut(usize, usize, &ReflogEntry) -> Result<bool>,
+        expected_removals: Option<usize>,
+    ) -> Result<ReflogRewriteResult> {
+        validate_read_name(name)?;
+        let reference_destination = self.git_path(name);
+        if let Some(parent) = reference_destination.parent() {
+            self.filesystem().create_dir_all(parent)?;
+        }
+        let reference_lock = lock_path(&reference_destination);
+        self.filesystem().write_new(&reference_lock, b"")?;
+        let log_destination = self.git_path(Path::new("logs").join(name));
+        let log_lock = lock_path(&log_destination);
+        let result = (|| {
+            let reference = self.read_reference(name)?;
+            if options.update_reference && matches!(reference.target, ReferenceTarget::Symbolic(_))
+            {
+                return Err(Error::InvalidReference(
+                    "cannot update a symbolic reference from its reflog".into(),
+                ));
+            }
+            let entries = self.read_reflog_bounded(name, options.max_entries)?;
+            let mut retained = Vec::with_capacity(entries.len());
+            let mut removed = 0;
+            let mut last_kept = ObjectId::null();
+            for (index, entry) in entries.iter().enumerate() {
+                let mut candidate = entry.clone();
+                if options.rewrite {
+                    candidate.old = last_kept;
+                }
+                if remove(index, entries.len(), &candidate)? {
+                    removed += 1;
+                } else {
+                    last_kept = candidate.new;
+                    retained.push(candidate);
+                }
+            }
+            if expected_removals.is_some_and(|expected| removed != expected) {
+                return Err(Error::InvalidReference(
+                    "reflog deletion selector is out of range".into(),
+                ));
+            }
+            let new_tip = retained.last().map(|entry| entry.new);
+            let outcome = ReflogRewriteResult {
+                removed,
+                retained: retained.len(),
+                new_tip,
+            };
+            if options.dry_run || removed == 0 {
+                return Ok(outcome);
+            }
+            if let Some(parent) = log_destination.parent() {
+                self.filesystem().create_dir_all(parent)?;
+            }
+            self.filesystem().write_new(&log_lock, b"")?;
+            let mut contents = Vec::new();
+            for entry in &retained {
+                append_reflog_line(
+                    &mut contents,
+                    entry.old,
+                    entry.new,
+                    &entry.committer,
+                    &entry.message,
+                );
+            }
+            self.filesystem().write(&log_lock, &contents)?;
+            if options.update_reference
+                && let Some(new_tip) = new_tip
+            {
+                let mut contents = new_tip.to_hex().to_vec();
+                contents.push(b'\n');
+                self.filesystem().write(&reference_lock, &contents)?;
+            }
+            self.filesystem().rename(&log_lock, &log_destination)?;
+            if options.update_reference && new_tip.is_some() {
+                self.filesystem()
+                    .rename(&reference_lock, &reference_destination)?;
+            }
+            Ok(outcome)
+        })();
+        let _ = self.filesystem().remove_file(&reference_lock);
+        let _ = self.filesystem().remove_file(&log_lock);
+        result
     }
 
     pub(crate) fn append_reflog(
@@ -690,6 +1624,14 @@ impl Repository {
     }
 
     fn packed_references_with_prefix(&self, prefix: &str) -> Result<BTreeMap<String, Reference>> {
+        self.packed_references_with_prefix_bounded(prefix, usize::MAX)
+    }
+
+    fn packed_references_with_prefix_bounded(
+        &self,
+        prefix: &str,
+        max_references: usize,
+    ) -> Result<BTreeMap<String, Reference>> {
         let contents = match self.filesystem().read(&self.git_path("packed-refs")) {
             Ok(contents) => contents,
             Err(Error::NotFound(_)) => return Ok(BTreeMap::new()),
@@ -718,6 +1660,11 @@ impl Repository {
                         target: ReferenceTarget::Direct(ObjectId::from_str(hex)?),
                     },
                 );
+                if references.len() > max_references {
+                    return Err(Error::InvalidRepository(
+                        "packed reference enumeration exceeds limit".into(),
+                    ));
+                }
             }
         }
         Ok(references)
@@ -725,15 +1672,37 @@ impl Repository {
 }
 
 fn validate_read_name(name: &str) -> Result<()> {
-    if name == "HEAD" || (name.starts_with("refs/") && is_valid_refname(name, false)) {
+    let root_ref = !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
+    if root_ref || (name.starts_with("refs/") && is_valid_refname(name, false)) {
         Ok(())
     } else {
         Err(Error::InvalidReferenceName(name.to_owned()))
     }
 }
 
+fn reflog_broken_object_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::NotFound(_)
+            | Error::InvalidObjectId(_)
+            | Error::InvalidObject(_)
+            | Error::InvalidTree(_)
+            | Error::InvalidCommit(_)
+            | Error::Compression(_)
+    )
+}
+
 struct PreparedReferenceEdit {
     edit: ReferenceEdit,
+    destination: PathBuf,
+    lock: PathBuf,
+}
+
+struct PreparedMixedReferenceEdit {
+    edit: ReferenceTransactionEdit,
     destination: PathBuf,
     lock: PathBuf,
 }
@@ -744,11 +1713,32 @@ fn cleanup_ref_locks(repository: &Repository, prepared: &[PreparedReferenceEdit]
     }
 }
 
+fn cleanup_mixed_ref_locks(repository: &Repository, prepared: &[PreparedMixedReferenceEdit]) {
+    for item in prepared {
+        let _ = repository.filesystem().remove_file(&item.lock);
+    }
+}
+
 fn previous_matches(previous: PreviousValue, actual: Option<ObjectId>) -> bool {
     match previous {
         PreviousValue::Any => true,
         PreviousValue::MustNotExist => actual.is_none(),
         PreviousValue::MustExist(expected) => actual == Some(expected),
+    }
+}
+
+fn previous_reference_matches(
+    repository: &Repository,
+    previous: &PreviousReferenceValue,
+    actual: Option<&ReferenceTarget>,
+) -> bool {
+    match previous {
+        PreviousReferenceValue::Any => true,
+        PreviousReferenceValue::MustNotExist => actual.is_none(),
+        PreviousReferenceValue::MustExist(expected) => actual == Some(expected),
+        PreviousReferenceValue::MustResolveTo(expected) => {
+            actual.is_some() && resolved_target(repository, actual) == *expected
+        }
     }
 }
 
@@ -845,6 +1835,16 @@ fn append_reflog_line(
     output.push(b'\n');
 }
 
+fn resolved_target(repository: &Repository, target: Option<&ReferenceTarget>) -> ObjectId {
+    match target {
+        Some(ReferenceTarget::Direct(id)) => *id,
+        Some(ReferenceTarget::Symbolic(name)) => repository
+            .resolve_reference(name.as_str())
+            .unwrap_or_else(|_| ObjectId::null()),
+        None => ObjectId::null(),
+    }
+}
+
 fn parse_reflog_line(line: &[u8]) -> Result<ReflogEntry> {
     if line.len() < ObjectId::HEX_LENGTH * 2 + 3 {
         return Err(Error::InvalidReference("truncated reflog line".into()));
@@ -882,7 +1882,7 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
-    use crate::{FileSystem, InitOptions, MemoryFileSystem};
+    use crate::{CommitBuilder, FileSystem, GraphOptions, InitOptions, MemoryFileSystem, Tree};
 
     const FIRST: &str = "1111111111111111111111111111111111111111";
     const SECOND: &str = "2222222222222222222222222222222222222222";
@@ -912,9 +1912,23 @@ mod tests {
             "refs/heads/a.lock",
             "refs/heads/a?b",
             "refs/heads/a\\b",
+            "refs/heads/a b",
+            "refs/heads/a~b",
+            "refs/heads/a^b",
+            "refs/heads/a:b",
+            "refs/heads/a[b",
+            "refs/heads/a\tb",
+            "refs/heads/a.b.",
+            "refs/heads/a.lock.lock",
+            "@",
         ] {
             assert!(ReferenceName::new(invalid).is_err(), "{invalid}");
         }
+        // Single-level refs are valid only with allow_one_level.
+        assert!(ReferenceName::new("main").is_err());
+        assert!(crate::refs::is_valid_refname("main", true));
+        assert!(!crate::refs::is_valid_refname(".hidden", true));
+        assert!(!crate::refs::is_valid_refname("a..b", true));
     }
 
     #[test]
@@ -956,6 +1970,93 @@ mod tests {
             repository.resolve_reference("refs/heads/a"),
             Err(Error::SymbolicReferenceLoop(_))
         ));
+    }
+
+    #[test]
+    fn creates_reads_logs_and_deletes_symbolic_references() {
+        let (repository, fs) = repository();
+        let first = ObjectId::from_str(FIRST).unwrap();
+        let branch = ReferenceName::branch("main").unwrap();
+        repository
+            .update_reference(&branch, first, PreviousValue::MustNotExist)
+            .unwrap();
+        let alias = ReferenceName::new("refs/meta/current").unwrap();
+        let signature = Signature::new("A U Thor", "author@example.com", 1, 0).unwrap();
+        repository
+            .update_symbolic_reference(
+                "refs/meta/alias",
+                &alias,
+                PreviousReferenceValue::MustNotExist,
+                None,
+            )
+            .unwrap();
+        repository
+            .update_symbolic_reference(
+                alias.as_str(),
+                &branch,
+                PreviousReferenceValue::MustNotExist,
+                Some((&signature, b"link")),
+            )
+            .unwrap();
+        assert_eq!(
+            repository
+                .symbolic_reference("refs/meta/alias", false)
+                .unwrap(),
+            alias
+        );
+        assert_eq!(
+            repository
+                .symbolic_reference("refs/meta/alias", true)
+                .unwrap(),
+            branch
+        );
+        assert_eq!(
+            repository.resolve_reference("refs/meta/alias").unwrap(),
+            first
+        );
+        assert_eq!(
+            repository.read_reflog("refs/meta/current").unwrap().len(),
+            1
+        );
+        assert!(matches!(
+            repository.update_symbolic_reference(
+                "refs/meta/current",
+                &alias,
+                PreviousReferenceValue::MustNotExist,
+                None,
+            ),
+            Err(Error::ReferenceConflict(_))
+        ));
+        repository
+            .delete_symbolic_reference("refs/meta/current", &branch)
+            .unwrap();
+        assert!(!fs.exists(Path::new("repo/.git/refs/meta/current")).unwrap());
+        assert!(
+            repository
+                .read_reflog("refs/meta/current")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn symbolic_reference_supports_unborn_targets_and_protects_head() {
+        let (repository, _) = repository();
+        let unborn = ReferenceName::branch("unborn").unwrap();
+        repository
+            .update_symbolic_reference("HEAD", &unborn, PreviousReferenceValue::Any, None)
+            .unwrap();
+        assert_eq!(repository.symbolic_reference("HEAD", true).unwrap(), unborn);
+        assert!(
+            repository
+                .delete_symbolic_reference("HEAD", &unborn)
+                .is_err()
+        );
+        assert!(
+            repository
+                .symbolic_reference("refs/heads/missing", true)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1187,6 +2288,329 @@ mod tests {
         assert!(entries[0].committer().has_unknown_timezone());
         assert!(
             !fs.exists(Path::new("repo/.git/logs/refs/heads/main.lock"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn deletes_expires_rewrites_and_updates_reflogs_transactionally() {
+        let (repository, fs) = repository();
+        let name = ReferenceName::branch("main").unwrap();
+        let first = ObjectId::from_str(FIRST).unwrap();
+        let second = ObjectId::from_str(SECOND).unwrap();
+        let third = ObjectId::compute(crate::ObjectKind::Blob, b"third");
+        for (index, (id, previous)) in [
+            (first, PreviousValue::MustNotExist),
+            (second, PreviousValue::MustExist(first)),
+            (third, PreviousValue::MustExist(second)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            repository
+                .update_reference_with_reflog(
+                    &name,
+                    id,
+                    previous,
+                    &Signature::new(
+                        "Test",
+                        "test@example.com",
+                        i64::try_from(index).unwrap() + 1,
+                        0,
+                    )
+                    .unwrap(),
+                    format!("entry {index}").as_bytes(),
+                )
+                .unwrap();
+        }
+
+        let before = fs
+            .read(Path::new("repo/.git/logs/refs/heads/main"))
+            .unwrap();
+        let dry_run = repository
+            .delete_reflog_entries(
+                name.as_str(),
+                &[1],
+                &ReflogRewriteOptions {
+                    dry_run: true,
+                    rewrite: true,
+                    update_reference: true,
+                    ..ReflogRewriteOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(dry_run.removed, 1);
+        assert_eq!(
+            fs.read(Path::new("repo/.git/logs/refs/heads/main"))
+                .unwrap(),
+            before
+        );
+
+        repository
+            .delete_reflog_entries(
+                name.as_str(),
+                &[1],
+                &ReflogRewriteOptions {
+                    rewrite: true,
+                    ..ReflogRewriteOptions::default()
+                },
+            )
+            .unwrap();
+        let entries = repository.read_reflog(name.as_str()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].old_id(), first);
+        assert_eq!(entries[1].new_id(), third);
+
+        let outcome = repository
+            .expire_reflog_before(
+                name.as_str(),
+                3,
+                &ReflogRewriteOptions {
+                    rewrite: true,
+                    update_reference: true,
+                    ..ReflogRewriteOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome.removed, 1);
+        assert_eq!(outcome.new_tip, Some(third));
+        let entries = repository.read_reflog(name.as_str()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].old_id(), ObjectId::null());
+        assert_eq!(repository.resolve_reference(name.as_str()).unwrap(), third);
+        assert!(repository.read_reflog_bounded(name.as_str(), 0).is_err());
+        assert!(
+            repository
+                .delete_reflog_entries(name.as_str(), &[9], &ReflogRewriteOptions::default())
+                .is_err()
+        );
+        assert!(
+            !fs.exists(Path::new("repo/.git/refs/heads/main.lock"))
+                .unwrap()
+        );
+        assert!(
+            !fs.exists(Path::new("repo/.git/logs/refs/heads/main.lock"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn expires_unreachable_entries_lists_and_drops_logs() {
+        let (repository, fs) = repository();
+        let tree = repository.write_tree(&Tree::default()).unwrap();
+        let identity = Signature::new("Test", "test@example.com", 1, 0).unwrap();
+        let root = repository
+            .write_commit(&CommitBuilder::new(tree, identity.clone(), identity.clone()).build())
+            .unwrap();
+        let side = repository
+            .write_commit(
+                &CommitBuilder::new(tree, identity.clone(), identity.clone())
+                    .message(b"side".to_vec())
+                    .build(),
+            )
+            .unwrap();
+        let tip = repository
+            .write_commit(
+                &CommitBuilder::new(tree, identity.clone(), identity)
+                    .parent(root)
+                    .message(b"tip".to_vec())
+                    .build(),
+            )
+            .unwrap();
+        let name = ReferenceName::branch("main").unwrap();
+        for (index, (id, previous)) in [
+            (root, PreviousValue::MustNotExist),
+            (side, PreviousValue::MustExist(root)),
+            (tip, PreviousValue::MustExist(side)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            repository
+                .update_reference_with_reflog(
+                    &name,
+                    id,
+                    previous,
+                    &Signature::new(
+                        "Test",
+                        "test@example.com",
+                        i64::try_from(index).unwrap() + 1,
+                        0,
+                    )
+                    .unwrap(),
+                    b"move",
+                )
+                .unwrap();
+        }
+
+        let outcome = repository
+            .expire_reflog_unreachable_before(
+                name.as_str(),
+                3,
+                &GraphOptions::default(),
+                &ReflogRewriteOptions {
+                    rewrite: true,
+                    ..ReflogRewriteOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome.removed, 1);
+        let entries = repository.read_reflog(name.as_str()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].new_id(), root);
+        assert_eq!(entries[1].old_id(), root);
+        assert_eq!(entries[1].new_id(), tip);
+        assert_eq!(repository.reflogs(10, 10).unwrap(), vec!["refs/heads/main"]);
+        assert!(repository.drop_reflog(name.as_str()).unwrap());
+        assert!(!repository.drop_reflog(name.as_str()).unwrap());
+        assert!(repository.reflogs(10, 10).unwrap().is_empty());
+        assert!(
+            !fs.exists(Path::new("repo/.git/logs/refs/heads/main.lock"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn stale_fix_prunes_entries_with_broken_commit_closures() {
+        let (repository, _) = repository();
+        let tree = repository.write_tree(&Tree::default()).unwrap();
+        let identity = Signature::new("Test", "test@example.com", 1, 0).unwrap();
+        let valid = repository
+            .write_commit(&CommitBuilder::new(tree, identity.clone(), identity.clone()).build())
+            .unwrap();
+        let missing = ObjectId::from_str(FIRST).unwrap();
+        let name = ReferenceName::branch("broken").unwrap();
+        repository
+            .update_reference_with_reflog(
+                &name,
+                valid,
+                PreviousValue::MustNotExist,
+                &identity,
+                b"valid",
+            )
+            .unwrap();
+        repository
+            .update_reference_with_reflog(
+                &name,
+                missing,
+                PreviousValue::MustExist(valid),
+                &identity,
+                b"broken",
+            )
+            .unwrap();
+
+        let outcome = repository
+            .prune_stale_reflog_entries(
+                name.as_str(),
+                &GraphOptions::default(),
+                &ReflogRewriteOptions {
+                    rewrite: true,
+                    ..ReflogRewriteOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome.removed, 1);
+        let entries = repository.read_reflog(name.as_str()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].new_id(), valid);
+        assert_eq!(entries[0].old_id(), ObjectId::null());
+    }
+
+    #[test]
+    fn expire_reflog_removes_old_entries() {
+        let (repository, _) = repository();
+        let name = ReferenceName::branch("main").unwrap();
+        let first = ObjectId::from_str(FIRST).unwrap();
+        let second = ObjectId::from_str(SECOND).unwrap();
+
+        repository
+            .update_reference_with_reflog(
+                &name,
+                first,
+                PreviousValue::MustNotExist,
+                &Signature::new("A", "a@example.com", 100, 0).unwrap(),
+                b"first",
+            )
+            .unwrap();
+        repository
+            .update_reference_with_reflog(
+                &name,
+                second,
+                PreviousValue::Any,
+                &Signature::new("B", "b@example.com", 200, 0).unwrap(),
+                b"second",
+            )
+            .unwrap();
+
+        let outcome = repository
+            .expire_reflog_before(
+                name.as_str(),
+                150,
+                &ReflogRewriteOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(outcome.removed, 1, "expected 1 entry expired (timestamp=100 < 150)");
+        let entries = repository.read_reflog(name.as_str()).unwrap();
+        assert_eq!(entries.len(), 1, "expected 1 entry remaining");
+        assert_eq!(entries[0].new_id(), second, "remaining entry should be the newer one");
+    }
+
+    #[test]
+    fn mixed_transaction_updates_direct_and_symbolic_refs_atomically() {
+        let (repository, fs) = repository();
+        let first = ObjectId::from_str(FIRST).unwrap();
+        let second = ObjectId::from_str(SECOND).unwrap();
+        let main = ReferenceName::branch("main").unwrap();
+        let topic = ReferenceName::branch("topic").unwrap();
+        repository
+            .update_reference(&main, first, PreviousValue::MustNotExist)
+            .unwrap();
+        repository
+            .update_symbolic_reference("HEAD", &main, PreviousReferenceValue::Any, None)
+            .unwrap();
+        repository
+            .apply_mixed_reference_transaction(&[
+                ReferenceTransactionEdit::update(
+                    main.as_str(),
+                    ReferenceTarget::Direct(second),
+                    PreviousReferenceValue::MustExist(ReferenceTarget::Direct(first)),
+                ),
+                ReferenceTransactionEdit::update(
+                    "HEAD",
+                    ReferenceTarget::Symbolic(topic.clone()),
+                    PreviousReferenceValue::MustExist(ReferenceTarget::Symbolic(main.clone())),
+                ),
+                ReferenceTransactionEdit::update(
+                    topic.as_str(),
+                    ReferenceTarget::Direct(first),
+                    PreviousReferenceValue::MustNotExist,
+                ),
+            ])
+            .unwrap();
+        assert_eq!(repository.resolve_reference(main.as_str()).unwrap(), second);
+        assert_eq!(repository.resolve_reference("HEAD").unwrap(), first);
+
+        assert!(
+            repository
+                .apply_mixed_reference_transaction(&[
+                    ReferenceTransactionEdit::update(
+                        main.as_str(),
+                        ReferenceTarget::Direct(first),
+                        PreviousReferenceValue::MustExist(ReferenceTarget::Direct(first)),
+                    ),
+                    ReferenceTransactionEdit::update(
+                        "HEAD",
+                        ReferenceTarget::Symbolic(main.clone()),
+                        PreviousReferenceValue::MustExist(ReferenceTarget::Symbolic(topic)),
+                    ),
+                ])
+                .is_err()
+        );
+        assert_eq!(repository.resolve_reference(main.as_str()).unwrap(), second);
+        assert_eq!(repository.resolve_reference("HEAD").unwrap(), first);
+        assert!(!fs.exists(Path::new("repo/.git/HEAD.lock")).unwrap());
+        assert!(
+            !fs.exists(Path::new("repo/.git/refs/heads/main.lock"))
                 .unwrap()
         );
     }

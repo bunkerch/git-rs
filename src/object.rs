@@ -177,12 +177,25 @@ impl Repository {
         }
     }
 
-    /// Read and verify a loose object, refusing output larger than `max_size`.
+    /// Read and verify an object, transparently following enabled replace refs.
     ///
     /// # Errors
     /// Returns an error for missing, malformed, oversized, corrupt, or
     /// non-loose objects and for storage failures.
     pub fn read_object(&self, id: ObjectId, max_size: usize) -> Result<Object> {
+        let resolved = self.resolve_replacement(id)?;
+        self.read_object_raw(resolved, max_size)
+    }
+
+    /// Read an object by its actual ID without consulting replace refs.
+    ///
+    /// This is intended for integrity checking and replace-ref administration.
+    /// Most callers should use [`Repository::read_object`].
+    ///
+    /// # Errors
+    /// Returns an error for missing, malformed, oversized, corrupt, or
+    /// unsupported object storage, or for filesystem failures.
+    pub fn read_object_raw(&self, id: ObjectId, max_size: usize) -> Result<Object> {
         let compressed = match self.filesystem().read(&self.git_path(object_path(id))) {
             Ok(compressed) => compressed,
             Err(Error::NotFound(_)) => return self.read_packed_object(id, max_size),
@@ -207,6 +220,16 @@ impl Repository {
     /// Returns a storage error if existence cannot be determined.
     pub fn contains_loose_object(&self, id: ObjectId) -> Result<bool> {
         self.filesystem().exists(&self.git_path(object_path(id)))
+    }
+
+    /// Test whether an object ID is present in loose or packed storage without
+    /// inflating its contents.
+    ///
+    /// # Errors
+    /// Returns an error when storage cannot be inspected or a pack index is
+    /// malformed.
+    pub fn contains_object(&self, id: ObjectId) -> Result<bool> {
+        Ok(self.contains_loose_object(id)? || self.contains_packed_object(id)?)
     }
 }
 
@@ -337,7 +360,7 @@ mod tests {
     use std::str::FromStr;
 
     use super::{ObjectId, ObjectKind, object_path, sha1};
-    use crate::{Error, FileSystem, InitOptions, MemoryFileSystem, Repository};
+    use crate::{Error, FileSystem, InitOptions, MemoryFileSystem, PackOptions, Repository};
 
     #[test]
     fn parses_and_formats_git_hex_object_ids() {
@@ -423,6 +446,22 @@ mod tests {
             repository.read_object(id, 1024),
             Err(Error::InvalidObject(_))
         ));
+    }
+
+    #[test]
+    fn finds_objects_from_pack_indexes_without_inflating_them() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let id = repository
+            .write_object(ObjectKind::Blob, b"packed")
+            .unwrap();
+        repository
+            .write_pack(&[id], &PackOptions::default())
+            .unwrap();
+        fs.remove_file(&repository.git_path(object_path(id)))
+            .unwrap();
+        assert!(!repository.contains_loose_object(id).unwrap());
+        assert!(repository.contains_object(id).unwrap());
     }
 
     fn hex(bytes: [u8; 20]) -> String {

@@ -8,13 +8,14 @@ use crate::{
     ReferenceTarget, Repository, Result, Sideband,
 };
 
-const CAPABILITIES: &str =
-    "side-band-64k ofs-delta no-progress object-format=sha1 agent=git-rs/0.1";
+const CAPABILITIES: &str = "side-band-64k ofs-delta no-progress shallow deepen-relative object-format=sha1 agent=git-rs/0.1";
 
 /// Limits and encoding choices for an upload-pack session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UploadPackOptions {
     pub max_object_size: usize,
+    pub max_objects: usize,
+    pub max_tag_depth: usize,
     pub use_deltas: bool,
 }
 
@@ -22,6 +23,8 @@ impl Default for UploadPackOptions {
     fn default() -> Self {
         Self {
             max_object_size: 1024 * 1024 * 1024,
+            max_objects: 10_000_000,
+            max_tag_depth: 64,
             use_deltas: true,
         }
     }
@@ -33,6 +36,9 @@ pub struct UploadPackRequest {
     wants: Vec<ObjectId>,
     haves: Vec<ObjectId>,
     capabilities: Vec<Capability>,
+    shallow: Vec<ObjectId>,
+    depth: Option<usize>,
+    deepen_relative: bool,
     done: bool,
 }
 
@@ -43,12 +49,16 @@ impl UploadPackRequest {
     /// # Errors
     /// Returns an error for malformed framing, invalid commands, capabilities
     /// outside the supported advertisement, or data following `done`.
+    #[allow(clippy::too_many_lines)]
     pub fn parse(input: &[u8]) -> Result<Self> {
         let mut decoder = PktLineDecoder::new();
         decoder.extend(input);
         let mut wants = Vec::new();
         let mut haves = Vec::new();
         let mut capabilities = Vec::new();
+        let mut shallow = Vec::new();
+        let mut depth = None;
+        let mut deepen_relative = false;
         let mut want_section = true;
         let mut done = false;
         while let Some(packet) = decoder.next_packet()? {
@@ -63,17 +73,45 @@ impl UploadPackRequest {
                         line.pop();
                     }
                     if want_section {
-                        let (id, requested) = parse_want(&line, wants.is_empty())?;
-                        if wants.contains(&id) {
-                            return protocol_error(format!("duplicate want {id}"));
+                        if line.starts_with(b"want ") {
+                            let (id, requested) = parse_want(&line, wants.is_empty())?;
+                            if wants.contains(&id) {
+                                return protocol_error(format!("duplicate want {id}"));
+                            }
+                            if wants.is_empty() {
+                                validate_capabilities(&requested)?;
+                                capabilities = requested;
+                            } else if !requested.is_empty() {
+                                return protocol_error(
+                                    "capabilities are only valid on the first want",
+                                );
+                            }
+                            wants.push(id);
+                        } else if let Some(value) = line.strip_prefix(b"shallow ") {
+                            if wants.is_empty() {
+                                return protocol_error("shallow precedes want");
+                            }
+                            let id = parse_exact_id(value, "shallow")?;
+                            if shallow.contains(&id) {
+                                return protocol_error(format!("duplicate shallow {id}"));
+                            }
+                            shallow.push(id);
+                        } else if let Some(value) = line.strip_prefix(b"deepen ") {
+                            if wants.is_empty() || depth.is_some() {
+                                return protocol_error("invalid or duplicate deepen");
+                            }
+                            let value = std::str::from_utf8(value)
+                                .map_err(|_| Error::Protocol("deepen is not ASCII".into()))?;
+                            let parsed = value
+                                .parse::<usize>()
+                                .map_err(|_| Error::Protocol("invalid deepen depth".into()))?;
+                            if parsed == 0 {
+                                return protocol_error("deepen depth must be positive");
+                            }
+                            depth = Some(parsed);
+                        } else {
+                            return protocol_error("unexpected command in want section");
                         }
-                        if wants.is_empty() {
-                            validate_capabilities(&requested)?;
-                            capabilities = requested;
-                        } else if !requested.is_empty() {
-                            return protocol_error("capabilities are only valid on the first want");
-                        }
-                        wants.push(id);
                     } else if let Some(value) = line.strip_prefix(b"have ") {
                         let id = parse_exact_id(value, "have")?;
                         if !haves.contains(&id) {
@@ -100,10 +138,19 @@ impl UploadPackRequest {
         if wants.is_empty() {
             return protocol_error("upload-pack request has no wants");
         }
+        deepen_relative |= capabilities
+            .iter()
+            .any(|capability| capability.name() == "deepen-relative");
+        if deepen_relative && depth.is_none() {
+            return protocol_error("deepen-relative requires deepen");
+        }
         Ok(Self {
             wants,
             haves,
             capabilities,
+            shallow,
+            depth,
+            deepen_relative,
             done,
         })
     }
@@ -121,6 +168,21 @@ impl UploadPackRequest {
     #[must_use]
     pub fn capabilities(&self) -> &[Capability] {
         &self.capabilities
+    }
+
+    #[must_use]
+    pub fn shallow(&self) -> &[ObjectId] {
+        &self.shallow
+    }
+
+    #[must_use]
+    pub const fn depth(&self) -> Option<usize> {
+        self.depth
+    }
+
+    #[must_use]
+    pub const fn is_deepen_relative(&self) -> bool {
+        self.deepen_relative
     }
 
     #[must_use]
@@ -156,6 +218,12 @@ impl Repository {
                 ReferenceTarget::Symbolic(_) => self.resolve_reference(reference.name())?,
             };
             advertised.push((reference.name().to_owned(), id));
+            if reference.name().starts_with("refs/tags/") {
+                let peeled = self.peel_tag(id, 64, 1024 * 1024 * 1024)?;
+                if peeled.id != id {
+                    advertised.push((format!("{}^{{}}", reference.name()), peeled.id));
+                }
+            }
         }
         advertised.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         if head_target.is_some() {
@@ -208,9 +276,55 @@ impl Repository {
             return protocol_error(format!("want {id} is not an advertised ref"));
         }
 
-        let common = self.reachable_objects(&request.haves, options.max_object_size, true)?;
+        let mut client_shallow = request.shallow.iter().copied().collect::<BTreeSet<_>>();
+        client_shallow.extend(self.shallow_commits(&crate::ShallowOptions {
+            max_commits: options.max_objects,
+            max_object_size: options.max_object_size,
+        })?);
+        let common = self.reachable_objects_stopping_at(
+            &request.haves,
+            options.max_object_size,
+            true,
+            options.max_objects,
+            &client_shallow,
+        )?;
         let acknowledged = request.haves.iter().rev().find(|id| common.contains(id));
         let mut response = Vec::new();
+        let wanted = if let Some(depth) = request.depth {
+            let (wanted, boundaries, unshallow) = if request.deepen_relative {
+                self.reachable_objects_deepen_relative(
+                    &request.wants,
+                    &request.shallow.iter().copied().collect(),
+                    depth,
+                    options.max_object_size,
+                    options.max_objects,
+                )?
+            } else {
+                let (wanted, boundaries) = self.reachable_objects_at_depth(
+                    &request.wants,
+                    depth,
+                    options.max_object_size,
+                    options.max_objects,
+                )?;
+                let unshallow = request
+                    .shallow
+                    .iter()
+                    .copied()
+                    .filter(|id| !boundaries.contains(id) && wanted.contains(id))
+                    .collect();
+                (wanted, boundaries, unshallow)
+            };
+            for id in &boundaries {
+                append_packet(&mut response, format!("shallow {id}\n").as_bytes())?;
+            }
+            for id in &unshallow {
+                append_packet(&mut response, format!("unshallow {id}\n").as_bytes())?;
+            }
+            response.extend(PktLine::Flush.encode()?);
+            wanted
+        } else {
+            Vec::new()
+        };
         let negotiation = acknowledged.map_or_else(
             || b"NAK\n".to_vec(),
             |id| format!("ACK {id}\n").into_bytes(),
@@ -220,7 +334,16 @@ impl Repository {
             return Ok(response);
         }
 
-        let wanted = self.reachable_objects(&request.wants, options.max_object_size, false)?;
+        let wanted = if request.depth.is_some() {
+            wanted
+        } else {
+            self.reachable_objects_bounded(
+                &request.wants,
+                options.max_object_size,
+                false,
+                options.max_objects,
+            )?
+        };
         let pack_ids = wanted
             .into_iter()
             .filter(|id| !common.contains(id))
@@ -257,11 +380,42 @@ impl Repository {
         Ok(ids)
     }
 
-    fn reachable_objects(
+    pub(crate) fn reachable_objects(
         &self,
         roots: &[ObjectId],
         max_size: usize,
         ignore_missing_roots: bool,
+    ) -> Result<Vec<ObjectId>> {
+        self.reachable_objects_bounded(roots, max_size, ignore_missing_roots, usize::MAX)
+    }
+
+    pub(crate) fn reachable_objects_bounded(
+        &self,
+        roots: &[ObjectId],
+        max_size: usize,
+        ignore_missing_roots: bool,
+        max_objects: usize,
+    ) -> Result<Vec<ObjectId>> {
+        let shallow = self.shallow_commits(&crate::ShallowOptions {
+            max_commits: max_objects,
+            max_object_size: max_size,
+        })?;
+        self.reachable_objects_stopping_at(
+            roots,
+            max_size,
+            ignore_missing_roots,
+            max_objects,
+            &shallow,
+        )
+    }
+
+    pub(crate) fn reachable_objects_stopping_at(
+        &self,
+        roots: &[ObjectId],
+        max_size: usize,
+        ignore_missing_roots: bool,
+        max_objects: usize,
+        shallow: &BTreeSet<ObjectId>,
     ) -> Result<Vec<ObjectId>> {
         let mut seen = BTreeSet::new();
         let mut ordered = Vec::new();
@@ -276,12 +430,19 @@ impl Repository {
                 Err(error) => return Err(error),
             };
             seen.insert(id);
+            if seen.len() > max_objects {
+                return Err(Error::InvalidObject(
+                    "reachable object traversal exceeds limit".into(),
+                ));
+            }
             ordered.push(id);
             match object.kind() {
                 ObjectKind::Commit => {
                     let commit = crate::Commit::parse(object.data())?;
-                    for parent in commit.parents().iter().rev() {
-                        stack.push(*parent);
+                    if !shallow.contains(&id) {
+                        for parent in commit.parents().iter().rev() {
+                            stack.push(*parent);
+                        }
                     }
                     stack.push(commit.tree());
                 }
@@ -293,12 +454,209 @@ impl Repository {
                         }
                     }
                 }
-                ObjectKind::Tag => stack.push(parse_tag_target(object.data())?),
+                ObjectKind::Tag => stack.push(crate::AnnotatedTag::parse(object.data())?.target()),
                 ObjectKind::Blob => {}
             }
         }
         Ok(ordered)
     }
+
+    pub(crate) fn reachable_objects_at_depth(
+        &self,
+        roots: &[ObjectId],
+        depth: usize,
+        max_size: usize,
+        max_objects: usize,
+    ) -> Result<(Vec<ObjectId>, BTreeSet<ObjectId>)> {
+        if depth == 0 {
+            return protocol_error("shallow depth must be positive");
+        }
+        let mut objects = BTreeSet::new();
+        let mut ordered = Vec::new();
+        let mut boundaries = BTreeSet::new();
+        let mut commits = std::collections::VecDeque::new();
+        for root in roots {
+            let mut id = *root;
+            loop {
+                let object = self.read_object(id, max_size)?;
+                if objects.insert(id) {
+                    ordered.push(id);
+                    ensure_object_limit(objects.len(), max_objects)?;
+                }
+                if object.kind() != ObjectKind::Tag {
+                    if object.kind() == ObjectKind::Commit {
+                        commits.push_back((id, 1usize));
+                    } else {
+                        self.collect_non_commit_closure(
+                            id,
+                            max_size,
+                            max_objects,
+                            &mut objects,
+                            &mut ordered,
+                        )?;
+                    }
+                    break;
+                }
+                id = crate::AnnotatedTag::parse(object.data())?.target();
+            }
+        }
+        let mut commit_depths = std::collections::BTreeMap::new();
+        let repository_shallow = self.shallow_commits(&crate::ShallowOptions {
+            max_commits: max_objects,
+            max_object_size: max_size,
+        })?;
+        while let Some((id, current_depth)) = commits.pop_front() {
+            if commit_depths
+                .get(&id)
+                .is_some_and(|known| *known <= current_depth)
+            {
+                continue;
+            }
+            commit_depths.insert(id, current_depth);
+            let commit = self.read_commit(id, max_size)?;
+            if objects.insert(id) {
+                ordered.push(id);
+                ensure_object_limit(objects.len(), max_objects)?;
+            }
+            self.collect_non_commit_closure(
+                commit.tree(),
+                max_size,
+                max_objects,
+                &mut objects,
+                &mut ordered,
+            )?;
+            if repository_shallow.contains(&id) {
+                boundaries.insert(id);
+            } else if current_depth == depth {
+                if !commit.parents().is_empty() {
+                    boundaries.insert(id);
+                }
+            } else {
+                for parent in commit.parents() {
+                    commits.push_back((*parent, current_depth.saturating_add(1)));
+                }
+            }
+        }
+        Ok((ordered, boundaries))
+    }
+
+    pub(crate) fn reachable_objects_deepen_relative(
+        &self,
+        roots: &[ObjectId],
+        client_shallow: &BTreeSet<ObjectId>,
+        additional_depth: usize,
+        max_size: usize,
+        max_objects: usize,
+    ) -> Result<(Vec<ObjectId>, BTreeSet<ObjectId>, BTreeSet<ObjectId>)> {
+        if additional_depth == 0 {
+            return protocol_error("relative deepen depth must be positive");
+        }
+        let mut ordered = self.reachable_objects_stopping_at(
+            roots,
+            max_size,
+            false,
+            max_objects,
+            client_shallow,
+        )?;
+        let mut objects = ordered.iter().copied().collect::<BTreeSet<_>>();
+        let reached = client_shallow
+            .iter()
+            .copied()
+            .filter(|id| objects.contains(id))
+            .collect::<BTreeSet<_>>();
+        let repository_shallow = self.shallow_commits(&crate::ShallowOptions {
+            max_commits: max_objects,
+            max_object_size: max_size,
+        })?;
+        let mut boundaries = BTreeSet::new();
+        let mut unshallow = BTreeSet::new();
+        let mut commits = std::collections::VecDeque::new();
+        for id in reached {
+            if repository_shallow.contains(&id) {
+                boundaries.insert(id);
+                continue;
+            }
+            unshallow.insert(id);
+            for parent in self.read_commit(id, max_size)?.parents() {
+                commits.push_back((*parent, 1usize));
+            }
+        }
+        let mut commit_depths = std::collections::BTreeMap::new();
+        while let Some((id, current_depth)) = commits.pop_front() {
+            if commit_depths
+                .get(&id)
+                .is_some_and(|known| *known <= current_depth)
+            {
+                continue;
+            }
+            commit_depths.insert(id, current_depth);
+            let commit = self.read_commit(id, max_size)?;
+            if objects.insert(id) {
+                ordered.push(id);
+                ensure_object_limit(objects.len(), max_objects)?;
+            }
+            self.collect_non_commit_closure(
+                commit.tree(),
+                max_size,
+                max_objects,
+                &mut objects,
+                &mut ordered,
+            )?;
+            if repository_shallow.contains(&id)
+                || current_depth == additional_depth && !commit.parents().is_empty()
+            {
+                boundaries.insert(id);
+            } else {
+                for parent in commit.parents() {
+                    commits.push_back((*parent, current_depth.saturating_add(1)));
+                }
+            }
+        }
+        Ok((ordered, boundaries, unshallow))
+    }
+
+    fn collect_non_commit_closure(
+        &self,
+        root: ObjectId,
+        max_size: usize,
+        max_objects: usize,
+        objects: &mut BTreeSet<ObjectId>,
+        ordered: &mut Vec<ObjectId>,
+    ) -> Result<()> {
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if !objects.insert(id) {
+                continue;
+            }
+            ordered.push(id);
+            ensure_object_limit(objects.len(), max_objects)?;
+            let object = self.read_object(id, max_size)?;
+            match object.kind() {
+                ObjectKind::Tree => {
+                    let tree = crate::Tree::parse(object.data())?;
+                    for entry in tree.entries().iter().rev() {
+                        if entry.mode() != EntryMode::Gitlink {
+                            stack.push(entry.id());
+                        }
+                    }
+                }
+                ObjectKind::Blob => {}
+                ObjectKind::Tag | ObjectKind::Commit => {
+                    return protocol_error("non-commit closure reached commit or tag");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn ensure_object_limit(count: usize, max_objects: usize) -> Result<()> {
+    if count > max_objects {
+        return Err(Error::InvalidObject(
+            "reachable object traversal exceeds limit".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_want(line: &[u8], first: bool) -> Result<(ObjectId, Vec<Capability>)> {
@@ -332,7 +690,9 @@ fn parse_exact_id(value: &[u8], command: &str) -> Result<ObjectId> {
 fn validate_capabilities(capabilities: &[Capability]) -> Result<()> {
     for capability in capabilities {
         let valid = match capability.name() {
-            "side-band-64k" | "ofs-delta" | "no-progress" => capability.value().is_none(),
+            "side-band-64k" | "ofs-delta" | "no-progress" | "shallow" | "deepen-relative" => {
+                capability.value().is_none()
+            }
             "object-format" => capability.value() == Some("sha1"),
             "agent" => capability.value().is_some(),
             _ => false,
@@ -345,18 +705,6 @@ fn validate_capabilities(capabilities: &[Capability]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn parse_tag_target(data: &[u8]) -> Result<ObjectId> {
-    let line = data
-        .split(|byte| *byte == b'\n')
-        .next()
-        .ok_or_else(|| Error::InvalidObject("tag has no object header".into()))?;
-    let value = line
-        .strip_prefix(b"object ")
-        .ok_or_else(|| Error::InvalidObject("tag has no object header".into()))?;
-    parse_exact_id(value, "tag object")
-        .map_err(|_| Error::InvalidObject("invalid tag target".into()))
 }
 
 fn append_packet(output: &mut Vec<u8>, data: &[u8]) -> Result<()> {

@@ -48,6 +48,6 @@ the API safe to hand to future checkout code across filesystem adapters.
 The examples update an index and inspect any Git-created v2-v4 index:
 
 ```console
-cargo run --example update_index -- my-repository path/to/file contents 4
+cargo run --example update_index -- my-repository path/to/file --add --index-version=4
 cargo run --example ls_files -- my-repository
 ```
