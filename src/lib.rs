@@ -107,7 +107,8 @@ pub use ls_files::{LsFilesEntry, LsFilesKind, LsFilesOptions};
 pub use ls_tree::{LsTreeEntry, LsTreeOptions};
 pub use maintenance::{MaintenanceOptions, MaintenanceOutcome, MaintenanceReport, MaintenanceTask};
 pub use merge::{
-    FastForwardMode, MergeOptions, MergeResult, ReplayKind, ReplayOptions, ReplayResult,
+    FastForwardMode, MergeOptions, MergeResult, MergeTreeConflict, MergeTreeOptions,
+    MergeTreeResult, MergeTreeStage, ReplayKind, ReplayOptions, ReplayResult,
 };
 pub use multi_pack_index::{
     MultiPackIndex, MultiPackIndexEntry, MultiPackIndexOptions, MultiPackIndexReport,

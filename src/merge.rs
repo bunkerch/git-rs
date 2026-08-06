@@ -47,6 +47,46 @@ pub enum MergeResult {
     Conflicted { paths: Vec<Vec<u8>> },
 }
 
+/// Choices for a non-checkout tree merge.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MergeTreeOptions {
+    /// Use this commit or tree as the merge base instead of discovering bases.
+    pub merge_base: Option<ObjectId>,
+    /// Treat the empty tree as the base when the commits have no common history.
+    pub allow_unrelated_histories: bool,
+    pub graph: GraphOptions,
+}
+
+/// One stage of a conflicted path returned by [`Repository::merge_tree`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MergeTreeStage {
+    pub stage: u8,
+    pub mode: u32,
+    pub id: ObjectId,
+}
+
+/// Structured conflict information from a non-checkout tree merge.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergeTreeConflict {
+    pub path: Vec<u8>,
+    /// Present stages in Git index order: base (1), ours (2), theirs (3).
+    pub stages: Vec<MergeTreeStage>,
+}
+
+/// Tree object and conflicts produced without changing repository state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergeTreeResult {
+    pub tree: ObjectId,
+    pub conflicts: Vec<MergeTreeConflict>,
+}
+
+impl MergeTreeResult {
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.conflicts.is_empty()
+    }
+}
+
 /// Direction of a single-commit replay.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayKind {
@@ -104,6 +144,93 @@ struct TreeMerge {
 }
 
 impl Repository {
+    /// Merge two commits into a new tree without reading or changing `HEAD`,
+    /// refs, the index, or the worktree.
+    ///
+    /// The resulting tree is written to object storage. Conflicted regular
+    /// files contain marker text in that tree, while `conflicts` retains the
+    /// original base/ours/theirs stages as typed object identities.
+    ///
+    /// # Errors
+    /// Returns an error for non-commit inputs without an explicit base,
+    /// unrelated histories unless allowed, invalid object kinds, corrupt
+    /// graphs or trees, resource-limit violations, or storage failures.
+    pub fn merge_tree(
+        &self,
+        ours: ObjectId,
+        theirs: ObjectId,
+        options: &MergeTreeOptions,
+    ) -> Result<MergeTreeResult> {
+        let (base_tree, ours_tree, theirs_tree) = if let Some(base) = options.merge_base {
+            (
+                self.merge_input_tree(base, options.graph.max_object_size)?,
+                self.merge_input_tree(ours, options.graph.max_object_size)?,
+                self.merge_input_tree(theirs, options.graph.max_object_size)?,
+            )
+        } else {
+            let ours_commit = self.read_commit(ours, options.graph.max_object_size)?;
+            let theirs_commit = self.read_commit(theirs, options.graph.max_object_size)?;
+            let bases = self.merge_bases(ours, theirs, &options.graph)?;
+            let base_tree = if bases.is_empty() {
+                if !options.allow_unrelated_histories {
+                    return Err(Error::InvalidRepository(
+                        "refusing to merge unrelated histories".into(),
+                    ));
+                }
+                self.empty_tree()?
+            } else {
+                self.combined_merge_base_tree(
+                    &bases,
+                    &MergeOptions {
+                        graph: options.graph.clone(),
+                        ..MergeOptions::default()
+                    },
+                )?
+            };
+            (base_tree, ours_commit.tree(), theirs_commit.tree())
+        };
+        let merged = self.merge_trees(
+            base_tree,
+            ours_tree,
+            theirs_tree,
+            theirs,
+            &MergeOptions {
+                graph: options.graph.clone(),
+                ..MergeOptions::default()
+            },
+        )?;
+        let tree = self.write_merge_result_tree(&merged)?;
+        let conflicts = merged
+            .conflicts
+            .iter()
+            .map(|conflict| MergeTreeConflict {
+                path: conflict.path.clone(),
+                stages: [(1, conflict.base), (2, conflict.ours), (3, conflict.theirs)]
+                    .into_iter()
+                    .filter_map(|(stage, entry)| {
+                        entry.map(|entry| MergeTreeStage {
+                            stage,
+                            mode: entry.mode,
+                            id: entry.id,
+                        })
+                    })
+                    .collect(),
+            })
+            .collect();
+        Ok(MergeTreeResult { tree, conflicts })
+    }
+
+    fn merge_input_tree(&self, id: ObjectId, max_size: usize) -> Result<ObjectId> {
+        let object = self.read_object(id, max_size)?;
+        match object.kind() {
+            ObjectKind::Commit => Ok(crate::Commit::parse(object.data())?.tree()),
+            ObjectKind::Tree => Ok(id),
+            kind => Err(Error::InvalidObject(format!(
+                "merge-tree input {id} is {kind:?}, expected commit or tree"
+            ))),
+        }
+    }
+
     /// Apply or reverse the change introduced by one commit.
     ///
     /// # Errors
@@ -659,7 +786,7 @@ impl Repository {
                 IndexEntry::new(path.clone(), value.mode, value.id, StatData::default())
             })
             .collect::<Result<Vec<_>>>()?;
-        self.write_index_tree(&Index::new(self.read_index()?.version(), entries)?)
+        self.write_index_tree(&Index::new(crate::IndexVersion::V2, entries)?)
     }
 
     fn write_merge_state(&self, target: ObjectId, message: &[u8]) -> Result<()> {
@@ -913,13 +1040,145 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        FastForwardMode, MergeOptions, MergeResult, ReplayKind, ReplayOptions, ReplayResult,
+        FastForwardMode, MergeOptions, MergeResult, MergeTreeOptions, ReplayKind, ReplayOptions,
+        ReplayResult,
     };
     use crate::{
         CheckoutOptions, CommitBuilder, EntryMode, FileSystem, InitOptions, MemoryFileSystem,
         ObjectKind, PreviousValue, ReferenceName, Repository, Signature, Tree, TreeEntry,
     };
 
+    #[test]
+    fn merge_tree_writes_result_and_structured_conflicts_without_mutating_state() {
+        let (repository, filesystem, _) = repository();
+        let base = commit(
+            &repository,
+            &[],
+            &[(&b"a"[..], b"base a\n"), (&b"b"[..], b"base b\n")],
+            1,
+        );
+        let ours = commit(
+            &repository,
+            &[base],
+            &[(&b"a"[..], b"ours a\n"), (&b"b"[..], b"base b\n")],
+            2,
+        );
+        let theirs = commit(
+            &repository,
+            &[base],
+            &[(&b"a"[..], b"base a\n"), (&b"b"[..], b"theirs b\n")],
+            3,
+        );
+        set_main(&repository, ours);
+        checkout(&repository, ours);
+        let head_before = filesystem.read(Path::new("repo/.git/HEAD")).unwrap();
+        let index_before = filesystem.read(Path::new("repo/.git/index")).unwrap();
+        let worktree_before = filesystem.read(Path::new("repo/a")).unwrap();
+
+        let clean = repository
+            .merge_tree(ours, theirs, &MergeTreeOptions::default())
+            .unwrap();
+        assert!(clean.is_clean());
+        let entries = repository.flattened_tree(clean.tree, 4096).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            repository.read_object(entries[0].id, 4096).unwrap().data(),
+            b"ours a\n"
+        );
+        assert_eq!(
+            repository.read_object(entries[1].id, 4096).unwrap().data(),
+            b"theirs b\n"
+        );
+
+        let conflicting = commit(
+            &repository,
+            &[base],
+            &[(&b"a"[..], b"theirs a\n"), (&b"b"[..], b"base b\n")],
+            4,
+        );
+        let result = repository
+            .merge_tree(ours, conflicting, &MergeTreeOptions::default())
+            .unwrap();
+        assert!(!result.is_clean());
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(result.conflicts[0].path, b"a");
+        assert_eq!(
+            result.conflicts[0]
+                .stages
+                .iter()
+                .map(|stage| stage.stage)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        let marker = repository
+            .flattened_tree(result.tree, 4096)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.path == b"a")
+            .unwrap();
+        assert!(
+            repository
+                .read_object(marker.id, 4096)
+                .unwrap()
+                .data()
+                .starts_with(b"<<<<<<< HEAD\n")
+        );
+        assert_eq!(
+            filesystem.read(Path::new("repo/.git/HEAD")).unwrap(),
+            head_before
+        );
+        assert_eq!(
+            filesystem.read(Path::new("repo/.git/index")).unwrap(),
+            index_before
+        );
+        assert_eq!(
+            filesystem.read(Path::new("repo/a")).unwrap(),
+            worktree_before
+        );
+        assert!(
+            !filesystem
+                .exists(Path::new("repo/.git/MERGE_HEAD"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn merge_tree_runs_in_a_bare_repository_and_accepts_an_explicit_tree_base() {
+        let repository = Repository::init(
+            MemoryFileSystem::new(),
+            "repo.git",
+            &InitOptions {
+                bare: true,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        let base = commit(&repository, &[], &[(&b"file"[..], b"base\n")], 1);
+        let ours = commit(&repository, &[base], &[(&b"file"[..], b"ours\n")], 2);
+        let base_tree = repository.read_commit(base, 4096).unwrap().tree();
+        let theirs = commit(
+            &repository,
+            &[base],
+            &[(&b"file"[..], b"base\n"), (&b"other"[..], b"new\n")],
+            3,
+        );
+        let theirs_tree = repository.read_commit(theirs, 4096).unwrap().tree();
+        let result = repository
+            .merge_tree(
+                ours,
+                theirs_tree,
+                &MergeTreeOptions {
+                    merge_base: Some(base_tree),
+                    ..MergeTreeOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(result.is_clean());
+        assert_eq!(
+            repository.flattened_tree(result.tree, 4096).unwrap().len(),
+            2
+        );
+    }
     #[test]
     fn fast_forwards_and_detects_up_to_date_heads() {
         let (repository, filesystem, signature) = repository();

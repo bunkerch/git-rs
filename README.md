@@ -98,6 +98,8 @@ Stateful good/bad/skip revision bisection and midpoint selection are documented
 in [`docs/bisect.md`](docs/bisect.md).
 Fast-forward, three-way, conflict, continue, and abort behavior is documented
 in [`docs/merge.md`](docs/merge.md).
+The same engine is exposed as a non-checkout, bare-compatible tree merge with
+structured conflict stages.
 Cherry-pick and revert behavior is documented in
 [`docs/replay.md`](docs/replay.md).
 Typed tree/index differences and unified patches are documented in
