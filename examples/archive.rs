@@ -7,7 +7,7 @@ fn main() -> git_rs::Result<()> {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
     assert!(
         arguments.len() >= 3,
-        "usage: archive <repository> <revision> <output> [--zip] [--prefix=<path>] [path...]"
+        "usage: archive <repository> <revision> <output> [--zip] [--worktree-attributes] [--prefix=<path>] [path...]"
     );
     let repository_path = std::fs::canonicalize(Path::new(&arguments[0]))?;
     let storage_root = repository_path
@@ -39,6 +39,9 @@ fn main() -> git_rs::Result<()> {
             format,
             prefix,
             paths,
+            worktree_attributes: arguments
+                .iter()
+                .any(|argument| argument == "--worktree-attributes"),
             ..ArchiveOptions::default()
         },
     )?;

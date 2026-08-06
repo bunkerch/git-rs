@@ -122,7 +122,11 @@ impl Repository {
                 "worktree attribute lookup requires a worktree".into(),
             ));
         }
-        let index = self.read_index()?;
+        let index = if matches!(options.source, AttributeSource::Tree(_)) {
+            crate::Index::default()
+        } else {
+            self.read_index()?
+        };
         let indexed = index
             .entries()
             .iter()

@@ -1,7 +1,8 @@
 //! Deterministic TAR and ZIP archives generated from stored Git trees.
 
 use crate::{
-    AnnotatedTag, EntryMode, Error, ObjectId, ObjectKind, Repository, Result, RevisionOptions,
+    AnnotatedTag, AttributeSource, AttributeValue, CheckAttributesOptions, EntryMode, Error,
+    ObjectId, ObjectKind, Repository, Result, RevisionOptions,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -20,9 +21,14 @@ pub struct ArchiveOptions {
     pub paths: Vec<Vec<u8>>,
     /// Override the commit timestamp (or zero for a tree object).
     pub timestamp: Option<u64>,
+    /// Read attributes from the worktree/index instead of the archived tree.
+    pub worktree_attributes: bool,
     pub max_object_size: usize,
     pub max_archive_size: usize,
     pub max_entries: usize,
+    pub max_attribute_files: usize,
+    pub max_attribute_rules: usize,
+    pub max_attribute_macro_depth: usize,
 }
 
 impl Default for ArchiveOptions {
@@ -32,9 +38,13 @@ impl Default for ArchiveOptions {
             prefix: Vec::new(),
             paths: Vec::new(),
             timestamp: None,
+            worktree_attributes: false,
             max_object_size: 1024 * 1024 * 1024,
             max_archive_size: 4 * 1024 * 1024 * 1024,
             max_entries: 10_000_000,
+            max_attribute_files: 4096,
+            max_attribute_rules: 1_000_000,
+            max_attribute_macro_depth: 64,
         }
     }
 }
@@ -93,7 +103,16 @@ impl Repository {
             .collect::<Result<Vec<_>>>()?;
         let mut matched = vec![false; selections.len()];
         let mut entries = Vec::new();
-        self.collect_archive_entries(tree, b"", &selections, &mut matched, options, &mut entries)?;
+        self.collect_archive_entries(
+            tree,
+            commit_id,
+            tree,
+            b"",
+            &selections,
+            &mut matched,
+            options,
+            &mut entries,
+        )?;
         if let Some((index, _)) = matched.iter().enumerate().find(|(_, found)| !**found) {
             return Err(Error::InvalidPath(bytes_path(&selections[index])));
         }
@@ -130,8 +149,11 @@ impl Repository {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn collect_archive_entries(
         &self,
+        attribute_tree: ObjectId,
+        commit_id: Option<ObjectId>,
         tree_id: ObjectId,
         base: &[u8],
         selections: &[Vec<u8>],
@@ -157,6 +179,11 @@ impl Repository {
                     matched[index] = true;
                 }
             }
+            let (export_ignore, export_subst) =
+                self.archive_attributes(attribute_tree, &path, options)?;
+            if export_ignore {
+                continue;
+            }
             match item.mode() {
                 EntryMode::Tree => {
                     push_archive_entry(
@@ -169,6 +196,8 @@ impl Repository {
                         options.max_entries,
                     )?;
                     self.collect_archive_entries(
+                        attribute_tree,
+                        commit_id,
                         item.id(),
                         &path,
                         selections,
@@ -194,13 +223,20 @@ impl Repository {
                             item.id()
                         )));
                     }
+                    let mut data = object.into_data();
+                    if export_subst
+                        && matches!(mode, EntryMode::Blob | EntryMode::BlobExecutable)
+                        && let Some(commit_id) = commit_id
+                    {
+                        data = self.expand_archive_placeholders(
+                            &data,
+                            commit_id,
+                            options.max_object_size,
+                        )?;
+                    }
                     push_archive_entry(
                         output,
-                        ArchiveEntry {
-                            path,
-                            mode,
-                            data: object.into_data(),
-                        },
+                        ArchiveEntry { path, mode, data },
                         options.max_entries,
                     )?;
                 }
@@ -208,6 +244,272 @@ impl Repository {
         }
         Ok(())
     }
+
+    fn archive_attributes(
+        &self,
+        tree: ObjectId,
+        path: &[u8],
+        options: &ArchiveOptions,
+    ) -> Result<(bool, bool)> {
+        let source = if options.worktree_attributes {
+            AttributeSource::WorktreeThenIndex
+        } else {
+            AttributeSource::Tree(tree)
+        };
+        let result = self.check_attributes(
+            &[path.to_vec()],
+            &CheckAttributesOptions {
+                source,
+                attributes: vec!["export-ignore".into(), "export-subst".into()],
+                max_files: options.max_attribute_files,
+                max_file_size: options.max_object_size,
+                max_rules: options.max_attribute_rules,
+                max_macro_depth: options.max_attribute_macro_depth,
+                max_paths: 1,
+                max_results: 2,
+            },
+        )?;
+        Ok((
+            result[0].value() == &AttributeValue::Set,
+            result[1].value() == &AttributeValue::Set,
+        ))
+    }
+
+    fn expand_archive_placeholders(
+        &self,
+        data: &[u8],
+        commit_id: ObjectId,
+        max_size: usize,
+    ) -> Result<Vec<u8>> {
+        let commit = self.read_commit(commit_id, max_size)?;
+        let mut output = Vec::new();
+        let mut remaining = data;
+        while let Some(start) = find_bytes(remaining, b"$Format:") {
+            output.extend_from_slice(&remaining[..start]);
+            let format = &remaining[start + 8..];
+            let Some(end) = format.iter().position(|byte| *byte == b'$') else {
+                output.extend_from_slice(&remaining[start..]);
+                remaining = b"";
+                break;
+            };
+            let expanded =
+                self.format_archive_commit(&format[..end], commit_id, &commit, max_size)?;
+            if output.len().saturating_add(expanded.len()) > max_size {
+                return Err(Error::InvalidRepository(
+                    "archive substitution exceeds object size limit".into(),
+                ));
+            }
+            output.extend_from_slice(&expanded);
+            remaining = &format[end + 1..];
+        }
+        if output.len().saturating_add(remaining.len()) > max_size {
+            return Err(Error::InvalidRepository(
+                "archive substitution exceeds object size limit".into(),
+            ));
+        }
+        output.extend_from_slice(remaining);
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn format_archive_commit(
+        &self,
+        format: &[u8],
+        commit_id: ObjectId,
+        commit: &crate::Commit,
+        max_size: usize,
+    ) -> Result<Vec<u8>> {
+        let mut output = Vec::new();
+        let mut index = 0;
+        while index < format.len() {
+            if format[index] != b'%' {
+                output.push(format[index]);
+                index += 1;
+                continue;
+            }
+            let rest = &format[index..];
+            if rest.starts_with(b"%(describe)") {
+                match self.describe(
+                    &commit_id.to_string(),
+                    &crate::DescribeOptions {
+                        graph: crate::GraphOptions {
+                            max_object_size: max_size,
+                            ..crate::GraphOptions::default()
+                        },
+                        ..crate::DescribeOptions::default()
+                    },
+                ) {
+                    Ok(description) => output.extend_from_slice(description.rendered().as_bytes()),
+                    Err(Error::InvalidRepository(message))
+                        if message.starts_with("no eligible name can describe") => {}
+                    Err(error) => return Err(error),
+                }
+                index += b"%(describe)".len();
+                continue;
+            }
+            let Some(code) = format.get(index + 1).copied() else {
+                output.push(b'%');
+                break;
+            };
+            let consumed = match code {
+                b'%' => {
+                    output.push(b'%');
+                    2
+                }
+                b'n' => {
+                    output.push(b'\n');
+                    2
+                }
+                b'H' => {
+                    output.extend_from_slice(commit_id.to_string().as_bytes());
+                    2
+                }
+                b'h' => {
+                    output.extend_from_slice(abbreviate(commit_id).as_bytes());
+                    2
+                }
+                b'T' => {
+                    output.extend_from_slice(commit.tree().to_string().as_bytes());
+                    2
+                }
+                b't' => {
+                    output.extend_from_slice(abbreviate(commit.tree()).as_bytes());
+                    2
+                }
+                b'P' => {
+                    append_ids(&mut output, commit.parents(), false);
+                    2
+                }
+                b'p' => {
+                    append_ids(&mut output, commit.parents(), true);
+                    2
+                }
+                b's' => {
+                    output.extend_from_slice(commit_subject(commit.message()));
+                    2
+                }
+                b'f' => {
+                    output.extend_from_slice(&sanitize_subject(commit_subject(commit.message())));
+                    2
+                }
+                b'b' => {
+                    output.extend_from_slice(commit_body(commit.message()));
+                    2
+                }
+                b'B' => {
+                    output.extend_from_slice(commit.message());
+                    2
+                }
+                b'a' | b'c' if format.get(index + 2).is_some() => {
+                    let signature = if code == b'a' {
+                        commit.author()
+                    } else {
+                        commit.committer()
+                    };
+                    match format[index + 2] {
+                        b'n' | b'N' => output.extend_from_slice(signature.name().as_bytes()),
+                        b'e' | b'E' => output.extend_from_slice(signature.email().as_bytes()),
+                        b'l' | b'L' => output.extend_from_slice(
+                            signature.email().split('@').next().unwrap_or("").as_bytes(),
+                        ),
+                        b't' => {
+                            output.extend_from_slice(signature.timestamp().to_string().as_bytes());
+                        }
+                        _ => {
+                            output.extend_from_slice(&format[index..index + 3]);
+                        }
+                    }
+                    3
+                }
+                b'x' if format.get(index + 2..index + 4).is_some() => {
+                    let digits = &format[index + 2..index + 4];
+                    if let Some(byte) = hex_byte(digits) {
+                        output.push(byte);
+                    } else {
+                        output.extend_from_slice(&format[index..index + 4]);
+                    }
+                    4
+                }
+                _ => {
+                    output.extend_from_slice(&format[index..index + 2]);
+                    2
+                }
+            };
+            index += consumed;
+            if output.len() > max_size {
+                return Err(Error::InvalidRepository(
+                    "archive substitution exceeds object size limit".into(),
+                ));
+            }
+        }
+        Ok(output)
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn abbreviate(id: ObjectId) -> String {
+    id.to_string().chars().take(7).collect()
+}
+
+fn append_ids(output: &mut Vec<u8>, ids: &[ObjectId], abbreviated: bool) {
+    for (index, id) in ids.iter().enumerate() {
+        if index > 0 {
+            output.push(b' ');
+        }
+        if abbreviated {
+            output.extend_from_slice(abbreviate(*id).as_bytes());
+        } else {
+            output.extend_from_slice(id.to_string().as_bytes());
+        }
+    }
+}
+
+fn commit_subject(message: &[u8]) -> &[u8] {
+    message
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default()
+}
+
+fn commit_body(message: &[u8]) -> &[u8] {
+    message
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map_or(b"".as_slice(), |index| &message[index + 2..])
+}
+
+fn sanitize_subject(subject: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut separator = false;
+    for byte in subject {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_') {
+            if separator && !output.is_empty() {
+                output.push(b'-');
+            }
+            separator = false;
+            output.push(*byte);
+        } else {
+            separator = true;
+        }
+    }
+    output
+}
+
+fn hex_byte(digits: &[u8]) -> Option<u8> {
+    fn digit(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    Some(digit(digits[0])? * 16 + digit(digits[1])?)
 }
 
 fn push_archive_entry(
@@ -821,6 +1123,75 @@ mod tests {
                 .unwrap();
             assert!(archive.windows(name.len()).any(|value| value == name));
         }
+    }
+
+    #[test]
+    fn archive_honors_tree_and_worktree_export_attributes() {
+        let filesystem = MemoryFileSystem::new();
+        let repository =
+            Repository::init(filesystem.clone(), "repo", &InitOptions::default()).unwrap();
+        filesystem
+            .create_dir_all(Path::new("repo/private"))
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/private/secret"), b"secret")
+            .unwrap();
+        filesystem
+            .write(
+                Path::new("repo/version"),
+                b"$Format:%H (%h)%n%an <%ae>%n%s%n%b$",
+            )
+            .unwrap();
+        filesystem
+            .write(
+                Path::new("repo/.gitattributes"),
+                b"private export-ignore\nversion export-subst\n",
+            )
+            .unwrap();
+        repository.add(".").unwrap();
+        let signature = Signature::new("Archive", "archive@example.com", 42, 0).unwrap();
+        let commit = repository
+            .commit_index(
+                b"release subject\n\nrelease body\n",
+                &signature,
+                &signature,
+                &CommitOptions::default(),
+            )
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/.gitattributes"), b"version export-ignore\n")
+            .unwrap();
+
+        let archived = repository
+            .archive(&commit.to_string(), &ArchiveOptions::default())
+            .unwrap();
+        let headers = tar_headers(&archived);
+        assert!(!headers.iter().any(|entry| entry.0.starts_with(b"private")));
+        let version = headers
+            .iter()
+            .find(|entry| entry.0 == b"version")
+            .map(|entry| entry.3.as_slice())
+            .unwrap();
+        assert_eq!(
+            version,
+            format!(
+                "{} ({})\nArchive <archive@example.com>\nrelease subject\nrelease body\n",
+                commit,
+                abbreviate(commit)
+            )
+            .as_bytes()
+        );
+
+        let live = repository
+            .archive(
+                &commit.to_string(),
+                &ArchiveOptions {
+                    worktree_attributes: true,
+                    ..ArchiveOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(!tar_headers(&live).iter().any(|entry| entry.0 == b"version"));
     }
 
     fn tar_headers(archive: &[u8]) -> Vec<TarHeader> {
