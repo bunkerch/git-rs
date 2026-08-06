@@ -19,6 +19,7 @@ pub mod cruft;
 pub mod describe;
 pub mod diff;
 pub mod error;
+pub mod fast_export;
 pub mod fast_import;
 pub mod fetch;
 pub mod for_each_ref;
@@ -100,6 +101,7 @@ pub use cruft::CruftMtimes;
 pub use describe::{DescribeOptions, Description};
 pub use diff::{DiffEntry, DiffKind, DiffOptions};
 pub use error::{Error, Result};
+pub use fast_export::{FastExportOptions, FastExportResult};
 pub use fast_import::{FastImportOptions, FastImportResult};
 pub use fetch::{
     CloneOptions, FetchOptions, FetchResult, RemoteAdvertisement, RemoteRef, RepositoryTransport,

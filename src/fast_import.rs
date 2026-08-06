@@ -339,9 +339,9 @@ impl<'a> ImportParser<'a> {
 
     fn parse_tag(&mut self, name: &str) -> Result<()> {
         let mark = self.take_optional_mark()?;
-        self.take_optional_original_oid();
         let from = self.take_prefixed_line(b"from ", "tag requires from")?;
-        let target = self.resolve_commitish(&from)?;
+        let target = self.resolve_dataref(&from)?;
+        self.take_optional_original_oid();
         let tagger = self.take_required_identity(b"tagger ")?;
         let message = self.take_data()?;
         let object = self
@@ -1155,8 +1155,12 @@ fn parse_quoted_path(value: &[u8]) -> Result<(Vec<u8>, usize)> {
                     if !digits.iter().all(|byte| matches!(byte, b'0'..=b'7')) {
                         return import_error("invalid octal path escape");
                     }
-                    output
-                        .push((digits[0] - b'0') * 64 + (digits[1] - b'0') * 8 + digits[2] - b'0');
+                    let octal = u16::from(digits[0] - b'0') * 64
+                        + u16::from(digits[1] - b'0') * 8
+                        + u16::from(digits[2] - b'0');
+                    output.push(u8::try_from(octal).map_err(|_| {
+                        Error::InvalidRepository("octal path escape exceeds one byte".into())
+                    })?);
                     cursor += 2;
                 } else {
                     output.push(match escaped {
@@ -1422,6 +1426,29 @@ done\n";
             repository.read_object(id, 4096).unwrap().kind(),
             ObjectKind::Commit
         );
+    }
+
+    #[test]
+    fn annotated_tags_may_target_blobs_and_octal_paths_are_byte_bounded() {
+        let repository = repository();
+        let result = repository
+            .fast_import(
+                b"blob\nmark :1\ndata 1\nx\ntag blob-tag\nmark :2\nfrom :1\noriginal-oid 0000000000000000000000000000000000000000\ntagger T <t@b> 1 +0000\ndata 1\nt\ndone\n",
+                &FastImportOptions::default(),
+            )
+            .unwrap();
+        let tag = repository.read_tag(result.marks()[&2], 4096).unwrap();
+        assert_eq!(tag.target(), result.marks()[&1]);
+        assert_eq!(tag.target_kind(), ObjectKind::Blob);
+        assert!(
+            repository
+                .fast_import(
+                    b"commit refs/heads/bad\ncommitter A <a@b> 1 +0000\ndata 0\nM 100644 inline \"bad\\777\"\ndata 1\nx\ndone\n",
+                    &FastImportOptions::default(),
+                )
+                .is_err()
+        );
+        assert!(repository.resolve_reference("refs/heads/bad").is_err());
     }
 
     fn repository() -> Repository {
