@@ -29,6 +29,8 @@ Worktree staging and index-to-tree writing are documented in
 [`docs/worktree.md`](docs/worktree.md).
 Staged, unstaged, unmerged, and untracked reporting is documented in
 [`docs/status.md`](docs/status.md).
+Ref-moving operations and their logs are documented in
+[`docs/reset-switch-reflog.md`](docs/reset-switch-reflog.md).
 
 To create a host-backed repository with the included example:
 

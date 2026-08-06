@@ -89,7 +89,7 @@ impl Signature {
         self.negative_zero
     }
 
-    fn encode(&self) -> String {
+    pub(crate) fn encode(&self) -> String {
         let absolute = self.offset_minutes.unsigned_abs();
         let sign = if self.offset_minutes < 0 || self.negative_zero {
             '-'
@@ -106,7 +106,7 @@ impl Signature {
         )
     }
 
-    fn parse(value: &[u8]) -> Result<Self> {
+    pub(crate) fn parse(value: &[u8]) -> Result<Self> {
         let value = std::str::from_utf8(value)
             .map_err(|_| Error::InvalidCommit("identity is not UTF-8".into()))?;
         let (identity, timezone) = value

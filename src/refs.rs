@@ -5,7 +5,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use crate::{Error, ObjectId, Repository, Result};
+use crate::{Error, ObjectId, Repository, Result, Signature};
 
 const SYMBOLIC_REF_MAX_DEPTH: usize = 5;
 
@@ -74,6 +74,36 @@ pub enum PreviousValue {
     Any,
     MustNotExist,
     MustExist(ObjectId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReflogEntry {
+    old: ObjectId,
+    new: ObjectId,
+    committer: Signature,
+    message: Vec<u8>,
+}
+
+impl ReflogEntry {
+    #[must_use]
+    pub const fn old_id(&self) -> ObjectId {
+        self.old
+    }
+
+    #[must_use]
+    pub const fn new_id(&self) -> ObjectId {
+        self.new
+    }
+
+    #[must_use]
+    pub const fn committer(&self) -> &Signature {
+        &self.committer
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &[u8] {
+        &self.message
+    }
 }
 
 impl Repository {
@@ -179,6 +209,33 @@ impl Repository {
         new: ObjectId,
         previous: PreviousValue,
     ) -> Result<()> {
+        self.update_reference_inner(name, new, previous, None)
+    }
+
+    /// Atomically update a direct reference and append its reflog.
+    ///
+    /// # Errors
+    /// Returns an error for invalid log messages, stale previous values, lock
+    /// contention, malformed current refs, or storage failures.
+    pub fn update_reference_with_reflog(
+        &self,
+        name: &ReferenceName,
+        new: ObjectId,
+        previous: PreviousValue,
+        committer: &Signature,
+        message: &[u8],
+    ) -> Result<()> {
+        validate_reflog_message(message)?;
+        self.update_reference_inner(name, new, previous, Some((committer, message)))
+    }
+
+    fn update_reference_inner(
+        &self,
+        name: &ReferenceName,
+        new: ObjectId,
+        previous: PreviousValue,
+        reflog: Option<(&Signature, &[u8])>,
+    ) -> Result<()> {
         if new.is_null() {
             return Err(Error::InvalidReference(
                 "a ref cannot point to the null object ID".into(),
@@ -190,6 +247,18 @@ impl Repository {
         }
         let lock = lock_path(&destination);
         self.filesystem().write_new(&lock, b"")?;
+
+        let log_destination = self.git_path(Path::new("logs").join(name.as_str()));
+        let log_lock = lock_path(&log_destination);
+        if reflog.is_some() {
+            if let Some(parent) = log_destination.parent() {
+                self.filesystem().create_dir_all(parent)?;
+            }
+            if let Err(error) = self.filesystem().write_new(&log_lock, b"") {
+                let _ = self.filesystem().remove_file(&lock);
+                return Err(error);
+            }
+        }
 
         let result = (|| {
             let actual = match self.read_reference(name.as_str()) {
@@ -211,12 +280,87 @@ impl Repository {
                 return Err(Error::ReferenceConflict(name.0.clone()));
             }
 
+            if let Some((committer, message)) = reflog {
+                let mut contents = match self.filesystem().read(&log_destination) {
+                    Ok(contents) => contents,
+                    Err(Error::NotFound(_)) => Vec::new(),
+                    Err(error) => return Err(error),
+                };
+                append_reflog_line(
+                    &mut contents,
+                    actual.unwrap_or_else(ObjectId::null),
+                    new,
+                    committer,
+                    message,
+                );
+                self.filesystem().write(&log_lock, &contents)?;
+            }
+
             let mut contents = new.to_hex().to_vec();
             contents.push(b'\n');
             self.filesystem().write(&lock, &contents)?;
+            if reflog.is_some() {
+                self.filesystem().rename(&log_lock, &log_destination)?;
+            }
             self.filesystem().rename(&lock, &destination)
         })();
 
+        if result.is_err() {
+            let _ = self.filesystem().remove_file(&lock);
+            if reflog.is_some() {
+                let _ = self.filesystem().remove_file(&log_lock);
+            }
+        }
+        result
+    }
+
+    /// Read a reference log from oldest to newest.
+    ///
+    /// # Errors
+    /// Returns an error for invalid names, malformed log lines, or storage failures.
+    pub fn read_reflog(&self, name: &str) -> Result<Vec<ReflogEntry>> {
+        validate_read_name(name)?;
+        let contents = match self
+            .filesystem()
+            .read(&self.git_path(Path::new("logs").join(name)))
+        {
+            Ok(contents) => contents,
+            Err(Error::NotFound(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        contents
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(parse_reflog_line)
+            .collect()
+    }
+
+    pub(crate) fn append_reflog(
+        &self,
+        name: &str,
+        old: ObjectId,
+        new: ObjectId,
+        committer: &Signature,
+        message: &[u8],
+    ) -> Result<()> {
+        validate_read_name(name)?;
+        validate_reflog_message(message)?;
+        let destination = self.git_path(Path::new("logs").join(name));
+        if let Some(parent) = destination.parent() {
+            self.filesystem().create_dir_all(parent)?;
+        }
+        let lock = lock_path(&destination);
+        self.filesystem().write_new(&lock, b"")?;
+        let result = (|| {
+            let mut contents = match self.filesystem().read(&destination) {
+                Ok(contents) => contents,
+                Err(Error::NotFound(_)) => Vec::new(),
+                Err(error) => return Err(error),
+            };
+            append_reflog_line(&mut contents, old, new, committer, message);
+            self.filesystem().write(&lock, &contents)?;
+            self.filesystem().rename(&lock, &destination)
+        })();
         if result.is_err() {
             let _ = self.filesystem().remove_file(&lock);
         }
@@ -319,6 +463,64 @@ fn lock_path(path: &Path) -> PathBuf {
     let mut value = path.as_os_str().to_owned();
     value.push(".lock");
     PathBuf::from(value)
+}
+
+fn validate_reflog_message(message: &[u8]) -> Result<()> {
+    if message.contains(&0) || message.contains(&b'\n') || message.contains(&b'\r') {
+        return Err(Error::InvalidReference(
+            "reflog message contains NUL or newline".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn append_reflog_line(
+    output: &mut Vec<u8>,
+    old: ObjectId,
+    new: ObjectId,
+    committer: &Signature,
+    message: &[u8],
+) {
+    output.extend_from_slice(&old.to_hex());
+    output.push(b' ');
+    output.extend_from_slice(&new.to_hex());
+    output.push(b' ');
+    output.extend_from_slice(committer.encode().as_bytes());
+    output.push(b'\t');
+    output.extend_from_slice(message);
+    output.push(b'\n');
+}
+
+fn parse_reflog_line(line: &[u8]) -> Result<ReflogEntry> {
+    if line.len() < ObjectId::HEX_LENGTH * 2 + 3 {
+        return Err(Error::InvalidReference("truncated reflog line".into()));
+    }
+    let first_space = line
+        .iter()
+        .position(|byte| *byte == b' ')
+        .ok_or_else(|| Error::InvalidReference("reflog has no old-ID separator".into()))?;
+    let second_space = line[first_space + 1..]
+        .iter()
+        .position(|byte| *byte == b' ')
+        .map(|position| first_space + 1 + position)
+        .ok_or_else(|| Error::InvalidReference("reflog has no new-ID separator".into()))?;
+    let tab = line[second_space + 1..]
+        .iter()
+        .position(|byte| *byte == b'\t')
+        .map(|position| second_space + 1 + position)
+        .ok_or_else(|| Error::InvalidReference("reflog has no message separator".into()))?;
+    let old = std::str::from_utf8(&line[..first_space])
+        .map_err(|_| Error::InvalidReference("non-UTF-8 old reflog ID".into()))?
+        .parse()?;
+    let new = std::str::from_utf8(&line[first_space + 1..second_space])
+        .map_err(|_| Error::InvalidReference("non-UTF-8 new reflog ID".into()))?
+        .parse()?;
+    Ok(ReflogEntry {
+        old,
+        new,
+        committer: Signature::parse(&line[second_space + 1..tab])?,
+        message: line[tab + 1..].to_vec(),
+    })
 }
 
 #[cfg(test)]
@@ -474,6 +676,45 @@ mod tests {
         assert_eq!(
             repository.resolve_reference("refs/heads/topic").unwrap(),
             second
+        );
+    }
+
+    #[test]
+    fn writes_and_parses_git_reflog_lines_under_the_ref_lock() {
+        let (repository, fs) = repository();
+        let name = ReferenceName::branch("main").unwrap();
+        let first = ObjectId::from_str(FIRST).unwrap();
+        let second = ObjectId::from_str(SECOND).unwrap();
+        let committer = Signature::with_unknown_timezone("Test", "test@example.com", 123).unwrap();
+        repository
+            .update_reference_with_reflog(
+                &name,
+                first,
+                PreviousValue::MustNotExist,
+                &committer,
+                b"commit (initial): base",
+            )
+            .unwrap();
+        repository
+            .update_reference_with_reflog(
+                &name,
+                second,
+                PreviousValue::MustExist(first),
+                &committer,
+                b"commit: second",
+            )
+            .unwrap();
+        let entries = repository.read_reflog(name.as_str()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].old_id(), ObjectId::null());
+        assert_eq!(entries[0].new_id(), first);
+        assert_eq!(entries[1].old_id(), first);
+        assert_eq!(entries[1].new_id(), second);
+        assert_eq!(entries[1].message(), b"commit: second");
+        assert!(entries[0].committer().has_unknown_timezone());
+        assert!(
+            !fs.exists(Path::new("repo/.git/logs/refs/heads/main.lock"))
+                .unwrap()
         );
     }
 }

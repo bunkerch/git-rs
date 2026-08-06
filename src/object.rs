@@ -15,6 +15,11 @@ impl ObjectId {
     pub const HEX_LENGTH: usize = Self::LENGTH * 2;
 
     #[must_use]
+    pub const fn null() -> Self {
+        Self([0; Self::LENGTH])
+    }
+
+    #[must_use]
     pub const fn from_bytes(bytes: [u8; Self::LENGTH]) -> Self {
         Self(bytes)
     }
