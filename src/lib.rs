@@ -30,7 +30,9 @@ pub use protocol::{Capability, PktLine, PktLineDecoder, Sideband};
 pub use receive_pack::{
     ReceiveCommand, ReceiveCommandStatus, ReceivePackOptions, ReceivePackRequest, ReceivePackResult,
 };
-pub use refs::{PreviousValue, Reference, ReferenceName, ReferenceTarget, ReflogEntry};
+pub use refs::{
+    PreviousValue, Reference, ReferenceEdit, ReferenceName, ReferenceTarget, ReflogEntry,
+};
 pub use repository::{InitOptions, Repository};
 pub use status::{ChangeKind, RepositoryStatus, StatusEntry, StatusOptions};
 pub use tree::{EntryMode, Tree, TreeEntry};

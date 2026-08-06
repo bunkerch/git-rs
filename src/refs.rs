@@ -76,6 +76,49 @@ pub enum PreviousValue {
     MustExist(ObjectId),
 }
 
+/// One direct update or deletion in a batch reference transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceEdit {
+    name: ReferenceName,
+    new: Option<ObjectId>,
+    previous: PreviousValue,
+}
+
+impl ReferenceEdit {
+    #[must_use]
+    pub const fn update(name: ReferenceName, new: ObjectId, previous: PreviousValue) -> Self {
+        Self {
+            name,
+            new: Some(new),
+            previous,
+        }
+    }
+
+    #[must_use]
+    pub const fn delete(name: ReferenceName, expected: ObjectId) -> Self {
+        Self {
+            name,
+            new: None,
+            previous: PreviousValue::MustExist(expected),
+        }
+    }
+
+    #[must_use]
+    pub const fn name(&self) -> &ReferenceName {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn new_id(&self) -> Option<ObjectId> {
+        self.new
+    }
+
+    #[must_use]
+    pub const fn previous(&self) -> PreviousValue {
+        self.previous
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReflogEntry {
     old: ObjectId,
@@ -306,6 +349,168 @@ impl Repository {
         result
     }
 
+    /// Apply several direct ref updates/deletions as one prepared transaction.
+    ///
+    /// All canonical loose locks are acquired in bytewise refname order before
+    /// any precondition is evaluated. If a precondition or preparation step
+    /// fails, every lock is removed and no ref is changed. Packed deletions are
+    /// prepared under `packed-refs.lock` before publication begins.
+    ///
+    /// # Errors
+    /// Returns an error for duplicate edits, invalid null updates, stale values,
+    /// symbolic refs, lock contention, directory/file conflicts, malformed
+    /// packed refs, or storage failures.
+    pub fn apply_reference_transaction(&self, edits: &[ReferenceEdit]) -> Result<()> {
+        if edits.is_empty() {
+            return Ok(());
+        }
+        let mut edits = edits.to_vec();
+        edits.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        if edits.windows(2).any(|pair| pair[0].name == pair[1].name) {
+            return Err(Error::InvalidReference(
+                "duplicate ref in transaction".into(),
+            ));
+        }
+        if edits
+            .iter()
+            .any(|edit| edit.new.is_some_and(|id| id.is_null()))
+        {
+            return Err(Error::InvalidReference(
+                "a ref cannot point to the null object ID".into(),
+            ));
+        }
+
+        let mut prepared = Vec::with_capacity(edits.len());
+        for edit in edits {
+            let destination = self.git_path(edit.name.as_str());
+            if let Some(parent) = destination.parent() {
+                self.filesystem().create_dir_all(parent)?;
+            }
+            if self
+                .filesystem()
+                .metadata(&destination)
+                .is_ok_and(crate::Metadata::is_dir)
+            {
+                cleanup_ref_locks(self, &prepared);
+                return Err(Error::ReferenceConflict(edit.name.0));
+            }
+            let lock = lock_path(&destination);
+            if let Err(error) = self.filesystem().write_new(&lock, b"") {
+                cleanup_ref_locks(self, &prepared);
+                return Err(error);
+            }
+            prepared.push(PreparedReferenceEdit {
+                edit,
+                destination,
+                lock,
+            });
+        }
+
+        let deletes_packed = prepared.iter().any(|item| item.edit.new.is_none());
+        let packed_path = self.git_path("packed-refs");
+        let packed_lock = lock_path(&packed_path);
+        if deletes_packed && let Err(error) = self.filesystem().write_new(&packed_lock, b"") {
+            cleanup_ref_locks(self, &prepared);
+            return Err(error);
+        }
+
+        let preparation =
+            self.prepare_reference_edits(&prepared, deletes_packed, &packed_path, &packed_lock);
+
+        let packed_exists = match preparation {
+            Ok(value) => value,
+            Err(error) => {
+                cleanup_ref_locks(self, &prepared);
+                if deletes_packed {
+                    let _ = self.filesystem().remove_file(&packed_lock);
+                }
+                return Err(error);
+            }
+        };
+
+        if deletes_packed {
+            if packed_exists {
+                self.filesystem().rename(&packed_lock, &packed_path)?;
+            } else {
+                self.filesystem().remove_file(&packed_lock)?;
+            }
+        }
+        for item in &prepared {
+            if item.edit.new.is_some() {
+                self.filesystem().rename(&item.lock, &item.destination)?;
+            } else {
+                match self.filesystem().remove_file(&item.destination) {
+                    Ok(()) | Err(Error::NotFound(_)) => {}
+                    Err(error) => return Err(error),
+                }
+                self.filesystem().remove_file(&item.lock)?;
+                let log = self.git_path(Path::new("logs").join(item.edit.name.as_str()));
+                match self.filesystem().remove_file(&log) {
+                    Ok(()) | Err(Error::NotFound(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn direct_reference_value(&self, name: &str) -> Result<Option<ObjectId>> {
+        match self.read_reference(name) {
+            Ok(reference) => match reference.target {
+                ReferenceTarget::Direct(id) => Ok(Some(id)),
+                ReferenceTarget::Symbolic(_) => Err(Error::ReferenceConflict(name.to_owned())),
+            },
+            Err(Error::NotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn prepare_reference_edits(
+        &self,
+        prepared: &[PreparedReferenceEdit],
+        deletes_packed: bool,
+        packed_path: &Path,
+        packed_lock: &Path,
+    ) -> Result<bool> {
+        for item in prepared {
+            let actual = self.direct_reference_value(item.edit.name.as_str())?;
+            if !previous_matches(item.edit.previous, actual)
+                || (item.edit.new.is_none() && actual.is_none())
+            {
+                return Err(Error::ReferenceConflict(item.edit.name.0.clone()));
+            }
+            if let Some(new) = item.edit.new {
+                let mut contents = new.to_hex().to_vec();
+                contents.push(b'\n');
+                self.filesystem().write(&item.lock, &contents)?;
+            }
+        }
+
+        let packed = if deletes_packed {
+            match self.filesystem().read(packed_path) {
+                Ok(contents) => Some(contents),
+                Err(Error::NotFound(_)) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let packed = packed
+            .map(|mut contents| {
+                for item in prepared {
+                    if item.edit.new.is_none() {
+                        contents = remove_packed_reference(&contents, item.edit.name.as_str())?;
+                    }
+                }
+                Ok::<Vec<u8>, Error>(contents)
+            })
+            .transpose()?;
+        if let Some(contents) = &packed {
+            self.filesystem().write(packed_lock, contents)?;
+        }
+        Ok(packed.is_some())
+    }
+
     /// Atomically update a direct reference and append its reflog.
     ///
     /// # Errors
@@ -524,6 +729,26 @@ fn validate_read_name(name: &str) -> Result<()> {
         Ok(())
     } else {
         Err(Error::InvalidReferenceName(name.to_owned()))
+    }
+}
+
+struct PreparedReferenceEdit {
+    edit: ReferenceEdit,
+    destination: PathBuf,
+    lock: PathBuf,
+}
+
+fn cleanup_ref_locks(repository: &Repository, prepared: &[PreparedReferenceEdit]) {
+    for item in prepared {
+        let _ = repository.filesystem().remove_file(&item.lock);
+    }
+}
+
+fn previous_matches(previous: PreviousValue, actual: Option<ObjectId>) -> bool {
+    match previous {
+        PreviousValue::Any => true,
+        PreviousValue::MustNotExist => actual.is_none(),
+        PreviousValue::MustExist(expected) => actual == Some(expected),
     }
 }
 
@@ -812,6 +1037,63 @@ mod tests {
         assert_eq!(
             fs.read(Path::new("repo/.git/packed-refs")).unwrap(),
             format!("{SECOND} refs/tags/v2\n").as_bytes()
+        );
+    }
+
+    #[test]
+    fn batch_transaction_prepares_all_values_before_changing_any_ref() {
+        let (repository, fs) = repository();
+        let main = ReferenceName::branch("main").unwrap();
+        let topic = ReferenceName::branch("topic").unwrap();
+        let first = ObjectId::from_str(FIRST).unwrap();
+        let second = ObjectId::from_str(SECOND).unwrap();
+        repository
+            .update_reference(&main, first, PreviousValue::MustNotExist)
+            .unwrap();
+        repository
+            .update_reference(&topic, first, PreviousValue::MustNotExist)
+            .unwrap();
+
+        let result = repository.apply_reference_transaction(&[
+            ReferenceEdit::update(main.clone(), second, PreviousValue::MustExist(first)),
+            ReferenceEdit::update(topic.clone(), second, PreviousValue::MustExist(second)),
+        ]);
+        assert!(matches!(result, Err(Error::ReferenceConflict(_))));
+        assert_eq!(repository.resolve_reference(main.as_str()).unwrap(), first);
+        assert_eq!(repository.resolve_reference(topic.as_str()).unwrap(), first);
+        assert!(
+            !fs.exists(Path::new("repo/.git/refs/heads/main.lock"))
+                .unwrap()
+        );
+        assert!(
+            !fs.exists(Path::new("repo/.git/refs/heads/topic.lock"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn batch_transaction_updates_and_deletes_packed_refs_together() {
+        let (repository, fs) = repository();
+        let main = ReferenceName::branch("main").unwrap();
+        let obsolete = ReferenceName::branch("obsolete").unwrap();
+        let first = ObjectId::from_str(FIRST).unwrap();
+        let second = ObjectId::from_str(SECOND).unwrap();
+        fs.write(
+            Path::new("repo/.git/packed-refs"),
+            format!("{FIRST} refs/heads/main\n{FIRST} refs/heads/obsolete\n").as_bytes(),
+        )
+        .unwrap();
+        repository
+            .apply_reference_transaction(&[
+                ReferenceEdit::update(main.clone(), second, PreviousValue::MustExist(first)),
+                ReferenceEdit::delete(obsolete.clone(), first),
+            ])
+            .unwrap();
+        assert_eq!(repository.resolve_reference(main.as_str()).unwrap(), second);
+        assert!(repository.resolve_reference(obsolete.as_str()).is_err());
+        assert_eq!(
+            fs.read(Path::new("repo/.git/packed-refs")).unwrap(),
+            format!("{FIRST} refs/heads/main\n").as_bytes()
         );
     }
 

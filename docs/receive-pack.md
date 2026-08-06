@@ -45,11 +45,16 @@ Successful commands can proceed independently, matching non-atomic
 receive-pack behavior.
 
 The current advertisement deliberately contains only implemented capabilities:
-`report-status`, `delete-refs`, `ofs-delta`, `object-format=sha1`, and `agent`.
-Atomic-push, push-options, signed-push, and sideband capabilities are not
-advertised or silently accepted. Deletion locks both the loose path and
+`report-status`, `delete-refs`, `atomic`, `ofs-delta`, `object-format=sha1`, and
+`agent`. Push-options, signed-push, and sideband capabilities are not advertised
+or silently accepted. Deletion locks both the loose path and
 `packed-refs`, removes a hidden packed copy so it cannot reappear, and removes
 the corresponding reflog.
+
+With `atomic`, any policy, connectivity, or stale-value failure marks every
+command failed. Accepted commands are passed to one batch ref transaction,
+which locks all names in deterministic order, validates every old value while
+all locks are held, prepares packed deletions, and then publishes the batch.
 
 ## Example
 

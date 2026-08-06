@@ -33,6 +33,12 @@ expected old object ID, and removes both representations. This prevents a
 packed value hidden by a loose override from reappearing. An annotated tag's
 peeled line and the deleted ref's reflog are removed with it.
 
+`apply_reference_transaction` batches `ReferenceEdit::update` and
+`ReferenceEdit::delete` operations. It rejects duplicate names, acquires all
+loose locks in bytewise order to avoid deadlocks, then checks every CAS
+precondition and prepares `packed-refs` before changing any destination. A
+preparation failure cleans every lock without changing a ref.
+
 ## Git source comparisons
 
 The implementation is independent Rust code. Behavior was derived and tests are

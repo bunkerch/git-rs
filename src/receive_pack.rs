@@ -5,11 +5,12 @@ use std::str::FromStr;
 
 use crate::{
     Capability, EntryMode, Error, IncomingPackOptions, ObjectId, ObjectKind, PktLine,
-    PreviousValue, ReferenceName, ReferenceTarget, Repository, Result, ValidatedPack, WrittenPack,
+    PreviousValue, ReferenceEdit, ReferenceName, ReferenceTarget, Repository, Result,
+    ValidatedPack, WrittenPack,
 };
 
 const CAPABILITIES: &str =
-    "report-status delete-refs ofs-delta object-format=sha1 agent=git-rs/0.1";
+    "report-status delete-refs atomic ofs-delta object-format=sha1 agent=git-rs/0.1";
 
 /// Resource and repository-safety settings for receive-pack.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -282,6 +283,8 @@ impl Repository {
             });
         }
 
+        reject_atomic_group(request, &mut statuses);
+
         let written_pack = if statuses.iter().any(|status| status.error.is_none()) {
             validated
                 .as_ref()
@@ -290,24 +293,7 @@ impl Repository {
         } else {
             None
         };
-        for (command, status) in request.commands.iter().zip(&mut statuses) {
-            if status.error.is_some() {
-                continue;
-            }
-            let previous = if command.old.is_null() {
-                PreviousValue::MustNotExist
-            } else {
-                PreviousValue::MustExist(command.old)
-            };
-            let result = if command.new.is_null() {
-                self.delete_reference(&command.name, command.old)
-            } else {
-                self.update_reference(&command.name, command.new, previous)
-            };
-            if let Err(error) = result {
-                status.error = Some(error.to_string());
-            }
-        }
+        self.apply_receive_commands(request, &mut statuses);
 
         let response = if request.has_capability("report-status") {
             report_status("ok", &statuses)?
@@ -332,6 +318,43 @@ impl Repository {
             ReferenceTarget::Symbolic(name) => Some(name.clone()),
             ReferenceTarget::Direct(_) => None,
         })
+    }
+
+    fn apply_receive_commands(
+        &self,
+        request: &ReceivePackRequest,
+        statuses: &mut [ReceiveCommandStatus],
+    ) {
+        if request.has_capability("atomic") {
+            if statuses.iter().any(|status| status.error.is_some()) {
+                return;
+            }
+            let edits = request
+                .commands
+                .iter()
+                .map(command_edit)
+                .collect::<Vec<_>>();
+            if let Err(error) = self.apply_reference_transaction(&edits) {
+                for status in statuses {
+                    status.error = Some(format!("atomic transaction failed: {error}"));
+                }
+            }
+            return;
+        }
+        for (command, status) in request.commands.iter().zip(statuses) {
+            if status.error.is_some() {
+                continue;
+            }
+            let edit = command_edit(command);
+            let result = if let Some(new) = edit.new_id() {
+                self.update_reference(edit.name(), new, edit.previous())
+            } else {
+                self.delete_reference(edit.name(), command.old)
+            };
+            if let Err(error) = result {
+                status.error = Some(error.to_string());
+            }
+        }
     }
 
     fn check_connectivity(
@@ -384,6 +407,29 @@ fn current_matches(repository: &Repository, command: &ReceiveCommand) -> Result<
     }
 }
 
+fn reject_atomic_group(request: &ReceivePackRequest, statuses: &mut [ReceiveCommandStatus]) {
+    if request.has_capability("atomic") && statuses.iter().any(|status| status.error.is_some()) {
+        for status in statuses {
+            if status.error.is_none() {
+                status.error = Some("atomic push failure".to_owned());
+            }
+        }
+    }
+}
+
+fn command_edit(command: &ReceiveCommand) -> ReferenceEdit {
+    if command.new.is_null() {
+        ReferenceEdit::delete(command.name.clone(), command.old)
+    } else {
+        let previous = if command.old.is_null() {
+            PreviousValue::MustNotExist
+        } else {
+            PreviousValue::MustExist(command.old)
+        };
+        ReferenceEdit::update(command.name.clone(), command.new, previous)
+    }
+}
+
 fn parse_command(line: &[u8]) -> Result<ReceiveCommand> {
     if line.len() < 82 || line[40] != b' ' || line[81] != b' ' {
         return protocol_error("expected `<old> <new> <ref>` receive command");
@@ -411,7 +457,9 @@ fn parse_id(data: &[u8]) -> Result<ObjectId> {
 fn validate_capabilities(capabilities: &[Capability]) -> Result<()> {
     for capability in capabilities {
         let valid = match capability.name() {
-            "report-status" | "delete-refs" | "ofs-delta" => capability.value().is_none(),
+            "report-status" | "delete-refs" | "atomic" | "ofs-delta" => {
+                capability.value().is_none()
+            }
             "object-format" => capability.value() == Some("sha1"),
             "agent" => capability.value().is_some(),
             _ => false,
@@ -716,6 +764,55 @@ mod tests {
         assert_eq!(
             PktLine::decode(&result.response[consumed..]).unwrap().0,
             PktLine::Data(b"ok refs/heads/obsolete\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn atomic_push_rejects_every_command_when_one_is_stale() {
+        let repository = Repository::init(
+            MemoryFileSystem::new(),
+            "repo",
+            &InitOptions {
+                bare: true,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        let current = repository
+            .write_object(ObjectKind::Blob, b"current")
+            .unwrap();
+        let stale = ObjectId::compute(ObjectKind::Blob, b"stale");
+        repository.create_branch("main", current, false).unwrap();
+        let first = format!(
+            "{} {current} refs/heads/topic\0report-status atomic\n",
+            ObjectId::null()
+        );
+        let second = format!("{stale} {current} refs/heads/main\n");
+        let mut input = PktLine::Data(first.into_bytes()).encode().unwrap();
+        input.extend(PktLine::Data(second.into_bytes()).encode().unwrap());
+        input.extend(PktLine::Flush.encode().unwrap());
+        let request = ReceivePackRequest::parse(&input).unwrap();
+        let result = repository
+            .receive_pack(&request, &ReceivePackOptions::default())
+            .unwrap();
+        assert!(
+            result.statuses[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("atomic")
+        );
+        assert!(
+            result.statuses[1]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("stale")
+        );
+        assert!(repository.resolve_reference("refs/heads/topic").is_err());
+        assert_eq!(
+            repository.resolve_reference("refs/heads/main").unwrap(),
+            current
         );
     }
 
