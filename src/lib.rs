@@ -2,6 +2,7 @@
 
 pub mod commit;
 pub mod error;
+pub mod fetch;
 pub mod fs;
 pub mod index;
 pub mod object;
@@ -18,6 +19,10 @@ pub mod worktree;
 
 pub use commit::{Commit, CommitBuilder, ExtraHeader, Signature};
 pub use error::{Error, Result};
+pub use fetch::{
+    CloneOptions, FetchOptions, FetchResult, RemoteAdvertisement, RemoteRef, RepositoryTransport,
+    UploadPackTransport,
+};
 pub use fs::{FileStat, FileSystem, HostFileSystem, MemoryFileSystem, Metadata};
 pub use index::{Index, IndexEntry, IndexExtension, IndexVersion, StatData};
 pub use object::{Object, ObjectId, ObjectKind};
