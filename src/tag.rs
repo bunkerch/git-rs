@@ -19,6 +19,28 @@ pub struct AnnotatedTag {
     message: Vec<u8>,
 }
 
+/// Validation and publication policy for [`Repository::mk_tag`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MkTagOptions {
+    /// Promote fsck-style tag warnings to errors, matching `git mktag`.
+    pub strict: bool,
+    /// Validate and compute the ID without storing the tag object.
+    pub dry_run: bool,
+    pub max_input_size: usize,
+    pub max_target_size: usize,
+}
+
+impl Default for MkTagOptions {
+    fn default() -> Self {
+        Self {
+            strict: true,
+            dry_run: false,
+            max_input_size: 1024 * 1024 * 1024,
+            max_target_size: 1024 * 1024 * 1024,
+        }
+    }
+}
+
 impl AnnotatedTag {
     #[must_use]
     pub const fn target(&self) -> ObjectId {
@@ -57,11 +79,13 @@ impl AnnotatedTag {
     /// Returns an error for missing, duplicate, out-of-order, or malformed
     /// required headers, invalid IDs/types/identity, NULs, or continuations.
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let separator = data
-            .windows(2)
-            .position(|window| window == b"\n\n")
-            .ok_or_else(|| Error::InvalidObject("tag has no header separator".into()))?;
-        let headers = parse_headers(&data[..separator])?;
+        let (header_end, message_start) = match data.windows(2).position(|window| window == b"\n\n")
+        {
+            Some(separator) => (separator, separator + 2),
+            None if data.ends_with(b"\n") => (data.len() - 1, data.len()),
+            None => return Err(Error::InvalidObject("unterminated tag header".into())),
+        };
+        let headers = parse_headers(&data[..header_end])?;
         if headers.len() < 3
             || headers[0].0 != b"object"
             || headers[1].0 != b"type"
@@ -97,7 +121,7 @@ impl AnnotatedTag {
             name,
             tagger,
             extra_headers,
-            message: data[separator + 2..].to_vec(),
+            message: data[message_start..].to_vec(),
         })
     }
 
@@ -183,6 +207,56 @@ pub struct PeeledObject {
 }
 
 impl Repository {
+    /// Validate exact annotated-tag bytes and optionally store the tag object.
+    ///
+    /// Strict mode rejects fsck warnings (missing tagger, invalid ref-style tag
+    /// name, or extra headers). Both modes verify the target's declared type.
+    ///
+    /// # Errors
+    /// Returns an error for oversized or malformed input, strict warnings,
+    /// missing/corrupt targets, declared-type mismatch, or storage failures.
+    pub fn mk_tag(&self, data: &[u8], options: &MkTagOptions) -> Result<ObjectId> {
+        if data.len() > options.max_input_size {
+            return Err(Error::ObjectTooLarge {
+                declared: data.len() as u64,
+                limit: options.max_input_size,
+            });
+        }
+        let tag = AnnotatedTag::parse(data)?;
+        if options.strict {
+            if tag.tagger.is_none() {
+                return Err(Error::InvalidObject(
+                    "strict tag requires a tagger header".into(),
+                ));
+            }
+            let valid_signature_header = tag.extra_headers.len() == 1
+                && matches!(tag.extra_headers[0].name(), b"gpgsig" | b"gpgsig-sha256");
+            if !tag.extra_headers.is_empty() && !valid_signature_header {
+                return Err(Error::InvalidObject(
+                    "strict tag contains extra header entries".into(),
+                ));
+            }
+            let name = std::str::from_utf8(&tag.name)
+                .map_err(|_| Error::InvalidObject("strict tag name is not UTF-8".into()))?;
+            ReferenceName::new(format!("refs/tags/{name}"))
+                .map_err(|_| Error::InvalidObject("invalid strict tag name".into()))?;
+        }
+        let target = self.read_object_raw(tag.target, options.max_target_size)?;
+        if target.kind() != tag.target_kind {
+            return Err(Error::InvalidObject(format!(
+                "tag declares {} but target is {}",
+                kind_name(tag.target_kind),
+                kind_name(target.kind())
+            )));
+        }
+        let id = ObjectId::compute(ObjectKind::Tag, data);
+        if options.dry_run {
+            Ok(id)
+        } else {
+            self.write_object(ObjectKind::Tag, data)
+        }
+    }
+
     /// Store an annotated tag object after verifying its declared target type.
     ///
     /// # Errors
@@ -382,10 +456,10 @@ const fn kind_name(kind: ObjectKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnnotatedTag, TagBuilder};
+    use super::{AnnotatedTag, MkTagOptions, TagBuilder};
     use crate::{
-        CommitBuilder, ExtraHeader, InitOptions, MemoryFileSystem, ObjectKind, Repository,
-        Signature, Tree,
+        CommitBuilder, ExtraHeader, InitOptions, MemoryFileSystem, ObjectId, ObjectKind,
+        Repository, Signature, Tree,
     };
 
     #[test]
@@ -475,6 +549,71 @@ mod tests {
         .build();
         assert!(repository.write_tag(&wrong, 4096).is_err());
         assert!(AnnotatedTag::parse(b"object bad\ntype commit\ntag v\n\nmsg").is_err());
+    }
+
+    #[test]
+    fn mktag_preserves_exact_bytes_and_matches_native_object_id() {
+        let repository = repository();
+        let target = repository.write_object(ObjectKind::Blob, b"x").unwrap();
+        let data = format!("object {target}\ntype blob\ntag v1\ntagger A <a@b> 1 +0000\n");
+        let id = repository
+            .mk_tag(data.as_bytes(), &MkTagOptions::default())
+            .unwrap();
+        assert_eq!(id.to_string(), "020af0de2a21636e20561ce438c29b6f06bcf00b");
+        assert_eq!(
+            repository.read_object(id, 4096).unwrap().data(),
+            data.as_bytes()
+        );
+        assert_eq!(repository.read_tag(id, 4096).unwrap().message(), b"");
+    }
+
+    #[test]
+    fn mktag_strictness_target_validation_dry_run_and_limits() {
+        let repository = repository();
+        let target = repository.write_object(ObjectKind::Blob, b"x").unwrap();
+        let warning = format!("object {target}\ntype blob\ntag bad..name\n\n");
+        assert!(
+            repository
+                .mk_tag(warning.as_bytes(), &MkTagOptions::default())
+                .is_err()
+        );
+        let id = repository
+            .mk_tag(
+                warning.as_bytes(),
+                &MkTagOptions {
+                    strict: false,
+                    dry_run: true,
+                    ..MkTagOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(!repository.contains_object(id).unwrap());
+
+        let wrong = format!("object {target}\ntype commit\ntag v1\ntagger A <a@b> 1 +0000\n");
+        assert!(
+            repository
+                .mk_tag(wrong.as_bytes(), &MkTagOptions::default())
+                .is_err()
+        );
+        assert!(
+            repository
+                .mk_tag(
+                    warning.as_bytes(),
+                    &MkTagOptions {
+                        strict: false,
+                        max_input_size: warning.len() - 1,
+                        ..MkTagOptions::default()
+                    },
+                )
+                .is_err()
+        );
+        let missing = ObjectId::from_bytes([0x11; ObjectId::LENGTH]);
+        let missing_data = format!("object {missing}\ntype blob\ntag v1\ntagger A <a@b> 1 +0000\n");
+        assert!(
+            repository
+                .mk_tag(missing_data.as_bytes(), &MkTagOptions::default())
+                .is_err()
+        );
     }
 
     fn repository() -> Repository {

@@ -211,7 +211,7 @@ pub use submodule::{
     SubmoduleDeinitReport, SubmoduleOptions, SubmoduleStatus, SubmoduleStatusKind,
     SubmoduleUpdateOptions, SubmoduleUpdateReport,
 };
-pub use tag::{AnnotatedTag, PeeledObject, TagBuilder};
+pub use tag::{AnnotatedTag, MkTagOptions, PeeledObject, TagBuilder};
 pub use tree::{EntryMode, Tree, TreeEntry};
 pub use unpack_objects::{UnpackObjectsOptions, UnpackObjectsReport};
 pub use update_index::{UpdateIndexCommand, UpdateIndexOptions, UpdateIndexReport};
