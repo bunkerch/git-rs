@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-use crate::{Error, IndexEntry, ObjectId, ObjectKind, Repository, Result};
+use crate::{Error, IgnoreMatcher, IndexEntry, ObjectId, ObjectKind, Repository, Result};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChangeKind {
@@ -171,11 +171,13 @@ impl Repository {
                 .map(|(path, _)| path.clone())
                 .collect::<BTreeSet<_>>();
             let mut untracked = Vec::new();
+            let mut ignores = self.ignore_matcher()?;
             self.collect_untracked(
                 work_tree,
                 Path::new(""),
                 &tracked,
                 &gitlinks,
+                &mut ignores,
                 &mut untracked,
             )?;
             for path in untracked {
@@ -198,8 +200,10 @@ impl Repository {
         relative: &Path,
         tracked: &BTreeSet<Vec<u8>>,
         gitlinks: &BTreeSet<Vec<u8>>,
+        ignores: &mut IgnoreMatcher,
         output: &mut Vec<Vec<u8>>,
     ) -> Result<()> {
+        ignores.add_worktree_patterns(self, work_tree, &index_path(relative)?)?;
         let directory = work_tree.join(relative);
         for child in self.filesystem().read_dir(&directory)? {
             let child_relative = relative.join(child);
@@ -216,8 +220,17 @@ impl Repository {
                 .filesystem()
                 .metadata(&work_tree.join(&child_relative))?;
             if metadata.is_dir() {
-                self.collect_untracked(work_tree, &child_relative, tracked, gitlinks, output)?;
-            } else if !tracked.contains(&path) {
+                if !ignores.is_ignored(&path, true) {
+                    self.collect_untracked(
+                        work_tree,
+                        &child_relative,
+                        tracked,
+                        gitlinks,
+                        ignores,
+                        output,
+                    )?;
+                }
+            } else if !tracked.contains(&path) && !ignores.is_ignored(&path, false) {
                 output.push(path);
             }
         }
@@ -367,6 +380,51 @@ mod tests {
                 .entries()[0]
                 .worktree_change(),
             Some(ChangeKind::Deleted)
+        );
+    }
+
+    #[test]
+    fn excludes_ignored_untracked_paths_with_nested_overrides() {
+        let (repository, fs) = committed_repository();
+        fs.write(
+            Path::new("repo/.gitignore"),
+            b"*.log\nbuild/\n!important.log\n",
+        )
+        .unwrap();
+        fs.create_dir_all(Path::new("repo/nested")).unwrap();
+        fs.write(Path::new("repo/nested/.gitignore"), b"!keep.log\n")
+            .unwrap();
+        fs.write(Path::new("repo/error.log"), b"ignored").unwrap();
+        fs.write(Path::new("repo/important.log"), b"visible")
+            .unwrap();
+        fs.write(Path::new("repo/nested/drop.log"), b"ignored")
+            .unwrap();
+        fs.write(Path::new("repo/nested/keep.log"), b"visible")
+            .unwrap();
+        fs.create_dir_all(Path::new("repo/build")).unwrap();
+        fs.write(Path::new("repo/build/output"), b"ignored")
+            .unwrap();
+        fs.write(Path::new("repo/.git/info/exclude"), b"from-info.tmp\n")
+            .unwrap();
+        fs.write(Path::new("repo/from-info.tmp"), b"ignored")
+            .unwrap();
+
+        let paths = repository
+            .status(&StatusOptions::default())
+            .unwrap()
+            .entries()
+            .iter()
+            .filter(|entry| entry.worktree_change() == Some(ChangeKind::Untracked))
+            .map(|entry| entry.path().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                b".gitignore".to_vec(),
+                b"important.log".to_vec(),
+                b"nested/.gitignore".to_vec(),
+                b"nested/keep.log".to_vec(),
+            ]
         );
     }
 

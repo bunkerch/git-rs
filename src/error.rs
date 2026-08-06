@@ -23,6 +23,7 @@ pub enum Error {
     InvalidReference(String),
     ReferenceConflict(String),
     CheckoutConflict(Vec<String>),
+    IgnoredPath(PathBuf),
     SymbolicReferenceLoop(String),
     InvalidRepository(String),
 }
@@ -63,6 +64,7 @@ impl fmt::Display for Error {
                     paths.join(", ")
                 )
             }
+            Self::IgnoredPath(path) => write!(f, "path is ignored: {}", path.display()),
             Self::SymbolicReferenceLoop(name) => {
                 write!(
                     f,

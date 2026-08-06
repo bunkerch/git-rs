@@ -54,6 +54,8 @@ Lightweight and annotated tag operations are documented in
 [`docs/tags.md`](docs/tags.md).
 Git-compatible configuration parsing and atomic editing are documented in
 [`docs/config.md`](docs/config.md).
+Ignore matching and its integration with status and staging are documented in
+[`docs/ignore.md`](docs/ignore.md).
 
 To create a host-backed repository with the included example:
 

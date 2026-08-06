@@ -6,6 +6,7 @@ pub mod diff;
 pub mod error;
 pub mod fetch;
 pub mod fs;
+pub mod ignore;
 pub mod index;
 pub mod linked_worktree;
 pub mod merge;
@@ -33,6 +34,7 @@ pub use fetch::{
     UploadPackTransport,
 };
 pub use fs::{FileStat, FileSystem, HostFileSystem, MemoryFileSystem, Metadata};
+pub use ignore::{IgnoreMatcher, IgnoreRule};
 pub use index::{Index, IndexEntry, IndexExtension, IndexVersion, StatData};
 pub use linked_worktree::{AddWorktreeOptions, LinkedWorktreeInfo, WorktreeTarget};
 pub use merge::{
@@ -61,4 +63,4 @@ pub use status::{ChangeKind, RepositoryStatus, StatusEntry, StatusOptions};
 pub use tag::{AnnotatedTag, PeeledObject, TagBuilder};
 pub use tree::{EntryMode, Tree, TreeEntry};
 pub use upload_pack::{UploadPackOptions, UploadPackRequest};
-pub use worktree::CheckoutOptions;
+pub use worktree::{AddOptions, CheckoutOptions};

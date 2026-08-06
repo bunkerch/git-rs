@@ -4,14 +4,21 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use crate::{
-    EntryMode, Error, FileStat, Index, IndexEntry, ObjectId, ObjectKind, Repository, Result,
-    StatData, Tree, TreeEntry,
+    EntryMode, Error, FileStat, IgnoreMatcher, Index, IndexEntry, ObjectId, ObjectKind, Repository,
+    Result, StatData, Tree, TreeEntry,
 };
 
 #[derive(Clone, Debug)]
 pub struct CheckoutOptions {
     pub force: bool,
     pub max_object_size: usize,
+}
+
+/// Controls worktree-to-index staging.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AddOptions {
+    /// Include ignored untracked paths, equivalent to `git add --force`.
+    pub force: bool,
 }
 
 impl Default for CheckoutOptions {
@@ -34,19 +41,61 @@ impl Repository {
     /// Returns an error for bare repositories, unsafe paths, unsupported file
     /// types, filesystem failures, object-write failures, or index contention.
     pub fn add(&self, path: impl AsRef<Path>) -> Result<usize> {
+        self.add_with_options(path, &AddOptions::default())
+    }
+
+    /// Add with explicit ignore policy.
+    ///
+    /// # Errors
+    /// Returns [`Error::IgnoredPath`] for an explicitly selected ignored file
+    /// unless `force` is enabled, plus the errors documented by [`Self::add`].
+    pub fn add_with_options(&self, path: impl AsRef<Path>, options: &AddOptions) -> Result<usize> {
         let relative = normalize_relative(path.as_ref())?;
         let work_tree = self
             .work_tree()
             .ok_or_else(|| Error::InvalidRepository("cannot add from a bare repository".into()))?;
+        let existing = self.read_index()?;
+        let tracked = existing
+            .entries()
+            .iter()
+            .map(|entry| entry.path().to_vec())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut ignores = self.ignore_matcher()?;
+        ignores.add_worktree_patterns(self, work_tree, b"")?;
+        let mut ignore_base = PathBuf::new();
+        if let Some(parent) = relative.parent() {
+            for component in parent.components() {
+                if let Component::Normal(component) = component {
+                    ignore_base.push(component);
+                    ignores.add_worktree_patterns(self, work_tree, &index_path(&ignore_base)?)?;
+                }
+            }
+        }
         let mut added = Vec::new();
         let target = work_tree.join(&relative);
         match self.filesystem().metadata(&target) {
-            Ok(_) => self.collect_entries(work_tree, &relative, &mut added)?,
+            Ok(metadata) => {
+                let selected = index_path(&relative)?;
+                if !options.force
+                    && !metadata.is_dir()
+                    && !tracked.contains(&selected)
+                    && ignores.is_ignored(&selected, false)
+                {
+                    return Err(Error::IgnoredPath(relative));
+                }
+                self.collect_entries(
+                    work_tree,
+                    &relative,
+                    &tracked,
+                    &mut ignores,
+                    options.force,
+                    &mut added,
+                )?;
+            }
             Err(Error::NotFound(_)) => {}
             Err(error) => return Err(error),
         }
 
-        let existing = self.read_index()?;
         let prefix = index_path(&relative)?;
         let mut entries = existing.entries().to_vec();
         entries.retain(|entry| !path_is_selected(entry.path(), &prefix));
@@ -329,11 +378,25 @@ impl Repository {
         &self,
         work_tree: &Path,
         relative: &Path,
+        tracked: &std::collections::BTreeSet<Vec<u8>>,
+        ignores: &mut IgnoreMatcher,
+        force: bool,
         output: &mut Vec<IndexEntry>,
     ) -> Result<()> {
         let path = work_tree.join(relative);
         let metadata = self.filesystem().metadata(&path)?;
+        let index_path = index_path(relative)?;
         if metadata.is_dir() {
+            ignores.add_worktree_patterns(self, work_tree, &index_path)?;
+            if !force
+                && !index_path.is_empty()
+                && ignores.is_ignored(&index_path, true)
+                && !tracked
+                    .iter()
+                    .any(|tracked| path_is_selected(tracked, &index_path))
+            {
+                return Ok(());
+            }
             for child in self.filesystem().read_dir(&path)? {
                 let child_relative = relative.join(child);
                 if child_relative == Path::new(".git")
@@ -341,8 +404,12 @@ impl Repository {
                 {
                     continue;
                 }
-                self.collect_entries(work_tree, &child_relative, output)?;
+                self.collect_entries(work_tree, &child_relative, tracked, ignores, force, output)?;
             }
+            return Ok(());
+        }
+
+        if !force && !tracked.contains(&index_path) && ignores.is_ignored(&index_path, false) {
             return Ok(());
         }
 
@@ -367,7 +434,7 @@ impl Repository {
         };
         let id = self.write_object(kind, &contents)?;
         output.push(IndexEntry::new(
-            index_path(relative)?,
+            index_path,
             mode,
             id,
             index_stat(metadata.stat(), metadata.len()),
@@ -597,6 +664,93 @@ mod tests {
         let repository = Repository::init(fs, "repo", &InitOptions::default()).unwrap();
         assert_eq!(repository.add(".").unwrap(), 0);
         assert!(repository.read_index().unwrap().entries().is_empty());
+    }
+
+    #[test]
+    fn recursive_add_skips_ignored_untracked_but_updates_tracked_files() {
+        let filesystem = MemoryFileSystem::new();
+        let repository =
+            Repository::init(filesystem.clone(), "repo", &InitOptions::default()).unwrap();
+        filesystem
+            .write(Path::new("repo/tracked.log"), b"old")
+            .unwrap();
+        repository.add("tracked.log").unwrap();
+        filesystem
+            .write(Path::new("repo/.gitignore"), b"*.log\nbuild/\n")
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/tracked.log"), b"new")
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/untracked.log"), b"skip")
+            .unwrap();
+        filesystem.create_dir_all(Path::new("repo/build")).unwrap();
+        filesystem
+            .write(Path::new("repo/build/output"), b"skip")
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/visible.txt"), b"add")
+            .unwrap();
+
+        assert!(matches!(
+            repository.add("untracked.log"),
+            Err(Error::IgnoredPath(_))
+        ));
+        assert!(
+            repository
+                .read_index()
+                .unwrap()
+                .entries()
+                .iter()
+                .all(|entry| { entry.path() != b"untracked.log" })
+        );
+
+        repository
+            .add_with_options("untracked.log", &AddOptions { force: true })
+            .unwrap();
+        assert!(
+            repository
+                .read_index()
+                .unwrap()
+                .entries()
+                .iter()
+                .any(|entry| { entry.path() == b"untracked.log" })
+        );
+        let force_index = repository.read_index().unwrap();
+        let retained = force_index
+            .entries()
+            .iter()
+            .filter(|entry| entry.path() != b"untracked.log")
+            .cloned()
+            .collect();
+        repository
+            .write_index(&Index::new(force_index.version(), retained).unwrap())
+            .unwrap();
+
+        repository.add(".").unwrap();
+        let index = repository.read_index().unwrap();
+        let paths = index
+            .entries()
+            .iter()
+            .map(|entry| entry.path().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                b".gitignore".to_vec(),
+                b"tracked.log".to_vec(),
+                b"visible.txt".to_vec()
+            ]
+        );
+        let tracked = index
+            .entries()
+            .iter()
+            .find(|entry| entry.path() == b"tracked.log")
+            .unwrap();
+        assert_eq!(
+            repository.read_object(tracked.id(), 1024).unwrap().data(),
+            b"new"
+        );
     }
 
     #[test]
