@@ -72,7 +72,7 @@ impl Repository {
     }
 }
 
-fn validate_strict(
+pub(crate) fn validate_strict(
     repository: &Repository,
     incoming: &crate::ValidatedPack,
     max_size: usize,

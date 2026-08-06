@@ -155,6 +155,21 @@ impl ValidatedPack {
         self.objects.contains_key(&id)
     }
 
+    #[must_use]
+    pub const fn checksum(&self) -> &[u8; HASH_SIZE] {
+        self.bundle.checksum()
+    }
+
+    #[must_use]
+    pub fn pack_size(&self) -> usize {
+        self.bundle.pack().len()
+    }
+
+    #[must_use]
+    pub fn index_size(&self) -> usize {
+        self.bundle.index().len()
+    }
+
     pub(crate) fn object(&self, id: ObjectId) -> Option<(ObjectKind, &[u8])> {
         self.objects
             .get(&id)
@@ -430,6 +445,38 @@ impl Repository {
     /// Returns an error if content-addressed publication fails.
     pub fn publish_validated_pack(&self, pack: &ValidatedPack) -> Result<WrittenPack> {
         self.publish_bundle(&pack.bundle)
+    }
+
+    pub(crate) fn publish_validated_pack_with_markers(
+        &self,
+        pack: &ValidatedPack,
+        keep: Option<&[u8]>,
+        promisor: Option<&[u8]>,
+    ) -> Result<WrittenPack> {
+        let bundle = &pack.bundle;
+        let stem = bundle.stem();
+        let pack_relative = Path::new("objects/pack").join(format!("{stem}.pack"));
+        let index_relative = Path::new("objects/pack").join(format!("{stem}.idx"));
+        self.publish_pack_file(&pack_relative, bundle.pack())?;
+        if let Some(contents) = keep {
+            self.publish_pack_file(
+                &Path::new("objects/pack").join(format!("{stem}.keep")),
+                contents,
+            )?;
+        }
+        if let Some(contents) = promisor {
+            self.publish_pack_file(
+                &Path::new("objects/pack").join(format!("{stem}.promisor")),
+                contents,
+            )?;
+        }
+        self.publish_pack_file(&index_relative, bundle.index())?;
+        Ok(WrittenPack {
+            pack_path: self.git_path(&pack_relative),
+            index_path: self.git_path(&index_relative),
+            checksum: bundle.checksum,
+            object_count: bundle.object_count,
+        })
     }
 
     fn publish_bundle(&self, bundle: &PackBundle) -> Result<WrittenPack> {
@@ -1777,6 +1824,17 @@ mod tests {
             )
             .unwrap();
         assert!(validated.contains(target));
+        let indexed = repository
+            .index_pack(
+                &pack,
+                &crate::IndexPackOptions {
+                    dry_run: true,
+                    ..crate::IndexPackOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(indexed.objects, vec![target]);
+        assert!(indexed.pack_size >= super::PACK_HEADER_SIZE + super::HASH_SIZE);
         let unpacked = repository
             .unpack_objects(&pack, &crate::UnpackObjectsOptions::default())
             .unwrap();

@@ -34,6 +34,7 @@ pub mod grep;
 pub mod hash_object;
 pub mod ignore;
 pub mod index;
+pub mod index_pack;
 pub mod linked_worktree;
 pub mod log;
 pub mod ls_files;
@@ -131,6 +132,7 @@ pub use grep::{GrepBinaryMode, GrepMatch, GrepOptions, GrepTarget};
 pub use hash_object::HashObjectOptions;
 pub use ignore::{IgnoreMatcher, IgnoreRule};
 pub use index::{Index, IndexEntry, IndexExtension, IndexVersion, StatData};
+pub use index_pack::{IndexPackOptions, IndexPackReport};
 pub use linked_worktree::{
     AddWorktreeOptions, LinkedWorktreeInfo, MoveWorktreeOptions, RemoveWorktreeOptions,
     WorktreePruneEntry, WorktreePruneOptions, WorktreePruneReason, WorktreeTarget,
