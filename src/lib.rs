@@ -77,4 +77,4 @@ pub use status::{ChangeKind, RepositoryStatus, StatusEntry, StatusOptions};
 pub use tag::{AnnotatedTag, PeeledObject, TagBuilder};
 pub use tree::{EntryMode, Tree, TreeEntry};
 pub use upload_pack::{UploadPackOptions, UploadPackRequest};
-pub use worktree::{AddOptions, CheckoutOptions};
+pub use worktree::{AddOptions, CheckoutOptions, RemoveOptions};

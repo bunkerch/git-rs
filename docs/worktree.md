@@ -33,6 +33,53 @@ paths, and untracked file/directory obstructions. Entries unchanged between the
 current index and target preserve local modifications. `CheckoutOptions::force`
 requests exact materialization instead.
 
+## Removing tracked paths
+
+`Repository::remove` implements the content-safety rules of `git rm` for one or
+more literal repository paths. Selection is completed for every path before
+mutation; a directory prefix requires `RemoveOptions::recursive`. The returned
+paths are sorted in index order and contain every removed tracked leaf.
+
+```rust
+# use git_rs::{RemoveOptions, Repository};
+# fn example(repository: &Repository) -> git_rs::Result<()> {
+repository.remove(
+    &["generated"],
+    &RemoveOptions {
+        recursive: true,
+        ..RemoveOptions::default()
+    },
+)?;
+# Ok(())
+# }
+```
+
+Without `force`, ordinary removal requires each present worktree file to match
+the index and each index entry to match `HEAD`. This prevents losing either
+local or staged content. A path already absent from the worktree is safe to
+remove, including when staged content differs. `cached` leaves the worktree
+untouched and permits removal when the index matches either the worktree or
+`HEAD`; content therefore remains recoverable in at least one layer.
+
+Unmerged stages are removed together as an intentional conflict resolution.
+`skip-worktree` entries require `include_sparse`, unmatched selections fail
+unless `ignore_unmatched` is set, and `dry_run` performs the complete selection
+and safety preflight without mutation. Populated gitlink directories require
+`force` before recursive deletion.
+
+The API takes literal paths rather than command-line pathspec syntax. Library
+callers can expand patterns under their own UI rules without hidden shell or
+locale behavior.
+
+Host-backed examples are:
+
+```console
+cargo run --example add -- /path/to/repository path/to/file
+cargo run --example rm -- /path/to/repository path/to/file
+cargo run --example rm -- /path/to/repository generated --recursive
+cargo run --example rm -- /path/to/repository path/to/file --cached
+```
+
 ## Linked worktrees
 
 `Repository::add_worktree` creates Git's linked-worktree layout without
@@ -91,6 +138,10 @@ provide stat identity enable Git's fast unchanged-file checks.
   worktree comparisons.
 - `unpack-trees.c:verify_uptodate` and `verify_absent` define modified-file and
   untracked-path checkout protection.
+- `builtin/rm.c:check_local_mod` defines the worktree/index/`HEAD` safety
+  matrix, missing-file behavior, and cached-removal exception.
+- `builtin/rm.c:cmd_rm` defines all-path preflight, recursive selection,
+  unmerged removal, sparse-entry policy, and index publication ordering.
 - `worktree.c:get_worktrees`, `write_worktree_linking_files`, and
   `builtin/worktree.c:add_worktree` define common-directory routing, relative
   linking files, registration, checkout exclusivity, and removal safety.

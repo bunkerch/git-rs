@@ -21,6 +21,39 @@ pub struct AddOptions {
     pub force: bool,
 }
 
+/// Safety, selection, and mutation policy for tracked-path removal.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoveOptions {
+    /// Remove only from the index and leave worktree files in place.
+    pub cached: bool,
+    /// Override staged and local modification checks.
+    pub force: bool,
+    /// Permit a selected directory prefix to remove all tracked descendants.
+    pub recursive: bool,
+    /// Succeed when a requested path matches no tracked entry.
+    pub ignore_unmatched: bool,
+    /// Include entries marked `skip-worktree`.
+    pub include_sparse: bool,
+    /// Validate and return selected paths without changing index or worktree.
+    pub dry_run: bool,
+    pub max_object_size: usize,
+}
+
+impl Default for RemoveOptions {
+    fn default() -> Self {
+        Self {
+            cached: false,
+            force: false,
+            recursive: false,
+            ignore_unmatched: false,
+            include_sparse: false,
+            dry_run: false,
+            max_object_size: 1024 * 1024 * 1024,
+        }
+    }
+}
+
 impl Default for CheckoutOptions {
     fn default() -> Self {
         Self {
@@ -103,6 +136,175 @@ impl Repository {
         entries.extend(added);
         self.write_index(&Index::new(existing.version(), entries)?)?;
         Ok(count)
+    }
+
+    /// Remove one or more literal tracked paths from the index and worktree.
+    ///
+    /// A path naming a tracked directory prefix requires `recursive`. All
+    /// selections and content-safety checks finish before the first mutation.
+    /// This method intentionally accepts literal repository paths rather than
+    /// CLI pathspec syntax; callers can perform their own pattern expansion.
+    ///
+    /// # Errors
+    /// Returns an error for no paths, unsafe/unmatched/recursive selections,
+    /// sparse entries without opt-in, local or staged changes without force,
+    /// object bounds, index contention, or filesystem failures.
+    #[allow(clippy::too_many_lines)]
+    pub fn remove<P: AsRef<Path>>(
+        &self,
+        paths: &[P],
+        options: &RemoveOptions,
+    ) -> Result<Vec<Vec<u8>>> {
+        if paths.is_empty() {
+            return Err(Error::InvalidPath(PathBuf::new()));
+        }
+        let work_tree = if options.cached {
+            self.work_tree()
+        } else {
+            Some(self.work_tree().ok_or_else(|| {
+                Error::InvalidRepository("worktree removal requires a non-bare repository".into())
+            })?)
+        };
+        let index = self.read_index()?;
+        let requested = paths
+            .iter()
+            .map(|path| normalize_relative(path.as_ref()).and_then(|path| index_path(&path)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut selected = BTreeMap::<Vec<u8>, Vec<&IndexEntry>>::new();
+        for prefix in &requested {
+            let matches = index
+                .entries()
+                .iter()
+                .filter(|entry| path_is_selected(entry.path(), prefix))
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                if !options.ignore_unmatched {
+                    return Err(Error::NotFound(worktree_path(prefix)?));
+                }
+                continue;
+            }
+            let recursive_match = matches.iter().any(|entry| entry.path() != prefix);
+            if recursive_match && !options.recursive {
+                return Err(Error::InvalidRepository(format!(
+                    "not removing `{}` recursively without recursive=true",
+                    String::from_utf8_lossy(prefix)
+                )));
+            }
+            for entry in matches {
+                if entry.skip_worktree() && !options.include_sparse {
+                    return Err(Error::InvalidRepository(format!(
+                        "path `{}` is outside the sparse worktree",
+                        String::from_utf8_lossy(entry.path())
+                    )));
+                }
+                selected
+                    .entry(entry.path().to_vec())
+                    .or_default()
+                    .push(entry);
+            }
+        }
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let head = match self.resolve_reference("HEAD") {
+            Ok(id) => self
+                .flattened_tree(
+                    self.read_commit(id, options.max_object_size)?.tree(),
+                    options.max_object_size,
+                )?
+                .into_iter()
+                .map(|entry| (entry.path, (entry.raw_mode, entry.id)))
+                .collect::<BTreeMap<_, _>>(),
+            Err(Error::NotFound(_)) => BTreeMap::new(),
+            Err(error) => return Err(error),
+        };
+        if !options.force {
+            let mut conflicts = Vec::new();
+            for (path, entries) in &selected {
+                let conflict_stages = entries
+                    .iter()
+                    .map(|entry| entry.stage())
+                    .collect::<std::collections::BTreeSet<_>>();
+                if conflict_stages.iter().any(|stage| *stage != 0) {
+                    continue;
+                }
+                let entry = entries[0];
+                let staged = head
+                    .get(path)
+                    .is_none_or(|(mode, id)| *mode != entry.mode() || *id != entry.id());
+                let local = match work_tree {
+                    Some(root) => {
+                        let full = root.join(worktree_path(path)?);
+                        match self.filesystem().metadata(&full) {
+                            Ok(metadata) if metadata.is_dir() && entry.mode() != 0o160_000 => None,
+                            Ok(_) => Some(!self.worktree_matches(entry, &full)?),
+                            Err(Error::NotFound(_)) => None,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    None => Some(false),
+                };
+                let Some(local) = local else { continue };
+                let unsafe_removal = if options.cached {
+                    local && staged && !entry.intent_to_add()
+                } else {
+                    local || staged
+                };
+                if unsafe_removal {
+                    conflicts.push(String::from_utf8_lossy(path).into_owned());
+                }
+            }
+            if !conflicts.is_empty() {
+                return Err(Error::CheckoutConflict(conflicts));
+            }
+        }
+
+        let removed = selected.keys().cloned().collect::<Vec<_>>();
+        if options.dry_run {
+            return Ok(removed);
+        }
+        let mut mutation_error = None;
+        if !options.cached {
+            let root = work_tree.ok_or_else(|| {
+                Error::InvalidRepository("worktree removal requires a non-bare repository".into())
+            })?;
+            for (removed_from_worktree, path) in removed.iter().enumerate() {
+                let full = root.join(worktree_path(path)?);
+                let entry = selected[path][0];
+                let result = match self.filesystem().metadata(&full) {
+                    Ok(metadata) if metadata.is_dir() && entry.mode() == 0o160_000 => {
+                        remove_worktree_tree(self, &full, options.force)
+                    }
+                    Ok(metadata) if metadata.is_dir() => Ok(()),
+                    Ok(_) => self.filesystem().remove_file(&full),
+                    Err(Error::NotFound(_)) => Ok(()),
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
+                    if removed_from_worktree == 0 {
+                        return Err(error);
+                    }
+                    mutation_error = Some(error);
+                    break;
+                }
+                if let Err(error) = self.prune_empty_parents(root, worktree_path(path)?.parent()) {
+                    mutation_error = Some(error);
+                    break;
+                }
+            }
+        }
+        let remaining = index
+            .entries()
+            .iter()
+            .filter(|entry| !selected.contains_key(entry.path()))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.write_index(&Index::new(index.version(), remaining)?)?;
+        if let Some(error) = mutation_error {
+            return Err(error);
+        }
+        Ok(removed)
     }
 
     /// Write the stage-zero index as a hierarchy of tree objects.
@@ -545,6 +747,23 @@ fn path_is_selected(candidate: &[u8], prefix: &[u8]) -> bool {
         || (candidate.starts_with(prefix) && candidate.get(prefix.len()) == Some(&b'/'))
 }
 
+fn remove_worktree_tree(repository: &Repository, path: &Path, force: bool) -> Result<()> {
+    let children = repository.filesystem().read_dir(path)?;
+    if !force && !children.is_empty() {
+        return Err(Error::DirectoryNotEmpty(path.to_path_buf()));
+    }
+    for child in children {
+        let child_path = path.join(child);
+        let metadata = repository.filesystem().metadata(&child_path)?;
+        if metadata.is_dir() {
+            remove_worktree_tree(repository, &child_path, true)?;
+        } else {
+            repository.filesystem().remove_file(&child_path)?;
+        }
+    }
+    repository.filesystem().remove_dir(path)
+}
+
 #[cfg(unix)]
 #[allow(clippy::unnecessary_wraps)]
 fn index_path(path: &Path) -> Result<Vec<u8>> {
@@ -604,7 +823,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::{FileSystem, InitOptions, MemoryFileSystem};
+    use crate::{FileSystem, IndexVersion, InitOptions, MemoryFileSystem};
 
     #[test]
     fn recursively_adds_files_executables_and_symlinks_in_memory() {
@@ -904,5 +1123,224 @@ mod tests {
         ));
         assert_eq!(fs.read(Path::new("repo/untracked")).unwrap(), b"local");
         assert!(repository.read_index().unwrap().entries().is_empty());
+    }
+
+    fn removal_fixture() -> (Repository, MemoryFileSystem) {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.create_dir_all(Path::new("repo/dir")).unwrap();
+        fs.write(Path::new("repo/dir/one"), b"one").unwrap();
+        fs.write(Path::new("repo/dir/two"), b"two").unwrap();
+        fs.write(Path::new("repo/root"), b"root").unwrap();
+        repository.add("dir").unwrap();
+        repository.add("root").unwrap();
+        let signature = crate::Signature::new("Remove", "remove@example.com", 100, 0).unwrap();
+        repository
+            .commit_index(
+                b"base",
+                &signature,
+                &signature,
+                &crate::CommitOptions::default(),
+            )
+            .unwrap();
+        (repository, fs)
+    }
+
+    #[test]
+    fn removes_clean_files_and_requires_recursive_for_prefixes() {
+        let (repository, fs) = removal_fixture();
+        assert!(
+            repository
+                .remove(&["dir"], &RemoveOptions::default())
+                .is_err()
+        );
+        assert!(fs.exists(Path::new("repo/dir/one")).unwrap());
+        let removed = repository
+            .remove(
+                &["dir"],
+                &RemoveOptions {
+                    recursive: true,
+                    ..RemoveOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(removed, vec![b"dir/one".to_vec(), b"dir/two".to_vec()]);
+        assert!(!fs.exists(Path::new("repo/dir")).unwrap());
+        assert_eq!(repository.read_index().unwrap().entries().len(), 1);
+    }
+
+    #[test]
+    fn protects_local_and_staged_changes_unless_forced() {
+        let (repository, fs) = removal_fixture();
+        fs.write(Path::new("repo/root"), b"local").unwrap();
+        assert!(matches!(
+            repository.remove(&["root"], &RemoveOptions::default()),
+            Err(Error::CheckoutConflict(_))
+        ));
+        assert!(fs.exists(Path::new("repo/root")).unwrap());
+        repository
+            .remove(
+                &["root"],
+                &RemoveOptions {
+                    force: true,
+                    ..RemoveOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(!fs.exists(Path::new("repo/root")).unwrap());
+
+        let (repository, fs) = removal_fixture();
+        fs.write(Path::new("repo/root"), b"staged").unwrap();
+        repository.add("root").unwrap();
+        assert!(
+            repository
+                .remove(&["root"], &RemoveOptions::default())
+                .is_err()
+        );
+        repository
+            .remove(
+                &["root"],
+                &RemoveOptions {
+                    cached: true,
+                    ..RemoveOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(fs.read(Path::new("repo/root")).unwrap(), b"staged");
+    }
+
+    #[test]
+    fn cached_removal_requires_index_to_match_head_or_worktree() {
+        let (repository, fs) = removal_fixture();
+        fs.write(Path::new("repo/root"), b"staged").unwrap();
+        repository.add("root").unwrap();
+        fs.write(Path::new("repo/root"), b"different local")
+            .unwrap();
+        assert!(
+            repository
+                .remove(
+                    &["root"],
+                    &RemoveOptions {
+                        cached: true,
+                        ..RemoveOptions::default()
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            repository
+                .read_index()
+                .unwrap()
+                .entries()
+                .iter()
+                .any(|entry| entry.path() == b"root")
+        );
+
+        let (repository, fs) = removal_fixture();
+        fs.write(Path::new("repo/root"), b"local only").unwrap();
+        repository
+            .remove(
+                &["root"],
+                &RemoveOptions {
+                    cached: true,
+                    ..RemoveOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(fs.read(Path::new("repo/root")).unwrap(), b"local only");
+    }
+
+    #[test]
+    fn accepts_missing_and_unmerged_paths_and_preflights_dry_run() {
+        let (repository, fs) = removal_fixture();
+        fs.write(Path::new("repo/root"), b"staged then missing")
+            .unwrap();
+        repository.add("root").unwrap();
+        fs.remove_file(Path::new("repo/root")).unwrap();
+        repository
+            .remove(&["root"], &RemoveOptions::default())
+            .unwrap();
+
+        let blob = repository.write_object(ObjectKind::Blob, b"ours").unwrap();
+        let mut entries = repository.read_index().unwrap().entries().to_vec();
+        entries.push(
+            IndexEntry::with_stage("conflict", 0o100_644, blob, StatData::default(), 2).unwrap(),
+        );
+        entries.push(
+            IndexEntry::with_stage("conflict", 0o100_644, blob, StatData::default(), 3).unwrap(),
+        );
+        repository
+            .write_index(&Index::new(IndexVersion::V3, entries).unwrap())
+            .unwrap();
+        repository
+            .remove(&["conflict"], &RemoveOptions::default())
+            .unwrap();
+        assert!(
+            repository
+                .read_index()
+                .unwrap()
+                .entries()
+                .iter()
+                .all(|entry| entry.path() != b"conflict")
+        );
+
+        let before = repository.read_index().unwrap();
+        let selected = repository
+            .remove(
+                &["dir/one", "absent"],
+                &RemoveOptions {
+                    dry_run: true,
+                    ignore_unmatched: true,
+                    ..RemoveOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(selected, vec![b"dir/one".to_vec()]);
+        assert_eq!(repository.read_index().unwrap(), before);
+        assert!(fs.exists(Path::new("repo/dir/one")).unwrap());
+    }
+
+    #[test]
+    fn sparse_entries_require_explicit_inclusion() {
+        let (repository, fs) = removal_fixture();
+        let entries = repository
+            .read_index()
+            .unwrap()
+            .entries()
+            .iter()
+            .cloned()
+            .map(|entry| {
+                if entry.path() == b"root" {
+                    entry.with_skip_worktree(true)
+                } else {
+                    entry
+                }
+            })
+            .collect::<Vec<_>>();
+        repository
+            .write_index(&Index::new(IndexVersion::V3, entries).unwrap())
+            .unwrap();
+        assert!(
+            repository
+                .remove(
+                    &["root"],
+                    &RemoveOptions {
+                        cached: true,
+                        ..RemoveOptions::default()
+                    }
+                )
+                .is_err()
+        );
+        repository
+            .remove(
+                &["root"],
+                &RemoveOptions {
+                    cached: true,
+                    include_sparse: true,
+                    ..RemoveOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(fs.exists(Path::new("repo/root")).unwrap());
     }
 }
