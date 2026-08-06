@@ -115,7 +115,7 @@ pub use count_objects::{
 };
 pub use cruft::CruftMtimes;
 pub use describe::{DescribeOptions, Description};
-pub use diff::{DiffEntry, DiffKind, DiffOptions};
+pub use diff::{DiffEntry, DiffKind, DiffOptions, DiffValue, LayerDiffEntry, LayerDiffOptions};
 pub use error::{Error, Result};
 pub use fast_export::{FastExportOptions, FastExportResult};
 pub use fast_import::{FastImportOptions, FastImportResult};

@@ -2,8 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::path::Path;
 
-use crate::{Error, Index, ObjectId, ObjectKind, Repository, Result, object::sha1};
+use crate::{Error, Index, IndexEntry, ObjectId, ObjectKind, Repository, Result, object::sha1};
 
 /// Classification of one path-level difference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +75,45 @@ pub struct DiffOptions {
     pub max_trace_cells: usize,
 }
 
+/// One mode/object pair from an index stage or worktree path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiffValue {
+    pub mode: u32,
+    pub id: ObjectId,
+}
+
+/// A normal layer change or a lossless unresolved-index record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LayerDiffEntry {
+    Change(DiffEntry),
+    Unmerged {
+        path: Vec<u8>,
+        base: Option<DiffValue>,
+        ours: Option<DiffValue>,
+        theirs: Option<DiffValue>,
+        worktree: Option<DiffValue>,
+    },
+}
+
+/// Selection and resource policy for index/worktree comparisons.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LayerDiffOptions {
+    pub diff: DiffOptions,
+    /// Compare this merge stage (1–3) instead of reporting unresolved records.
+    pub stage: Option<u8>,
+    pub max_paths: usize,
+}
+
+impl Default for LayerDiffOptions {
+    fn default() -> Self {
+        Self {
+            diff: DiffOptions::default(),
+            stage: None,
+            max_paths: 1_000_000,
+        }
+    }
+}
+
 impl Default for DiffOptions {
     fn default() -> Self {
         Self {
@@ -92,7 +132,95 @@ struct Value {
     id: ObjectId,
 }
 
+#[derive(Clone, Copy)]
+enum DiffBaseline {
+    Index,
+    Tree(Option<ObjectId>),
+}
+
+fn index_value(entry: &IndexEntry) -> Value {
+    Value {
+        mode: entry.mode(),
+        id: entry.id(),
+    }
+}
+
+fn public_index_value(entry: &IndexEntry) -> DiffValue {
+    public_value(index_value(entry))
+}
+
+const fn public_value(value: Value) -> DiffValue {
+    DiffValue {
+        mode: value.mode,
+        id: value.id,
+    }
+}
+
+fn validate_layer_options(options: &LayerDiffOptions) -> Result<()> {
+    if options.max_paths == 0 || options.stage.is_some_and(|stage| !(1..=3).contains(&stage)) {
+        return Err(Error::InvalidRepository(
+            "layer diff requires a positive path limit and stage 1, 2, or 3".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn layer_path(entry: &LayerDiffEntry) -> &[u8] {
+    match entry {
+        LayerDiffEntry::Change(entry) => entry
+            .new_path()
+            .or_else(|| entry.old_path())
+            .expect("diff changes always have a path"),
+        LayerDiffEntry::Unmerged { path, .. } => path,
+    }
+}
+
 impl Repository {
+    /// Compare stage-zero index entries to their current worktree paths.
+    ///
+    /// Untracked worktree paths are intentionally absent, matching
+    /// `diff-files`. Without an explicit stage, unresolved paths retain all
+    /// three index stages in [`LayerDiffEntry::Unmerged`].
+    ///
+    /// # Errors
+    /// Returns an error for bare repositories, invalid stage selection,
+    /// inaccessible/unsupported worktree paths, oversized files, unsafe index
+    /// paths, or an exceeded path count.
+    pub fn diff_files(&self, options: &LayerDiffOptions) -> Result<Vec<LayerDiffEntry>> {
+        validate_layer_options(options)?;
+        let work_tree = self
+            .work_tree()
+            .ok_or_else(|| Error::InvalidRepository("diff-files requires a worktree".into()))?;
+        let index = self.read_index()?;
+        self.diff_index_layers(DiffBaseline::Index, &index, Some(work_tree), options)
+    }
+
+    /// Compare a tree to the index (`cached`) or tracked worktree state.
+    ///
+    /// `None` is the empty tree. The non-cached form still ignores untracked
+    /// worktree paths, matching `diff-index`.
+    ///
+    /// # Errors
+    /// Returns an error for malformed/oversized trees, bare non-cached access,
+    /// invalid stages, inaccessible worktree paths, or exceeded limits.
+    pub fn diff_index(
+        &self,
+        tree: Option<ObjectId>,
+        cached: bool,
+        options: &LayerDiffOptions,
+    ) -> Result<Vec<LayerDiffEntry>> {
+        validate_layer_options(options)?;
+        let index = self.read_index()?;
+        let work_tree = if cached {
+            None
+        } else {
+            Some(self.work_tree().ok_or_else(|| {
+                Error::InvalidRepository("non-cached diff-index requires a worktree".into())
+            })?)
+        };
+        self.diff_index_layers(DiffBaseline::Tree(tree), &index, work_tree, options)
+    }
+
     /// Compute Git's stable patch identity for a root or single-parent commit.
     ///
     /// The identity ignores whitespace and commit metadata, disables rename
@@ -173,6 +301,158 @@ impl Repository {
             })
             .collect();
         Ok(diff_maps(&old, &new, options.detect_exact_renames))
+    }
+
+    fn diff_index_layers(
+        &self,
+        baseline: DiffBaseline,
+        index: &Index,
+        work_tree: Option<&Path>,
+        options: &LayerDiffOptions,
+    ) -> Result<Vec<LayerDiffEntry>> {
+        let mut groups = BTreeMap::<Vec<u8>, Vec<&IndexEntry>>::new();
+        for entry in index.entries() {
+            groups.entry(entry.path().to_vec()).or_default().push(entry);
+        }
+        if groups.len() > options.max_paths {
+            return Err(Error::InvalidRepository(
+                "diff path count exceeds limit".into(),
+            ));
+        }
+        let mut old = match baseline {
+            DiffBaseline::Tree(tree) => {
+                self.optional_tree_map(tree, options.diff.max_object_size)?
+            }
+            DiffBaseline::Index => BTreeMap::new(),
+        };
+        let mut new = BTreeMap::new();
+        let mut unresolved = Vec::new();
+        for (path, entries) in groups {
+            let stage_zero = entries.iter().find(|entry| entry.stage() == 0).copied();
+            let stages = [1_u8, 2, 3]
+                .map(|stage| entries.iter().find(|entry| entry.stage() == stage).copied());
+            if stages.iter().any(Option::is_some) {
+                let reference = stages[1].or(stages[0]).or(stages[2]);
+                let current_value = work_tree
+                    .map(|root| self.diff_worktree_value(reference, root, &path, options))
+                    .transpose()?
+                    .flatten();
+                if matches!(baseline, DiffBaseline::Index)
+                    && let Some(stage) = options.stage
+                {
+                    if let Some(selected) = stages[usize::from(stage - 1)] {
+                        old.insert(path.clone(), index_value(selected));
+                    }
+                    if let Some(value) = current_value {
+                        new.insert(path, value);
+                    }
+                    continue;
+                }
+                old.remove(&path);
+                unresolved.push(LayerDiffEntry::Unmerged {
+                    path,
+                    base: stages[0].map(public_index_value),
+                    ours: stages[1].map(public_index_value),
+                    theirs: stages[2].map(public_index_value),
+                    worktree: current_value.map(public_value),
+                });
+                continue;
+            }
+            let Some(entry) = stage_zero else {
+                continue;
+            };
+            if matches!(baseline, DiffBaseline::Index) {
+                old.insert(path.clone(), index_value(entry));
+            }
+            let value = if let Some(root) = work_tree {
+                self.diff_worktree_value(Some(entry), root, &path, options)?
+            } else {
+                Some(index_value(entry))
+            };
+            if let Some(value) = value {
+                new.insert(path, value);
+            }
+        }
+        let mut result = diff_maps(&old, &new, options.diff.detect_exact_renames)
+            .into_iter()
+            .map(LayerDiffEntry::Change)
+            .collect::<Vec<_>>();
+        result.extend(unresolved);
+        result.sort_by(|left, right| layer_path(left).cmp(layer_path(right)));
+        if result.len() > options.max_paths {
+            return Err(Error::InvalidRepository(
+                "diff result exceeds path limit".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    fn diff_worktree_value(
+        &self,
+        entry: Option<&IndexEntry>,
+        root: &Path,
+        path: &[u8],
+        options: &LayerDiffOptions,
+    ) -> Result<Option<Value>> {
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        if entry.assume_valid() || entry.skip_worktree() {
+            return Ok(Some(index_value(entry)));
+        }
+        let relative = crate::worktree::worktree_path(path)?;
+        let full = root.join(relative);
+        let metadata = match self.filesystem().metadata(&full) {
+            Ok(metadata) => metadata,
+            Err(Error::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if entry.mode() == 0o160_000 && metadata.is_dir() {
+            let nested = match Repository::open_shared(self.shared_filesystem(), &full) {
+                Ok(repository) => repository,
+                Err(Error::InvalidRepository(_) | Error::NotFound(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let id = match nested.resolve_revision_id("HEAD", &crate::RevisionOptions::default()) {
+                Ok(id) => id,
+                Err(Error::InvalidRevision(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            return Ok(Some(Value {
+                mode: 0o160_000,
+                id,
+            }));
+        }
+        let (mode, data) = if metadata.is_symlink() {
+            (0o120_000, self.filesystem().read_link(&full)?)
+        } else if metadata.is_file() {
+            if metadata.len() > options.diff.max_object_size as u64 {
+                return Err(Error::ObjectTooLarge {
+                    declared: metadata.len(),
+                    limit: options.diff.max_object_size,
+                });
+            }
+            (
+                if metadata.is_executable() {
+                    0o100_755
+                } else {
+                    0o100_644
+                },
+                self.filesystem().read(&full)?,
+            )
+        } else {
+            return Ok(None);
+        };
+        if data.len() > options.diff.max_object_size {
+            return Err(Error::ObjectTooLarge {
+                declared: data.len() as u64,
+                limit: options.diff.max_object_size,
+            });
+        }
+        Ok(Some(Value {
+            mode,
+            id: ObjectId::compute(ObjectKind::Blob, &data),
+        }))
     }
 
     /// Render one typed entry as a Git-style unified patch.
@@ -1366,10 +1646,15 @@ fn quoted_path(prefix: &[u8], path: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiffKind, DiffOptions, Edit, compact_patch_edits, merge_text, myers, split_lines};
+    use std::path::Path;
+
+    use super::{
+        DiffKind, DiffOptions, Edit, LayerDiffEntry, LayerDiffOptions, compact_patch_edits,
+        merge_text, myers, split_lines,
+    };
     use crate::{
-        CommitBuilder, EntryMode, InitOptions, MemoryFileSystem, ObjectKind, Repository, Signature,
-        Tree, TreeEntry,
+        CommitBuilder, EntryMode, FileSystem, Index, IndexEntry, IndexVersion, InitOptions,
+        MemoryFileSystem, ObjectKind, Repository, Signature, StatData, Tree, TreeEntry,
     };
 
     #[test]
@@ -1419,6 +1704,109 @@ mod tests {
                 .commit_patch_id(merge, &DiffOptions::default())
                 .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn compares_index_worktree_and_tree_layers_without_untracked_paths() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.write(Path::new("repo/modified"), b"old\n").unwrap();
+        fs.write(Path::new("repo/deleted"), b"gone\n").unwrap();
+        repository.add(".").unwrap();
+        let base_tree = repository
+            .write_index_tree(&repository.read_index().unwrap())
+            .unwrap();
+        fs.write(Path::new("repo/modified"), b"new\n").unwrap();
+        fs.remove_file(Path::new("repo/deleted")).unwrap();
+        fs.write(Path::new("repo/untracked"), b"new file\n")
+            .unwrap();
+
+        let files = repository.diff_files(&LayerDiffOptions::default()).unwrap();
+        assert_eq!(
+            change_paths(&files),
+            [b"deleted".to_vec(), b"modified".to_vec()]
+        );
+        assert_eq!(
+            change_kinds(&files),
+            [DiffKind::Deleted, DiffKind::Modified]
+        );
+
+        repository.add("modified").unwrap();
+        let cached = repository
+            .diff_index(Some(base_tree), true, &LayerDiffOptions::default())
+            .unwrap();
+        assert_eq!(change_paths(&cached), [b"modified".to_vec()]);
+        let worktree = repository
+            .diff_index(Some(base_tree), false, &LayerDiffOptions::default())
+            .unwrap();
+        assert_eq!(
+            change_paths(&worktree),
+            [b"deleted".to_vec(), b"modified".to_vec()]
+        );
+    }
+
+    #[test]
+    fn preserves_unmerged_stages_or_compares_an_explicit_stage() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let base = repository
+            .write_object(ObjectKind::Blob, b"base\n")
+            .unwrap();
+        let ours = repository
+            .write_object(ObjectKind::Blob, b"ours\n")
+            .unwrap();
+        let theirs = repository
+            .write_object(ObjectKind::Blob, b"theirs\n")
+            .unwrap();
+        repository
+            .write_index(
+                &Index::new(
+                    IndexVersion::V2,
+                    vec![
+                        IndexEntry::with_stage(
+                            b"conflict".to_vec(),
+                            0o100_644,
+                            base,
+                            StatData::default(),
+                            1,
+                        )
+                        .unwrap(),
+                        IndexEntry::with_stage(
+                            b"conflict".to_vec(),
+                            0o100_644,
+                            ours,
+                            StatData::default(),
+                            2,
+                        )
+                        .unwrap(),
+                        IndexEntry::with_stage(
+                            b"conflict".to_vec(),
+                            0o100_644,
+                            theirs,
+                            StatData::default(),
+                            3,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        fs.write(Path::new("repo/conflict"), b"resolved\n").unwrap();
+
+        let entries = repository.diff_files(&LayerDiffOptions::default()).unwrap();
+        assert!(
+            matches!(&entries[0], LayerDiffEntry::Unmerged { path, base: Some(_), ours: Some(_), theirs: Some(_), worktree: Some(_), } if path == b"conflict")
+        );
+        let ours_diff = repository
+            .diff_files(&LayerDiffOptions {
+                stage: Some(2),
+                ..LayerDiffOptions::default()
+            })
+            .unwrap();
+        assert!(
+            matches!(&ours_diff[0], LayerDiffEntry::Change(entry) if entry.kind() == DiffKind::Modified)
         );
     }
 
@@ -1619,6 +2007,29 @@ mod tests {
 
     fn repository() -> Repository {
         Repository::init(MemoryFileSystem::new(), "repo", &InitOptions::default()).unwrap()
+    }
+
+    fn change_paths(entries: &[LayerDiffEntry]) -> Vec<Vec<u8>> {
+        entries
+            .iter()
+            .filter_map(|entry| match entry {
+                LayerDiffEntry::Change(change) => change
+                    .new_path()
+                    .or_else(|| change.old_path())
+                    .map(<[u8]>::to_vec),
+                LayerDiffEntry::Unmerged { .. } => None,
+            })
+            .collect()
+    }
+
+    fn change_kinds(entries: &[LayerDiffEntry]) -> Vec<DiffKind> {
+        entries
+            .iter()
+            .filter_map(|entry| match entry {
+                LayerDiffEntry::Change(change) => Some(change.kind()),
+                LayerDiffEntry::Unmerged { .. } => None,
+            })
+            .collect()
     }
 
     fn tree(
