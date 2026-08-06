@@ -8,7 +8,8 @@ use crate::{
     PreviousValue, ReferenceName, ReferenceTarget, Repository, Result, ValidatedPack, WrittenPack,
 };
 
-const CAPABILITIES: &str = "report-status ofs-delta object-format=sha1 agent=git-rs/0.1";
+const CAPABILITIES: &str =
+    "report-status delete-refs ofs-delta object-format=sha1 agent=git-rs/0.1";
 
 /// Resource and repository-safety settings for receive-pack.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -107,12 +108,16 @@ impl ReceivePackRequest {
                             command.name
                         ));
                     }
-                    if command.new.is_null() {
-                        return protocol_error("ref deletion was not advertised");
-                    }
                     if let Some(requested) = requested {
                         capabilities = Capability::parse_list(&requested)?;
                         validate_capabilities(&capabilities)?;
+                    }
+                    if command.new.is_null()
+                        && !capabilities
+                            .iter()
+                            .any(|capability| capability.name() == "delete-refs")
+                    {
+                        return protocol_error("ref deletion requires `delete-refs`");
                     }
                     commands.push(command);
                 }
@@ -252,14 +257,7 @@ impl Repository {
                 }
             }
         };
-        let checked_out = if options.deny_current_branch && self.work_tree().is_some() {
-            match self.read_reference("HEAD")?.target() {
-                ReferenceTarget::Symbolic(name) => Some(name.clone()),
-                ReferenceTarget::Direct(_) => None,
-            }
-        } else {
-            None
-        };
+        let checked_out = self.checked_out_receive_ref(options)?;
 
         let mut statuses = Vec::with_capacity(request.commands.len());
         for command in &request.commands {
@@ -267,8 +265,12 @@ impl Repository {
                 Some("branch is currently checked out".to_owned())
             } else if !current_matches(self, command)? {
                 Some("stale old object ID".to_owned())
-            } else if let Err(error) =
-                self.check_connectivity(command.new, validated.as_ref(), options.max_object_size)
+            } else if !command.new.is_null()
+                && let Err(error) = self.check_connectivity(
+                    command.new,
+                    validated.as_ref(),
+                    options.max_object_size,
+                )
             {
                 Some(format!("missing necessary objects: {error}"))
             } else {
@@ -297,7 +299,12 @@ impl Repository {
             } else {
                 PreviousValue::MustExist(command.old)
             };
-            if let Err(error) = self.update_reference(&command.name, command.new, previous) {
+            let result = if command.new.is_null() {
+                self.delete_reference(&command.name, command.old)
+            } else {
+                self.update_reference(&command.name, command.new, previous)
+            };
+            if let Err(error) = result {
                 status.error = Some(error.to_string());
             }
         }
@@ -311,6 +318,19 @@ impl Repository {
             response,
             statuses,
             written_pack,
+        })
+    }
+
+    fn checked_out_receive_ref(
+        &self,
+        options: &ReceivePackOptions,
+    ) -> Result<Option<ReferenceName>> {
+        if !options.deny_current_branch || self.work_tree().is_none() {
+            return Ok(None);
+        }
+        Ok(match self.read_reference("HEAD")?.target() {
+            ReferenceTarget::Symbolic(name) => Some(name.clone()),
+            ReferenceTarget::Direct(_) => None,
         })
     }
 
@@ -391,7 +411,7 @@ fn parse_id(data: &[u8]) -> Result<ObjectId> {
 fn validate_capabilities(capabilities: &[Capability]) -> Result<()> {
     for capability in capabilities {
         let valid = match capability.name() {
-            "report-status" | "ofs-delta" => capability.value().is_none(),
+            "report-status" | "delete-refs" | "ofs-delta" => capability.value().is_none(),
             "object-format" => capability.value() == Some("sha1"),
             "agent" => capability.value().is_some(),
             _ => false,
@@ -663,6 +683,40 @@ mod tests {
         duplicate.extend(PktLine::Data(second.into_bytes()).encode().unwrap());
         duplicate.extend(PktLine::Flush.encode().unwrap());
         assert!(ReceivePackRequest::parse(&duplicate).is_err());
+    }
+
+    #[test]
+    fn deletes_a_ref_when_delete_refs_was_negotiated() {
+        let repository = Repository::init(
+            MemoryFileSystem::new(),
+            "repo",
+            &InitOptions {
+                bare: true,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        let old = repository.write_object(ObjectKind::Blob, b"old").unwrap();
+        repository.create_branch("obsolete", old, false).unwrap();
+        let request = ReceivePackRequest::parse(&receive_input(
+            old,
+            ObjectId::null(),
+            "refs/heads/obsolete",
+            "report-status delete-refs",
+            &[],
+        ))
+        .unwrap();
+        let result = repository
+            .receive_pack(&request, &ReceivePackOptions::default())
+            .unwrap();
+        assert_eq!(result.statuses[0].error, None);
+        assert!(result.written_pack.is_none());
+        assert!(repository.resolve_reference("refs/heads/obsolete").is_err());
+        let (_, consumed) = PktLine::decode(&result.response).unwrap();
+        assert_eq!(
+            PktLine::decode(&result.response[consumed..]).unwrap().0,
+            PktLine::Data(b"ok refs/heads/obsolete\n".to_vec())
+        );
     }
 
     fn receive_input(

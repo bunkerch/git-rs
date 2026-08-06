@@ -45,9 +45,11 @@ Successful commands can proceed independently, matching non-atomic
 receive-pack behavior.
 
 The current advertisement deliberately contains only implemented capabilities:
-`report-status`, `ofs-delta`, `object-format=sha1`, and `agent`. Deletion,
-atomic-push, push-options, signed-push, and sideband capabilities are not
-advertised or silently accepted.
+`report-status`, `delete-refs`, `ofs-delta`, `object-format=sha1`, and `agent`.
+Atomic-push, push-options, signed-push, and sideband capabilities are not
+advertised or silently accepted. Deletion locks both the loose path and
+`packed-refs`, removes a hidden packed copy so it cannot reappear, and removes
+the corresponding reflog.
 
 ## Example
 

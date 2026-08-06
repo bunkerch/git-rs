@@ -28,6 +28,11 @@ Updates exclusively acquire `<ref>.lock`, inspect the current loose or packed
 value while holding that lock, write the new complete value, and atomically
 rename the lock over the loose ref. Failed transactions remove their lock.
 
+`delete_reference` locks both the loose path and `packed-refs`, verifies the
+expected old object ID, and removes both representations. This prevents a
+packed value hidden by a loose override from reappearing. An annotated tag's
+peeled line and the deleted ref's reflog are removed with it.
+
 ## Git source comparisons
 
 The implementation is independent Rust code. Behavior was derived and tests are

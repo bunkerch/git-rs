@@ -239,6 +239,73 @@ impl Repository {
         self.update_reference_inner(name, new, previous, None)
     }
 
+    /// Delete a loose or packed reference with a compare-and-swap precondition.
+    ///
+    /// The loose ref and `packed-refs` locks are held while the current value is
+    /// checked. Removing both forms prevents a packed value hidden by a loose
+    /// override from reappearing after deletion.
+    ///
+    /// # Errors
+    /// Returns an error for a missing or stale ref, lock contention, symbolic
+    /// refs, malformed packed refs, or storage failures.
+    pub fn delete_reference(&self, name: &ReferenceName, expected: ObjectId) -> Result<()> {
+        if expected.is_null() {
+            return Err(Error::InvalidReference(
+                "delete precondition cannot be the null object ID".into(),
+            ));
+        }
+        let destination = self.git_path(name.as_str());
+        if let Some(parent) = destination.parent() {
+            self.filesystem().create_dir_all(parent)?;
+        }
+        let loose_lock = lock_path(&destination);
+        self.filesystem().write_new(&loose_lock, b"")?;
+        let packed_path = self.git_path("packed-refs");
+        let packed_lock = lock_path(&packed_path);
+        if let Err(error) = self.filesystem().write_new(&packed_lock, b"") {
+            let _ = self.filesystem().remove_file(&loose_lock);
+            return Err(error);
+        }
+
+        let result = (|| {
+            let actual = self.read_reference(name.as_str())?;
+            match actual.target {
+                ReferenceTarget::Direct(id) if id == expected => {}
+                ReferenceTarget::Direct(_) | ReferenceTarget::Symbolic(_) => {
+                    return Err(Error::ReferenceConflict(name.0.clone()));
+                }
+            }
+            let packed = match self.filesystem().read(&packed_path) {
+                Ok(contents) => Some(contents),
+                Err(Error::NotFound(_)) => None,
+                Err(error) => return Err(error),
+            };
+            if let Some(contents) = packed {
+                let filtered = remove_packed_reference(&contents, name.as_str())?;
+                self.filesystem().write(&packed_lock, &filtered)?;
+                self.filesystem().rename(&packed_lock, &packed_path)?;
+            } else {
+                self.filesystem().remove_file(&packed_lock)?;
+            }
+            match self.filesystem().remove_file(&destination) {
+                Ok(()) | Err(Error::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+            self.filesystem().remove_file(&loose_lock)?;
+
+            let log = self.git_path(Path::new("logs").join(name.as_str()));
+            match self.filesystem().remove_file(&log) {
+                Ok(()) | Err(Error::NotFound(_)) => Ok(()),
+                Err(error) => Err(error),
+            }
+        })();
+        if result.is_err() {
+            let _ = self.filesystem().remove_file(&loose_lock);
+            let _ = self.filesystem().remove_file(&packed_lock);
+        }
+        result
+    }
+
     /// Atomically update a direct reference and append its reflog.
     ///
     /// # Errors
@@ -460,6 +527,41 @@ fn validate_read_name(name: &str) -> Result<()> {
     }
 }
 
+fn remove_packed_reference(contents: &[u8], name: &str) -> Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(contents.len());
+    let mut removed = false;
+    let mut skip_peeled = false;
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        if skip_peeled && body.starts_with(b"^") {
+            skip_peeled = false;
+            continue;
+        }
+        skip_peeled = false;
+        if body.is_empty() || matches!(body[0], b'#' | b'^') {
+            output.extend_from_slice(line);
+            continue;
+        }
+        let separator = body
+            .iter()
+            .position(|byte| *byte == b' ')
+            .ok_or_else(|| Error::InvalidReference("malformed packed-refs entry".into()))?;
+        let packed_name = std::str::from_utf8(&body[separator + 1..])
+            .map_err(|_| Error::InvalidReference("non-UTF-8 packed ref name".into()))?;
+        ReferenceName::new(packed_name.to_owned())?;
+        if packed_name == name {
+            removed = true;
+            skip_peeled = true;
+        } else {
+            output.extend_from_slice(line);
+        }
+    }
+    if !removed {
+        return Ok(contents.to_vec());
+    }
+    Ok(output)
+}
+
 // Git's grammar reserves the exact lowercase `.lock` suffix.
 #[allow(clippy::case_sensitive_file_extension_comparisons)]
 pub(crate) fn is_valid_refname(name: &str, allow_one_level: bool) -> bool {
@@ -648,6 +750,68 @@ mod tests {
         assert!(
             !fs.exists(Path::new("repo/.git/refs/heads/main.lock"))
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn deletes_loose_and_hidden_packed_forms_without_resurrection() {
+        let (repository, fs) = repository();
+        let name = ReferenceName::branch("main").unwrap();
+        let first = ObjectId::from_str(FIRST).unwrap();
+        fs.write(
+            Path::new("repo/.git/packed-refs"),
+            format!("# pack-refs with: peeled\n{SECOND} refs/heads/main\n^{FIRST}\n").as_bytes(),
+        )
+        .unwrap();
+        fs.write(
+            Path::new("repo/.git/refs/heads/main"),
+            format!("{FIRST}\n").as_bytes(),
+        )
+        .unwrap();
+        fs.create_dir_all(Path::new("repo/.git/logs/refs/heads"))
+            .unwrap();
+        fs.write(Path::new("repo/.git/logs/refs/heads/main"), b"log")
+            .unwrap();
+
+        repository.delete_reference(&name, first).unwrap();
+        assert!(matches!(
+            repository.read_reference(name.as_str()),
+            Err(Error::NotFound(_))
+        ));
+        assert_eq!(
+            fs.read(Path::new("repo/.git/packed-refs")).unwrap(),
+            b"# pack-refs with: peeled\n"
+        );
+        assert!(
+            !fs.exists(Path::new("repo/.git/logs/refs/heads/main"))
+                .unwrap()
+        );
+        assert!(
+            !fs.exists(Path::new("repo/.git/refs/heads/main.lock"))
+                .unwrap()
+        );
+        assert!(!fs.exists(Path::new("repo/.git/packed-refs.lock")).unwrap());
+    }
+
+    #[test]
+    fn deletes_a_packed_only_ref_and_rejects_stale_values() {
+        let (repository, fs) = repository();
+        let name = ReferenceName::new("refs/tags/v1").unwrap();
+        let first = ObjectId::from_str(FIRST).unwrap();
+        let second = ObjectId::from_str(SECOND).unwrap();
+        fs.write(
+            Path::new("repo/.git/packed-refs"),
+            format!("{FIRST} refs/tags/v1\n{SECOND} refs/tags/v2\n").as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            repository.delete_reference(&name, second),
+            Err(Error::ReferenceConflict(_))
+        ));
+        repository.delete_reference(&name, first).unwrap();
+        assert_eq!(
+            fs.read(Path::new("repo/.git/packed-refs")).unwrap(),
+            format!("{SECOND} refs/tags/v2\n").as_bytes()
         );
     }
 
