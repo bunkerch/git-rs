@@ -31,6 +31,8 @@ Expiry-controlled loose-object pruning is documented in
 [`docs/prune.md`](docs/prune.md).
 Full object and connectivity verification is documented in
 [`docs/fsck.md`](docs/fsck.md).
+Bounded loose, packed, duplicate, size, and garbage inventory is documented in
+[`docs/count-objects.md`](docs/count-objects.md).
 Wire-format primitives are documented in
 [`docs/protocol.md`](docs/protocol.md).
 Server-side fetch negotiation is documented in
