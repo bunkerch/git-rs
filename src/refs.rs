@@ -140,6 +140,8 @@ pub struct ReflogRewriteOptions {
     pub rewrite: bool,
     pub update_reference: bool,
     pub max_entries: usize,
+    pub max_reference_depth: usize,
+    pub max_stale_objects: usize,
 }
 
 impl Default for ReflogRewriteOptions {
@@ -149,6 +151,8 @@ impl Default for ReflogRewriteOptions {
             rewrite: false,
             update_reference: false,
             max_entries: 10_000_000,
+            max_reference_depth: 4096,
+            max_stale_objects: 10_000_000,
         }
     }
 }
@@ -864,6 +868,74 @@ impl Repository {
         Ok(entries)
     }
 
+    /// List reflogs in bytewise reference-name order.
+    ///
+    /// # Errors
+    /// Returns an error for malformed/non-UTF-8 names, exceeded count/depth
+    /// limits, or storage failures.
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    pub fn reflogs(&self, max_reflogs: usize, max_depth: usize) -> Result<Vec<String>> {
+        let root = self.git_path("logs");
+        match self.filesystem().metadata(&root) {
+            Err(Error::NotFound(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        let mut pending = vec![(root, String::new(), 0usize)];
+        let mut output = Vec::new();
+        while let Some((directory, prefix, depth)) = pending.pop() {
+            if depth > max_depth {
+                return Err(Error::InvalidRepository(
+                    "reflog enumeration exceeds depth limit".into(),
+                ));
+            }
+            for child in self.filesystem().read_dir(&directory)? {
+                let component = child
+                    .to_str()
+                    .ok_or_else(|| Error::InvalidReference("non-UTF-8 reflog name".into()))?;
+                let name = if prefix.is_empty() {
+                    component.to_owned()
+                } else {
+                    format!("{prefix}/{component}")
+                };
+                let path = directory.join(child);
+                let metadata = self.filesystem().metadata(&path)?;
+                if metadata.is_dir() {
+                    pending.push((path, name, depth.saturating_add(1)));
+                } else if metadata.is_file() && !name.ends_with(".lock") {
+                    validate_read_name(&name)?;
+                    output.push(name);
+                    if output.len() > max_reflogs {
+                        return Err(Error::InvalidRepository(
+                            "reflog enumeration exceeds limit".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        output.sort_unstable();
+        Ok(output)
+    }
+
+    /// Remove one complete reflog while holding its canonical log lock.
+    ///
+    /// Returns `false` when no log exists.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid name, lock contention, or storage failure.
+    pub fn drop_reflog(&self, name: &str) -> Result<bool> {
+        validate_read_name(name)?;
+        let destination = self.git_path(Path::new("logs").join(name));
+        if !self.filesystem().exists(&destination)? {
+            return Ok(false);
+        }
+        let lock = lock_path(&destination);
+        self.filesystem().write_new(&lock, b"")?;
+        let result = self.filesystem().remove_file(&destination);
+        let _ = self.filesystem().remove_file(&lock);
+        result.map(|()| true)
+    }
+
     /// Delete entries addressed by zero-based positions from the newest entry.
     ///
     /// # Errors
@@ -884,7 +956,7 @@ impl Repository {
         self.rewrite_reflog(
             name,
             options,
-            |index, len, _| selected.contains(&(len - index - 1)),
+            |index, len, _| Ok(selected.contains(&(len - index - 1))),
             Some(selected.len()),
         )
     }
@@ -903,16 +975,226 @@ impl Repository {
         self.rewrite_reflog(
             name,
             options,
-            |_, _, entry| entry.committer.timestamp() < timestamp,
+            |_, _, entry| Ok(entry.committer.timestamp() < timestamp),
             None,
         )
+    }
+
+    /// Expire old entries whose old or new commit is unreachable from the
+    /// current reference tip. For `HEAD`, all reference tips are roots.
+    ///
+    /// Non-commit object IDs are retained, matching Git's gentle commit lookup;
+    /// when a non-commit direct reference is the root, all old entries expire.
+    ///
+    /// # Errors
+    /// Returns an error for malformed references/objects, graph or storage
+    /// failures, exceeded limits, or lock contention.
+    pub fn expire_reflog_unreachable_before(
+        &self,
+        name: &str,
+        timestamp: i64,
+        graph: &crate::GraphOptions,
+        options: &ReflogRewriteOptions,
+    ) -> Result<ReflogRewriteResult> {
+        let (reachable, expire_all) = self.reflog_reachable_commits(name, graph, options)?;
+        self.rewrite_reflog(
+            name,
+            options,
+            |_, _, entry| {
+                if entry.committer.timestamp() >= timestamp {
+                    return Ok(false);
+                }
+                if expire_all {
+                    return Ok(true);
+                }
+                Ok(self.reflog_commit_is_unreachable(
+                    entry.old,
+                    &reachable,
+                    graph.max_object_size,
+                )? || self.reflog_commit_is_unreachable(
+                    entry.new,
+                    &reachable,
+                    graph.max_object_size,
+                )?)
+            },
+            None,
+        )
+    }
+
+    /// Remove entries whose old or new commit has an incomplete object closure.
+    ///
+    /// Null endpoints are valid. Non-commit endpoints, missing/corrupt parents,
+    /// trees, or blobs make an entry stale. Successfully verified objects are
+    /// cached across entries.
+    ///
+    /// # Errors
+    /// Returns an error for storage failures, object size/count limits, malformed
+    /// reference state, or lock contention.
+    pub fn prune_stale_reflog_entries(
+        &self,
+        name: &str,
+        graph: &crate::GraphOptions,
+        options: &ReflogRewriteOptions,
+    ) -> Result<ReflogRewriteResult> {
+        let mut verified = std::collections::HashSet::new();
+        self.rewrite_reflog(
+            name,
+            options,
+            |_, _, entry| {
+                Ok(!self.reflog_commit_closure_complete(
+                    entry.old,
+                    graph.max_object_size,
+                    options.max_stale_objects,
+                    &mut verified,
+                )? || !self.reflog_commit_closure_complete(
+                    entry.new,
+                    graph.max_object_size,
+                    options.max_stale_objects,
+                    &mut verified,
+                )?)
+            },
+            None,
+        )
+    }
+
+    fn reflog_commit_closure_complete(
+        &self,
+        root: ObjectId,
+        max_object_size: usize,
+        max_objects: usize,
+        verified: &mut std::collections::HashSet<ObjectId>,
+    ) -> Result<bool> {
+        if root.is_null() || verified.contains(&root) {
+            return Ok(true);
+        }
+        let mut pending = vec![(root, crate::ObjectKind::Commit)];
+        let mut discovered = std::collections::HashSet::new();
+        while let Some((id, expected)) = pending.pop() {
+            if verified.contains(&id) || !discovered.insert(id) {
+                continue;
+            }
+            if verified.len().saturating_add(discovered.len()) > max_objects {
+                return Err(Error::InvalidRepository(
+                    "stale reflog verification exceeds object limit".into(),
+                ));
+            }
+            let object = match self.read_object(id, max_object_size) {
+                Ok(object) => object,
+                Err(error) if reflog_broken_object_error(&error) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if object.kind() != expected {
+                return Ok(false);
+            }
+            match expected {
+                crate::ObjectKind::Blob => {}
+                crate::ObjectKind::Commit => {
+                    let commit = match crate::Commit::parse(object.data()) {
+                        Ok(commit) => commit,
+                        Err(error) if reflog_broken_object_error(&error) => return Ok(false),
+                        Err(error) => return Err(error),
+                    };
+                    pending.push((commit.tree(), crate::ObjectKind::Tree));
+                    pending.extend(
+                        commit
+                            .parents()
+                            .iter()
+                            .copied()
+                            .map(|parent| (parent, crate::ObjectKind::Commit)),
+                    );
+                }
+                crate::ObjectKind::Tree => {
+                    let tree = match crate::Tree::parse(object.data()) {
+                        Ok(tree) => tree,
+                        Err(error) if reflog_broken_object_error(&error) => return Ok(false),
+                        Err(error) => return Err(error),
+                    };
+                    pending.extend(
+                        tree.entries()
+                            .iter()
+                            .filter(|entry| entry.mode() != crate::EntryMode::Gitlink)
+                            .map(|entry| (entry.id(), entry.mode().object_kind())),
+                    );
+                }
+                crate::ObjectKind::Tag => return Ok(false),
+            }
+        }
+        verified.extend(discovered);
+        Ok(true)
+    }
+
+    fn reflog_reachable_commits(
+        &self,
+        name: &str,
+        graph: &crate::GraphOptions,
+        options: &ReflogRewriteOptions,
+    ) -> Result<(std::collections::HashSet<ObjectId>, bool)> {
+        let mut roots = Vec::new();
+        if name == "HEAD" {
+            for reference in self.references_with_prefix_bounded(
+                "refs/",
+                options.max_entries,
+                options.max_reference_depth,
+            )? {
+                let id = match reference.target() {
+                    ReferenceTarget::Direct(id) => *id,
+                    ReferenceTarget::Symbolic(_) => self.resolve_reference(reference.name())?,
+                };
+                if self.read_object(id, graph.max_object_size)?.kind() == crate::ObjectKind::Commit
+                {
+                    roots.push(id);
+                }
+            }
+        } else {
+            let id = self.resolve_reference(name)?;
+            if self.read_object(id, graph.max_object_size)?.kind() != crate::ObjectKind::Commit {
+                return Ok((std::collections::HashSet::new(), true));
+            }
+            roots.push(id);
+        }
+        if roots.is_empty() {
+            return Ok((std::collections::HashSet::new(), false));
+        }
+        let revisions = self.walk_revisions(
+            &roots,
+            &[],
+            &crate::RevisionWalkOptions {
+                graph: graph.clone(),
+                ..crate::RevisionWalkOptions::default()
+            },
+        )?;
+        Ok((
+            revisions
+                .into_iter()
+                .map(|revision| revision.id())
+                .collect(),
+            false,
+        ))
+    }
+
+    fn reflog_commit_is_unreachable(
+        &self,
+        id: ObjectId,
+        reachable: &std::collections::HashSet<ObjectId>,
+        max_object_size: usize,
+    ) -> Result<bool> {
+        if id.is_null() {
+            return Ok(false);
+        }
+        match self.read_object(id, max_object_size) {
+            Ok(object) if object.kind() == crate::ObjectKind::Commit => {
+                Ok(!reachable.contains(&id))
+            }
+            Ok(_) | Err(Error::NotFound(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     fn rewrite_reflog(
         &self,
         name: &str,
         options: &ReflogRewriteOptions,
-        mut remove: impl FnMut(usize, usize, &ReflogEntry) -> bool,
+        mut remove: impl FnMut(usize, usize, &ReflogEntry) -> Result<bool>,
         expected_removals: Option<usize>,
     ) -> Result<ReflogRewriteResult> {
         validate_read_name(name)?;
@@ -935,11 +1217,17 @@ impl Repository {
             let entries = self.read_reflog_bounded(name, options.max_entries)?;
             let mut retained = Vec::with_capacity(entries.len());
             let mut removed = 0;
+            let mut last_kept = ObjectId::null();
             for (index, entry) in entries.iter().enumerate() {
-                if remove(index, entries.len(), entry) {
+                let mut candidate = entry.clone();
+                if options.rewrite {
+                    candidate.old = last_kept;
+                }
+                if remove(index, entries.len(), &candidate)? {
                     removed += 1;
                 } else {
-                    retained.push(entry.clone());
+                    last_kept = candidate.new;
+                    retained.push(candidate);
                 }
             }
             if expected_removals.is_some_and(|expected| removed != expected) {
@@ -961,20 +1249,14 @@ impl Repository {
             }
             self.filesystem().write_new(&log_lock, b"")?;
             let mut contents = Vec::new();
-            let mut last_kept = ObjectId::null();
             for entry in &retained {
                 append_reflog_line(
                     &mut contents,
-                    if options.rewrite {
-                        last_kept
-                    } else {
-                        entry.old
-                    },
+                    entry.old,
                     entry.new,
                     &entry.committer,
                     &entry.message,
                 );
-                last_kept = entry.new;
             }
             self.filesystem().write(&log_lock, &contents)?;
             if options.update_reference
@@ -1105,6 +1387,18 @@ fn validate_read_name(name: &str) -> Result<()> {
     } else {
         Err(Error::InvalidReferenceName(name.to_owned()))
     }
+}
+
+fn reflog_broken_object_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::NotFound(_)
+            | Error::InvalidObjectId(_)
+            | Error::InvalidObject(_)
+            | Error::InvalidTree(_)
+            | Error::InvalidCommit(_)
+            | Error::Compression(_)
+    )
 }
 
 struct PreparedReferenceEdit {
@@ -1267,7 +1561,7 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
-    use crate::{FileSystem, InitOptions, MemoryFileSystem};
+    use crate::{CommitBuilder, FileSystem, GraphOptions, InitOptions, MemoryFileSystem, Tree};
 
     const FIRST: &str = "1111111111111111111111111111111111111111";
     const SECOND: &str = "2222222222222222222222222222222222222222";
@@ -1763,5 +2057,127 @@ mod tests {
             !fs.exists(Path::new("repo/.git/logs/refs/heads/main.lock"))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn expires_unreachable_entries_lists_and_drops_logs() {
+        let (repository, fs) = repository();
+        let tree = repository.write_tree(&Tree::default()).unwrap();
+        let identity = Signature::new("Test", "test@example.com", 1, 0).unwrap();
+        let root = repository
+            .write_commit(&CommitBuilder::new(tree, identity.clone(), identity.clone()).build())
+            .unwrap();
+        let side = repository
+            .write_commit(
+                &CommitBuilder::new(tree, identity.clone(), identity.clone())
+                    .message(b"side".to_vec())
+                    .build(),
+            )
+            .unwrap();
+        let tip = repository
+            .write_commit(
+                &CommitBuilder::new(tree, identity.clone(), identity)
+                    .parent(root)
+                    .message(b"tip".to_vec())
+                    .build(),
+            )
+            .unwrap();
+        let name = ReferenceName::branch("main").unwrap();
+        for (index, (id, previous)) in [
+            (root, PreviousValue::MustNotExist),
+            (side, PreviousValue::MustExist(root)),
+            (tip, PreviousValue::MustExist(side)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            repository
+                .update_reference_with_reflog(
+                    &name,
+                    id,
+                    previous,
+                    &Signature::new(
+                        "Test",
+                        "test@example.com",
+                        i64::try_from(index).unwrap() + 1,
+                        0,
+                    )
+                    .unwrap(),
+                    b"move",
+                )
+                .unwrap();
+        }
+
+        let outcome = repository
+            .expire_reflog_unreachable_before(
+                name.as_str(),
+                3,
+                &GraphOptions::default(),
+                &ReflogRewriteOptions {
+                    rewrite: true,
+                    ..ReflogRewriteOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome.removed, 1);
+        let entries = repository.read_reflog(name.as_str()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].new_id(), root);
+        assert_eq!(entries[1].old_id(), root);
+        assert_eq!(entries[1].new_id(), tip);
+        assert_eq!(repository.reflogs(10, 10).unwrap(), vec!["refs/heads/main"]);
+        assert!(repository.drop_reflog(name.as_str()).unwrap());
+        assert!(!repository.drop_reflog(name.as_str()).unwrap());
+        assert!(repository.reflogs(10, 10).unwrap().is_empty());
+        assert!(
+            !fs.exists(Path::new("repo/.git/logs/refs/heads/main.lock"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn stale_fix_prunes_entries_with_broken_commit_closures() {
+        let (repository, _) = repository();
+        let tree = repository.write_tree(&Tree::default()).unwrap();
+        let identity = Signature::new("Test", "test@example.com", 1, 0).unwrap();
+        let valid = repository
+            .write_commit(&CommitBuilder::new(tree, identity.clone(), identity.clone()).build())
+            .unwrap();
+        let missing = ObjectId::from_str(FIRST).unwrap();
+        let name = ReferenceName::branch("broken").unwrap();
+        repository
+            .update_reference_with_reflog(
+                &name,
+                valid,
+                PreviousValue::MustNotExist,
+                &identity,
+                b"valid",
+            )
+            .unwrap();
+        repository
+            .update_reference_with_reflog(
+                &name,
+                missing,
+                PreviousValue::MustExist(valid),
+                &identity,
+                b"broken",
+            )
+            .unwrap();
+
+        let outcome = repository
+            .prune_stale_reflog_entries(
+                name.as_str(),
+                &GraphOptions::default(),
+                &ReflogRewriteOptions {
+                    rewrite: true,
+                    ..ReflogRewriteOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome.removed, 1);
+        let entries = repository.read_reflog(name.as_str()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].new_id(), valid);
+        assert_eq!(entries[0].old_id(), ObjectId::null());
     }
 }
