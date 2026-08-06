@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{Error, Result};
 
-use super::{FileSystem, Metadata, path::validate};
+use super::{FileStat, FileSystem, Metadata, path::validate};
 
 #[derive(Clone, Debug)]
 pub struct HostFileSystem {
@@ -56,6 +56,23 @@ impl FileSystem for HostFileSystem {
         file.write_all(contents).map_err(Error::Io)
     }
 
+    fn read_link(&self, path: &Path) -> Result<Vec<u8>> {
+        let target = fs::read_link(self.resolve(path)?).map_err(|error| map_io(error, path))?;
+        os_path_bytes(&target)
+    }
+
+    fn create_symlink(&self, path: &Path, target: &[u8]) -> Result<()> {
+        let destination = self.resolve(path)?;
+        if fs::symlink_metadata(&destination).is_ok() {
+            fs::remove_file(&destination).map_err(|error| map_io(error, path))?;
+        }
+        create_host_symlink(target, &destination).map_err(Error::Io)
+    }
+
+    fn set_executable(&self, path: &Path, executable: bool) -> Result<()> {
+        set_host_executable(&self.resolve(path)?, executable).map_err(Error::Io)
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         fs::rename(self.resolve(from)?, self.resolve(to)?).map_err(|error| map_io(error, from))
     }
@@ -65,11 +82,17 @@ impl FileSystem for HostFileSystem {
     }
 
     fn metadata(&self, path: &Path) -> Result<Metadata> {
-        let metadata = fs::metadata(self.resolve(path)?).map_err(|error| map_io(error, path))?;
+        let metadata =
+            fs::symlink_metadata(self.resolve(path)?).map_err(|error| map_io(error, path))?;
+        let stat = host_stat(&metadata);
         if metadata.is_file() {
-            Ok(Metadata::file(metadata.len()))
+            Ok(Metadata::file(metadata.len())
+                .with_executable(host_executable(&metadata))
+                .with_stat(stat))
         } else if metadata.is_dir() {
-            Ok(Metadata::directory())
+            Ok(Metadata::directory().with_stat(stat))
+        } else if metadata.file_type().is_symlink() {
+            Ok(Metadata::symlink(metadata.len()).with_stat(stat))
         } else {
             Err(Error::InvalidPath(path.to_path_buf()))
         }
@@ -83,6 +106,100 @@ impl FileSystem for HostFileSystem {
         entries.sort_unstable();
         Ok(entries)
     }
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
+fn os_path_bytes(path: &Path) -> Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(path.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(not(unix))]
+fn os_path_bytes(path: &Path) -> Result<Vec<u8>> {
+    path.to_str()
+        .map(|value| value.as_bytes().to_vec())
+        .ok_or_else(|| Error::InvalidPath(path.to_path_buf()))
+}
+
+#[cfg(unix)]
+fn create_host_symlink(target: &[u8], destination: &Path) -> std::io::Result<()> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    std::os::unix::fs::symlink(OsStr::from_bytes(target), destination)
+}
+
+#[cfg(windows)]
+fn create_host_symlink(target: &[u8], destination: &Path) -> std::io::Result<()> {
+    let target = std::str::from_utf8(target)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF-8 symlink"))?;
+    std::os::windows::fs::symlink_file(target, destination)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_host_symlink(_target: &[u8], _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "symbolic links are unsupported",
+    ))
+}
+
+#[cfg(unix)]
+fn host_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn host_executable(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn set_host_executable(path: &Path, executable: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path)?.permissions();
+    let mode = permissions.mode();
+    permissions.set_mode(if executable {
+        mode | 0o111
+    } else {
+        mode & !0o111
+    });
+    fs::set_permissions(path, permissions)
+}
+
+#[cfg(not(unix))]
+fn set_host_executable(path: &Path, _executable: bool) -> std::io::Result<()> {
+    if fs::metadata(path)?.is_file() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a file",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn host_stat(metadata: &fs::Metadata) -> FileStat {
+    use std::os::unix::fs::MetadataExt;
+    FileStat {
+        ctime_seconds: metadata.ctime().try_into().unwrap_or(0),
+        ctime_nanoseconds: metadata.ctime_nsec().try_into().unwrap_or(0),
+        mtime_seconds: metadata.mtime().try_into().unwrap_or(0),
+        mtime_nanoseconds: metadata.mtime_nsec().try_into().unwrap_or(0),
+        device: u32::try_from(metadata.dev() & u64::from(u32::MAX))
+            .expect("device was masked to u32"),
+        inode: u32::try_from(metadata.ino() & u64::from(u32::MAX))
+            .expect("inode was masked to u32"),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+    }
+}
+
+#[cfg(not(unix))]
+fn host_stat(_metadata: &fs::Metadata) -> FileStat {
+    FileStat::default()
 }
 
 fn map_io(error: std::io::Error, path: &Path) -> Error {

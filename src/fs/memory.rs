@@ -13,8 +13,9 @@ pub struct MemoryFileSystem {
 
 #[derive(Clone, Debug)]
 enum Entry {
-    File(Vec<u8>),
+    File { data: Vec<u8>, executable: bool },
     Directory,
+    Symlink(Vec<u8>),
 }
 
 impl Default for MemoryFileSystem {
@@ -54,7 +55,9 @@ impl FileSystem for MemoryFileSystem {
         for component in path.components() {
             current.push(component);
             match entries.get(&current) {
-                Some(Entry::File(_)) => return Err(Error::NotDirectory(current)),
+                Some(Entry::File { .. } | Entry::Symlink(_)) => {
+                    return Err(Error::NotDirectory(current));
+                }
                 Some(Entry::Directory) => {}
                 None => {
                     entries.insert(current.clone(), Entry::Directory);
@@ -67,8 +70,9 @@ impl FileSystem for MemoryFileSystem {
     fn read(&self, path: &Path) -> Result<Vec<u8>> {
         let path = validate(path)?;
         match self.entries().get(&path) {
-            Some(Entry::File(data)) => Ok(data.clone()),
+            Some(Entry::File { data, .. }) => Ok(data.clone()),
             Some(Entry::Directory) => Err(Error::IsDirectory(path)),
+            Some(Entry::Symlink(_)) => Err(Error::InvalidPath(path)),
             None => Err(Error::NotFound(path)),
         }
     }
@@ -78,14 +82,28 @@ impl FileSystem for MemoryFileSystem {
         let parent = path.parent().unwrap_or(Path::new(""));
         match self.entries().get(parent) {
             Some(Entry::Directory) => {}
-            Some(Entry::File(_)) => return Err(Error::NotDirectory(parent.to_path_buf())),
+            Some(Entry::File { .. } | Entry::Symlink(_)) => {
+                return Err(Error::NotDirectory(parent.to_path_buf()));
+            }
             None => return Err(Error::NotFound(parent.to_path_buf())),
         }
         if matches!(self.entries().get(&path), Some(Entry::Directory)) {
             return Err(Error::IsDirectory(path));
         }
-        self.entries_mut()
-            .insert(path, Entry::File(contents.to_vec()));
+        let executable = matches!(
+            self.entries().get(&path),
+            Some(Entry::File {
+                executable: true,
+                ..
+            })
+        );
+        self.entries_mut().insert(
+            path,
+            Entry::File {
+                data: contents.to_vec(),
+                executable,
+            },
+        );
         Ok(())
     }
 
@@ -95,14 +113,60 @@ impl FileSystem for MemoryFileSystem {
         let mut entries = self.entries_mut();
         match entries.get(parent) {
             Some(Entry::Directory) => {}
-            Some(Entry::File(_)) => return Err(Error::NotDirectory(parent.to_path_buf())),
+            Some(Entry::File { .. } | Entry::Symlink(_)) => {
+                return Err(Error::NotDirectory(parent.to_path_buf()));
+            }
             None => return Err(Error::NotFound(parent.to_path_buf())),
         }
         if entries.contains_key(&path) {
             return Err(Error::AlreadyExists(path));
         }
-        entries.insert(path, Entry::File(contents.to_vec()));
+        entries.insert(
+            path,
+            Entry::File {
+                data: contents.to_vec(),
+                executable: false,
+            },
+        );
         Ok(())
+    }
+
+    fn read_link(&self, path: &Path) -> Result<Vec<u8>> {
+        let path = validate(path)?;
+        match self.entries().get(&path) {
+            Some(Entry::Symlink(target)) => Ok(target.clone()),
+            Some(_) => Err(Error::InvalidPath(path)),
+            None => Err(Error::NotFound(path)),
+        }
+    }
+
+    fn create_symlink(&self, path: &Path, target: &[u8]) -> Result<()> {
+        let path = validate(path)?;
+        let parent = path.parent().unwrap_or(Path::new(""));
+        let mut entries = self.entries_mut();
+        if !matches!(entries.get(parent), Some(Entry::Directory)) {
+            return Err(Error::NotDirectory(parent.to_path_buf()));
+        }
+        if matches!(entries.get(&path), Some(Entry::Directory)) {
+            return Err(Error::IsDirectory(path));
+        }
+        entries.insert(path, Entry::Symlink(target.to_vec()));
+        Ok(())
+    }
+
+    fn set_executable(&self, path: &Path, executable: bool) -> Result<()> {
+        let path = validate(path)?;
+        let mut entries = self.entries_mut();
+        match entries.get_mut(&path) {
+            Some(Entry::File {
+                executable: value, ..
+            }) => {
+                *value = executable;
+                Ok(())
+            }
+            Some(_) => Err(Error::InvalidPath(path)),
+            None => Err(Error::NotFound(path)),
+        }
     }
 
     fn rename(&self, from: &Path, to: &Path) -> Result<()> {
@@ -129,7 +193,7 @@ impl FileSystem for MemoryFileSystem {
         let path = validate(path)?;
         let mut entries = self.entries_mut();
         match entries.get(&path) {
-            Some(Entry::File(_)) => {
+            Some(Entry::File { .. } | Entry::Symlink(_)) => {
                 entries.remove(&path);
                 Ok(())
             }
@@ -141,8 +205,11 @@ impl FileSystem for MemoryFileSystem {
     fn metadata(&self, path: &Path) -> Result<Metadata> {
         let path = validate(path)?;
         match self.entries().get(&path) {
-            Some(Entry::File(data)) => Ok(Metadata::file(data.len() as u64)),
+            Some(Entry::File { data, executable }) => {
+                Ok(Metadata::file(data.len() as u64).with_executable(*executable))
+            }
             Some(Entry::Directory) => Ok(Metadata::directory()),
+            Some(Entry::Symlink(target)) => Ok(Metadata::symlink(target.len() as u64)),
             None => Err(Error::NotFound(path)),
         }
     }
@@ -151,7 +218,9 @@ impl FileSystem for MemoryFileSystem {
         let path = validate(path)?;
         match self.entries().get(&path) {
             Some(Entry::Directory) => {}
-            Some(Entry::File(_)) => return Err(Error::NotDirectory(path)),
+            Some(Entry::File { .. } | Entry::Symlink(_)) => {
+                return Err(Error::NotDirectory(path));
+            }
             None => return Err(Error::NotFound(path)),
         }
         let entries = self.entries();

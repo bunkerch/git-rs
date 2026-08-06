@@ -15,12 +15,40 @@ use crate::Result;
 pub struct Metadata {
     kind: FileType,
     len: u64,
+    executable: bool,
+    stat: FileStat,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FileStat {
+    pub ctime_seconds: u32,
+    pub ctime_nanoseconds: u32,
+    pub mtime_seconds: u32,
+    pub mtime_nanoseconds: u32,
+    pub device: u32,
+    pub inode: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl FileStat {
+    pub const EMPTY: Self = Self {
+        ctime_seconds: 0,
+        ctime_nanoseconds: 0,
+        mtime_seconds: 0,
+        mtime_nanoseconds: 0,
+        device: 0,
+        inode: 0,
+        uid: 0,
+        gid: 0,
+    };
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileType {
     File,
     Directory,
+    Symlink,
 }
 
 impl Metadata {
@@ -29,6 +57,8 @@ impl Metadata {
         Self {
             kind: FileType::File,
             len,
+            executable: false,
+            stat: FileStat::EMPTY,
         }
     }
 
@@ -37,7 +67,31 @@ impl Metadata {
         Self {
             kind: FileType::Directory,
             len: 0,
+            executable: false,
+            stat: FileStat::EMPTY,
         }
+    }
+
+    #[must_use]
+    pub const fn symlink(len: u64) -> Self {
+        Self {
+            kind: FileType::Symlink,
+            len,
+            executable: false,
+            stat: FileStat::EMPTY,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_executable(mut self, executable: bool) -> Self {
+        self.executable = executable;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_stat(mut self, stat: FileStat) -> Self {
+        self.stat = stat;
+        self
     }
 
     #[must_use]
@@ -48,6 +102,21 @@ impl Metadata {
     #[must_use]
     pub const fn is_dir(self) -> bool {
         matches!(self.kind, FileType::Directory)
+    }
+
+    #[must_use]
+    pub const fn is_symlink(self) -> bool {
+        matches!(self.kind, FileType::Symlink)
+    }
+
+    #[must_use]
+    pub const fn is_executable(self) -> bool {
+        self.executable
+    }
+
+    #[must_use]
+    pub const fn stat(self) -> FileStat {
+        self.stat
     }
 
     #[must_use]
@@ -90,6 +159,21 @@ pub trait FileSystem: Send + Sync + 'static {
     /// Returns [`crate::Error::AlreadyExists`] if the path is occupied, or a
     /// storage error if the file cannot be created.
     fn write_new(&self, path: &Path, contents: &[u8]) -> Result<()>;
+    /// Read the target bytes of a symbolic link without following it.
+    ///
+    /// # Errors
+    /// Returns an error when the path is absent or not a symbolic link.
+    fn read_link(&self, path: &Path) -> Result<Vec<u8>>;
+    /// Create or replace a symbolic link with byte-preserving target data.
+    ///
+    /// # Errors
+    /// Returns an error for invalid paths, unsupported target bytes, or storage failure.
+    fn create_symlink(&self, path: &Path, target: &[u8]) -> Result<()>;
+    /// Change a regular file's executable bit.
+    ///
+    /// # Errors
+    /// Returns an error when the path is not a regular file or storage fails.
+    fn set_executable(&self, path: &Path, executable: bool) -> Result<()>;
     /// Atomically move `from` to `to`, replacing a file at `to`.
     ///
     /// # Errors

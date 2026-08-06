@@ -14,6 +14,11 @@ to)` is the publication boundary and must atomically replace a file at `to`.
 Remote adapters can implement these with a database transaction, object
 generation plus compare-and-swap, or another storage-native atomic primitive.
 
+Metadata is no-follow: adapters distinguish regular files, directories, and
+symbolic links. `read_link` returns target bytes, and executable state plus
+`FileStat` fields support Git index semantics without exposing host-specific
+metadata types.
+
 Built-in adapters:
 
 - `MemoryFileSystem`: cloneable, shared, lock-protected storage for tests and
