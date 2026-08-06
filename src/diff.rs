@@ -427,8 +427,211 @@ enum Edit<'a> {
     Insert(&'a [u8]),
 }
 
+#[derive(Clone, Debug)]
+struct LineChange<'a> {
+    start: usize,
+    end: usize,
+    replacement: Vec<&'a [u8]>,
+}
+
 fn split_lines(data: &[u8]) -> Vec<&[u8]> {
     data.split_inclusive(|byte| *byte == b'\n').collect()
+}
+
+pub(crate) fn merge_text(
+    base_data: &[u8],
+    ours_data: &[u8],
+    theirs_data: &[u8],
+    ours_label: &[u8],
+    theirs_label: &[u8],
+    max_lines: usize,
+    max_trace_cells: usize,
+) -> Result<(Vec<u8>, bool)> {
+    let base = split_lines(base_data);
+    let ours = split_lines(ours_data);
+    let theirs = split_lines(theirs_data);
+    if base.len().max(ours.len()).max(theirs.len()) > max_lines {
+        return Err(Error::InvalidRepository(format!(
+            "text merge exceeds {max_lines} lines"
+        )));
+    }
+    let ours_changes = line_changes(&base, &ours, max_trace_cells)?;
+    let theirs_changes = line_changes(&base, &theirs, max_trace_cells)?;
+    let mut output = Vec::new();
+    let mut base_position = 0usize;
+    let mut ours_position = 0usize;
+    let mut theirs_position = 0usize;
+    let mut conflicted = false;
+    while ours_position < ours_changes.len() || theirs_position < theirs_changes.len() {
+        let ours_change = ours_changes.get(ours_position);
+        let theirs_change = theirs_changes.get(theirs_position);
+        match (ours_change, theirs_change) {
+            (Some(ours_change), Some(theirs_change))
+                if changes_are_disjoint(ours_change, theirs_change) =>
+            {
+                let (change, position) = if ours_change.start <= theirs_change.start {
+                    (ours_change, &mut ours_position)
+                } else {
+                    (theirs_change, &mut theirs_position)
+                };
+                append_change(&mut output, &base, &mut base_position, change);
+                *position += 1;
+            }
+            (Some(_), Some(_)) => {
+                let start = ours_changes[ours_position]
+                    .start
+                    .min(theirs_changes[theirs_position].start);
+                let mut end = ours_changes[ours_position]
+                    .end
+                    .max(theirs_changes[theirs_position].end);
+                let mut ours_end = ours_position;
+                let mut theirs_end = theirs_position;
+                loop {
+                    let previous = (ours_end, theirs_end, end);
+                    ours_end = collect_overlapping(&ours_changes, ours_end, start, &mut end);
+                    theirs_end = collect_overlapping(&theirs_changes, theirs_end, start, &mut end);
+                    if previous == (ours_end, theirs_end, end) {
+                        break;
+                    }
+                }
+                let ours_region =
+                    apply_changes(&base, start, end, &ours_changes[ours_position..ours_end]);
+                let theirs_region = apply_changes(
+                    &base,
+                    start,
+                    end,
+                    &theirs_changes[theirs_position..theirs_end],
+                );
+                output.extend(base[base_position..start].iter().copied().flatten());
+                if ours_region == theirs_region {
+                    output.extend_from_slice(&ours_region);
+                } else {
+                    conflicted = true;
+                    output.extend_from_slice(b"<<<<<<< ");
+                    output.extend_from_slice(ours_label);
+                    output.push(b'\n');
+                    append_with_terminal_newline(&mut output, &ours_region);
+                    output.extend_from_slice(b"=======\n");
+                    append_with_terminal_newline(&mut output, &theirs_region);
+                    output.extend_from_slice(b">>>>>>> ");
+                    output.extend_from_slice(theirs_label);
+                    output.push(b'\n');
+                }
+                base_position = end;
+                ours_position = ours_end;
+                theirs_position = theirs_end;
+            }
+            (Some(change), None) => {
+                append_change(&mut output, &base, &mut base_position, change);
+                ours_position += 1;
+            }
+            (None, Some(change)) => {
+                append_change(&mut output, &base, &mut base_position, change);
+                theirs_position += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    output.extend(base[base_position..].iter().copied().flatten());
+    Ok((output, conflicted))
+}
+
+fn line_changes<'a>(
+    base: &[&'a [u8]],
+    side: &[&'a [u8]],
+    max_trace_cells: usize,
+) -> Result<Vec<LineChange<'a>>> {
+    let mut changes = Vec::new();
+    let mut base_position = 0usize;
+    let mut pending: Option<LineChange<'a>> = None;
+    for edit in myers(base, side, max_trace_cells)? {
+        match edit {
+            Edit::Equal(_) => {
+                if let Some(change) = pending.take() {
+                    changes.push(change);
+                }
+                base_position += 1;
+            }
+            Edit::Delete(_) => {
+                let change = pending.get_or_insert_with(|| LineChange {
+                    start: base_position,
+                    end: base_position,
+                    replacement: Vec::new(),
+                });
+                base_position += 1;
+                change.end = base_position;
+            }
+            Edit::Insert(line) => pending
+                .get_or_insert_with(|| LineChange {
+                    start: base_position,
+                    end: base_position,
+                    replacement: Vec::new(),
+                })
+                .replacement
+                .push(line),
+        }
+    }
+    if let Some(change) = pending {
+        changes.push(change);
+    }
+    Ok(changes)
+}
+
+fn changes_are_disjoint(left: &LineChange<'_>, right: &LineChange<'_>) -> bool {
+    if left.start == left.end && right.start == right.end && left.start == right.start {
+        return false;
+    }
+    left.end <= right.start || right.end <= left.start
+}
+
+fn collect_overlapping(
+    changes: &[LineChange<'_>],
+    start_index: usize,
+    region_start: usize,
+    region_end: &mut usize,
+) -> usize {
+    let mut index = start_index;
+    while let Some(change) = changes.get(index) {
+        let overlaps = change.start < *region_end
+            || change.start == region_start
+            || *region_end == region_start && change.start == *region_end;
+        if !overlaps {
+            break;
+        }
+        *region_end = (*region_end).max(change.end);
+        index += 1;
+    }
+    index
+}
+
+fn apply_changes(base: &[&[u8]], start: usize, end: usize, changes: &[LineChange<'_>]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut position = start;
+    for change in changes {
+        output.extend(base[position..change.start].iter().copied().flatten());
+        output.extend(change.replacement.iter().copied().flatten());
+        position = change.end;
+    }
+    output.extend(base[position..end].iter().copied().flatten());
+    output
+}
+
+fn append_change(
+    output: &mut Vec<u8>,
+    base: &[&[u8]],
+    base_position: &mut usize,
+    change: &LineChange<'_>,
+) {
+    output.extend(base[*base_position..change.start].iter().copied().flatten());
+    output.extend(change.replacement.iter().copied().flatten());
+    *base_position = change.end;
+}
+
+fn append_with_terminal_newline(output: &mut Vec<u8>, value: &[u8]) {
+    output.extend_from_slice(value);
+    if !value.ends_with(b"\n") {
+        output.push(b'\n');
+    }
 }
 
 pub(crate) fn unchanged_line_map(
@@ -701,10 +904,43 @@ fn quoted_path(prefix: &[u8], path: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiffKind, DiffOptions, Edit, myers, split_lines};
+    use super::{DiffKind, DiffOptions, Edit, merge_text, myers, split_lines};
     use crate::{
         EntryMode, InitOptions, MemoryFileSystem, ObjectKind, Repository, Tree, TreeEntry,
     };
+
+    #[test]
+    fn three_way_text_merge_combines_regions_and_marks_overlaps() {
+        let (merged, conflicted) = merge_text(
+            b"one\ntwo\nthree\n",
+            b"ONE\ntwo\nthree\n",
+            b"one\ntwo\nTHREE\n",
+            b"ours",
+            b"theirs",
+            10,
+            10_000,
+        )
+        .unwrap();
+        assert!(!conflicted);
+        assert_eq!(merged, b"ONE\ntwo\nTHREE\n");
+
+        let (merged, conflicted) = merge_text(
+            b"one\ntwo\n",
+            b"one\nOURS\n",
+            b"one\nTHEIRS\n",
+            b"ours",
+            b"theirs",
+            10,
+            10_000,
+        )
+        .unwrap();
+        assert!(conflicted);
+        assert_eq!(
+            merged,
+            b"one\n<<<<<<< ours\nOURS\n=======\nTHEIRS\n>>>>>>> theirs\n"
+        );
+        assert!(merge_text(b"a\nb\n", b"a\nb\n", b"a\nb\n", b"o", b"t", 1, 100).is_err());
+    }
 
     #[test]
     fn classifies_add_delete_modify_type_and_exact_rename() {

@@ -24,6 +24,8 @@ pub struct MergeOptions {
     pub no_commit: bool,
     pub message: Vec<u8>,
     pub graph: GraphOptions,
+    pub max_text_merge_lines: usize,
+    pub max_diff_trace_cells: usize,
 }
 
 impl Default for MergeOptions {
@@ -33,6 +35,8 @@ impl Default for MergeOptions {
             no_commit: false,
             message: b"Merge commit\n".to_vec(),
             graph: GraphOptions::default(),
+            max_text_merge_lines: 1_000_000,
+            max_diff_trace_cells: 10_000_000,
         }
     }
 }
@@ -48,13 +52,27 @@ pub enum MergeResult {
 }
 
 /// Choices for a non-checkout tree merge.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MergeTreeOptions {
     /// Use this commit or tree as the merge base instead of discovering bases.
     pub merge_base: Option<ObjectId>,
     /// Treat the empty tree as the base when the commits have no common history.
     pub allow_unrelated_histories: bool,
     pub graph: GraphOptions,
+    pub max_text_merge_lines: usize,
+    pub max_diff_trace_cells: usize,
+}
+
+impl Default for MergeTreeOptions {
+    fn default() -> Self {
+        Self {
+            merge_base: None,
+            allow_unrelated_histories: false,
+            graph: GraphOptions::default(),
+            max_text_merge_lines: 1_000_000,
+            max_diff_trace_cells: 10_000_000,
+        }
+    }
 }
 
 /// One stage of a conflicted path returned by [`Repository::merge_tree`].
@@ -183,6 +201,8 @@ impl Repository {
                     &bases,
                     &MergeOptions {
                         graph: options.graph.clone(),
+                        max_text_merge_lines: options.max_text_merge_lines,
+                        max_diff_trace_cells: options.max_diff_trace_cells,
                         ..MergeOptions::default()
                     },
                 )?
@@ -193,9 +213,12 @@ impl Repository {
             base_tree,
             ours_tree,
             theirs_tree,
+            Some(ours),
             theirs,
             &MergeOptions {
                 graph: options.graph.clone(),
+                max_text_merge_lines: options.max_text_merge_lines,
+                max_diff_trace_cells: options.max_diff_trace_cells,
                 ..MergeOptions::default()
             },
         )?;
@@ -283,7 +306,14 @@ impl Repository {
             },
             ..MergeOptions::default()
         };
-        let merged = self.merge_trees(base, ours_commit.tree(), theirs, target, &merge_options)?;
+        let merged = self.merge_trees(
+            base,
+            ours_commit.tree(),
+            theirs,
+            None,
+            target,
+            &merge_options,
+        )?;
         let (tree, paths) = self.materialize_merge(&merged, options.max_object_size, false)?;
         let message = replay_message(kind, target, &picked, options.mainline);
         if !paths.is_empty() {
@@ -448,7 +478,7 @@ impl Repository {
         let theirs_tree = self
             .read_commit(target, options.graph.max_object_size)?
             .tree();
-        let merged = self.merge_trees(base_tree, ours_tree, theirs_tree, target, options)?;
+        let merged = self.merge_trees(base_tree, ours_tree, theirs_tree, None, target, options)?;
         let (tree, paths) =
             self.materialize_merge(&merged, options.graph.max_object_size, false)?;
         self.write_atomic(Path::new("ORIG_HEAD"), format!("{ours}\n").as_bytes())?;
@@ -543,7 +573,7 @@ impl Repository {
             } else {
                 self.empty_tree()?
             };
-            let merged = self.merge_trees(ancestor_tree, tree, other, base, options)?;
+            let merged = self.merge_trees(ancestor_tree, tree, other, None, base, options)?;
             tree = self.write_merge_result_tree(&merged)?;
         }
         Ok(tree)
@@ -558,6 +588,7 @@ impl Repository {
         base: ObjectId,
         ours: ObjectId,
         theirs: ObjectId,
+        ours_label: Option<ObjectId>,
         target: ObjectId,
         options: &MergeOptions,
     ) -> Result<TreeMerge> {
@@ -590,19 +621,25 @@ impl Repository {
                     resolved.insert(path, value);
                 }
             } else {
-                let working = self.conflict_working_entry(
+                let (working, content_conflict) = self.conflict_working_entry(
+                    base_entry,
                     ours_entry,
                     theirs_entry,
+                    ours_label,
                     target,
-                    options.graph.max_object_size,
+                    options,
                 )?;
-                conflicts.push(Conflict {
-                    path,
-                    base: base_entry,
-                    ours: ours_entry,
-                    theirs: theirs_entry,
-                    working,
-                });
+                if content_conflict {
+                    conflicts.push(Conflict {
+                        path,
+                        base: base_entry,
+                        ours: ours_entry,
+                        theirs: theirs_entry,
+                        working,
+                    });
+                } else {
+                    resolved.insert(path, working);
+                }
             }
         }
         reject_file_directory_collisions(
@@ -618,30 +655,43 @@ impl Repository {
 
     fn conflict_working_entry(
         &self,
+        base: Option<MergeEntry>,
         ours: Option<MergeEntry>,
         theirs: Option<MergeEntry>,
+        ours_label: Option<ObjectId>,
         target: ObjectId,
-        max_size: usize,
-    ) -> Result<MergeEntry> {
-        if let (Some(ours), Some(theirs)) = (ours, theirs)
+        options: &MergeOptions,
+    ) -> Result<(MergeEntry, bool)> {
+        if let (Some(base), Some(ours), Some(theirs)) = (base, ours, theirs)
+            && regular_mode(base.mode)
             && regular_mode(ours.mode)
             && regular_mode(theirs.mode)
         {
-            let ours_data = self.read_blob(ours.id, max_size)?;
-            let theirs_data = self.read_blob(theirs.id, max_size)?;
-            if !ours_data.contains(&0) && !theirs_data.contains(&0) {
-                let mut data = b"<<<<<<< HEAD\n".to_vec();
-                append_with_newline(&mut data, &ours_data);
-                data.extend_from_slice(b"=======\n");
-                append_with_newline(&mut data, &theirs_data);
-                data.extend_from_slice(format!(">>>>>>> {target}\n").as_bytes());
-                return Ok(MergeEntry {
-                    mode: ours.mode,
-                    id: self.write_object(ObjectKind::Blob, &data)?,
-                });
+            let base_data = self.read_blob(base.id, options.graph.max_object_size)?;
+            let ours_data = self.read_blob(ours.id, options.graph.max_object_size)?;
+            let theirs_data = self.read_blob(theirs.id, options.graph.max_object_size)?;
+            if !base_data.contains(&0) && !ours_data.contains(&0) && !theirs_data.contains(&0) {
+                let ours_label = ours_label.map(|id| id.to_string());
+                let (data, conflicted) = crate::diff::merge_text(
+                    &base_data,
+                    &ours_data,
+                    &theirs_data,
+                    ours_label.as_deref().unwrap_or("HEAD").as_bytes(),
+                    target.to_string().as_bytes(),
+                    options.max_text_merge_lines,
+                    options.max_diff_trace_cells,
+                )?;
+                let mode = merge_scalar(base.mode, ours.mode, theirs.mode).unwrap_or(ours.mode);
+                return Ok((
+                    MergeEntry {
+                        mode,
+                        id: self.write_object(ObjectKind::Blob, &data)?,
+                    },
+                    conflicted || merge_scalar(base.mode, ours.mode, theirs.mode).is_none(),
+                ));
             }
         }
-        ours.or(theirs).ok_or_else(|| {
+        ours.or(theirs).map(|entry| (entry, true)).ok_or_else(|| {
             Error::InvalidRepository("merge conflict has no materializable side".into())
         })
     }
@@ -686,7 +736,7 @@ impl Repository {
             },
             ..MergeOptions::default()
         };
-        let merged = self.merge_trees(base, ours, theirs, target, &options)?;
+        let merged = self.merge_trees(base, ours, theirs, None, target, &options)?;
         self.materialize_merge(&merged, max_object_size, force_checkout)
     }
 
@@ -705,7 +755,7 @@ impl Repository {
             },
             ..MergeOptions::default()
         };
-        let merged = self.merge_trees(base, ours, theirs, target, &options)?;
+        let merged = self.merge_trees(base, ours, theirs, None, target, &options)?;
         if !merged.conflicts.is_empty() {
             return Err(Error::CheckoutConflict(
                 merged
@@ -1024,15 +1074,20 @@ fn reject_file_directory_collisions<'a>(paths: impl Iterator<Item = &'a Vec<u8>>
     Ok(())
 }
 
-const fn regular_mode(mode: u32) -> bool {
-    matches!(mode, 0o100_644 | 0o100_755)
+fn merge_scalar<T: Copy + Eq>(base: T, ours: T, theirs: T) -> Option<T> {
+    if ours == theirs {
+        Some(ours)
+    } else if ours == base {
+        Some(theirs)
+    } else if theirs == base {
+        Some(ours)
+    } else {
+        None
+    }
 }
 
-fn append_with_newline(output: &mut Vec<u8>, contents: &[u8]) {
-    output.extend_from_slice(contents);
-    if !contents.ends_with(b"\n") {
-        output.push(b'\n');
-    }
+const fn regular_mode(mode: u32) -> bool {
+    matches!(mode, 0o100_644 | 0o100_755)
 }
 
 #[cfg(test)]
@@ -1121,7 +1176,7 @@ mod tests {
                 .read_object(marker.id, 4096)
                 .unwrap()
                 .data()
-                .starts_with(b"<<<<<<< HEAD\n")
+                .starts_with(b"<<<<<<< ")
         );
         assert_eq!(
             filesystem.read(Path::new("repo/.git/HEAD")).unwrap(),
@@ -1260,6 +1315,58 @@ mod tests {
             !filesystem
                 .exists(Path::new("repo/.git/MERGE_HEAD"))
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn merges_disjoint_edits_within_the_same_text_file() {
+        let (repository, filesystem, signature) = repository();
+        let base = commit(&repository, &[], &[(&b"file"[..], b"one\ntwo\nthree\n")], 1);
+        let ours = commit(
+            &repository,
+            &[base],
+            &[(&b"file"[..], b"ONE\ntwo\nthree\n")],
+            2,
+        );
+        let theirs = commit(
+            &repository,
+            &[base],
+            &[(&b"file"[..], b"one\ntwo\nTHREE\n")],
+            3,
+        );
+        let tree_result = repository
+            .merge_tree(ours, theirs, &MergeTreeOptions::default())
+            .unwrap();
+        assert!(tree_result.is_clean());
+        set_main(&repository, ours);
+        checkout(&repository, ours);
+        let result = repository
+            .merge(
+                theirs,
+                &MergeOptions {
+                    no_commit: true,
+                    ..MergeOptions::default()
+                },
+                &signature,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            MergeResult::Prepared {
+                tree: tree_result.tree
+            }
+        );
+        assert_eq!(
+            filesystem.read(Path::new("repo/file")).unwrap(),
+            b"ONE\ntwo\nTHREE\n"
+        );
+        assert!(
+            repository
+                .read_index()
+                .unwrap()
+                .entries()
+                .iter()
+                .all(|entry| entry.stage() == 0)
         );
     }
 

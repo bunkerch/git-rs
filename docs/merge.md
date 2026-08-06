@@ -24,9 +24,13 @@ possible. `no_commit` leaves a clean merged index and worktree with merge state
 for `continue_merge`.
 
 Conflicting paths receive Git index stages 1 (base), 2 (ours), and 3 (theirs).
-Text blobs are materialized with `<<<<<<<`, `=======`, and `>>>>>>>` markers;
-binary or non-regular conflicts retain one side in the worktree while keeping
-all available stages. Resolve files through `add`, then call `continue_merge`.
+Text blobs are merged at line-region granularity: independent edits within the
+same file combine cleanly, identical edits are deduplicated, and only
+overlapping changes receive `<<<<<<<`, `=======`, and `>>>>>>>` markers. Binary
+or non-regular conflicts retain one side in the worktree while keeping all
+available stages. `max_text_merge_lines` and `max_diff_trace_cells` bound line
+inventory and Myers trace storage. Resolve files through `add`, then call
+`continue_merge`.
 `abort_merge` restores the original commit tree and clears merge state.
 
 ## Non-checkout tree merges
@@ -72,6 +76,8 @@ base tree; conflicting virtual-base content is preserved with marker blobs.
 - `merge-ort.c` and `unpack-trees.c` define three-way path selection and index
   stage semantics.
 - `xdiff-interface.c` defines textual conflict-marker presentation.
+- `xdiff/xmerge.c` defines diff-derived region combination and overlapping
+  change conflicts.
 - `commit-reach.c` defines best common ancestors and criss-cross bases.
 - `builtin/merge-tree.c:real_merge` defines non-checkout inputs, explicit-base
   behavior, result-tree creation, and structured conflict stages.
