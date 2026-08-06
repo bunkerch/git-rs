@@ -80,7 +80,8 @@ pub use receive_pack::{
     ReceiveCommand, ReceiveCommandStatus, ReceivePackOptions, ReceivePackRequest, ReceivePackResult,
 };
 pub use refs::{
-    PreviousValue, Reference, ReferenceEdit, ReferenceName, ReferenceTarget, ReflogEntry,
+    PreviousReferenceValue, PreviousValue, Reference, ReferenceEdit, ReferenceName,
+    ReferenceTarget, ReflogEntry,
 };
 pub use refspec::{RefSpec, RefSpecKind};
 pub use remote::{Remote, RemoveRemoteResult};

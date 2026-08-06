@@ -76,6 +76,13 @@ pub enum PreviousValue {
     MustExist(ObjectId),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PreviousReferenceValue {
+    Any,
+    MustNotExist,
+    MustExist(ReferenceTarget),
+}
+
 /// One direct update or deletion in a batch reference transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReferenceEdit {
@@ -263,6 +270,158 @@ impl Repository {
             }
         }
         Err(Error::SymbolicReferenceLoop(name.to_owned()))
+    }
+
+    /// Return the target name of a symbolic reference.
+    ///
+    /// With `recurse`, symbolic chains are followed and the final symbolic
+    /// target is returned, including when that target is unborn.
+    ///
+    /// # Errors
+    /// Returns an error when `name` is missing, direct, malformed, or exceeds
+    /// Git's five-hop symbolic-reference limit.
+    pub fn symbolic_reference(&self, name: &str, recurse: bool) -> Result<ReferenceName> {
+        validate_read_name(name)?;
+        let mut current = name.to_owned();
+        for _ in 0..SYMBOLIC_REF_MAX_DEPTH {
+            let reference = self.read_reference(&current)?;
+            let ReferenceTarget::Symbolic(target) = reference.target else {
+                return Err(Error::InvalidReference(format!(
+                    "{name} is not a symbolic reference"
+                )));
+            };
+            if !recurse {
+                return Ok(target);
+            }
+            current.clone_from(&target.0);
+            match self.read_reference(&current) {
+                Ok(next) if matches!(next.target, ReferenceTarget::Symbolic(_)) => {}
+                Ok(_) | Err(Error::NotFound(_)) => return Ok(target),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::SymbolicReferenceLoop(name.to_owned()))
+    }
+
+    /// Atomically create or replace a symbolic reference without dereferencing it.
+    ///
+    /// If `reflog` is supplied, its lock is acquired before checking the CAS
+    /// precondition and the old/new resolved IDs are appended atomically with
+    /// the reference update. Unborn targets are represented by the null ID.
+    ///
+    /// # Errors
+    /// Returns an error for invalid names/messages, a stale previous value,
+    /// lock contention, malformed refs, or storage failures.
+    pub fn update_symbolic_reference(
+        &self,
+        name: &str,
+        target: &ReferenceName,
+        previous: PreviousReferenceValue,
+        reflog: Option<(&Signature, &[u8])>,
+    ) -> Result<()> {
+        validate_read_name(name)?;
+        if let Some((_, message)) = reflog {
+            validate_reflog_message(message)?;
+        }
+        let destination = self.git_path(name);
+        if let Some(parent) = destination.parent() {
+            self.filesystem().create_dir_all(parent)?;
+        }
+        let lock = lock_path(&destination);
+        self.filesystem().write_new(&lock, b"")?;
+        let log_destination = self.git_path(Path::new("logs").join(name));
+        let log_lock = lock_path(&log_destination);
+        if reflog.is_some() {
+            if let Some(parent) = log_destination.parent() {
+                self.filesystem().create_dir_all(parent)?;
+            }
+            if let Err(error) = self.filesystem().write_new(&log_lock, b"") {
+                let _ = self.filesystem().remove_file(&lock);
+                return Err(error);
+            }
+        }
+
+        let result = (|| {
+            let actual = match self.read_reference(name) {
+                Ok(reference) => Some(reference.target),
+                Err(Error::NotFound(_)) => None,
+                Err(error) => return Err(error),
+            };
+            let matches = match previous {
+                PreviousReferenceValue::Any => true,
+                PreviousReferenceValue::MustNotExist => actual.is_none(),
+                PreviousReferenceValue::MustExist(expected) => actual == Some(expected),
+            };
+            if !matches {
+                return Err(Error::ReferenceConflict(name.to_owned()));
+            }
+            if let Some((committer, message)) = reflog {
+                let old = resolved_target(self, actual.as_ref());
+                let new = self
+                    .resolve_reference(target.as_str())
+                    .unwrap_or_else(|_| ObjectId::null());
+                let mut contents = match self.filesystem().read(&log_destination) {
+                    Ok(contents) => contents,
+                    Err(Error::NotFound(_)) => Vec::new(),
+                    Err(error) => return Err(error),
+                };
+                append_reflog_line(&mut contents, old, new, committer, message);
+                self.filesystem().write(&log_lock, &contents)?;
+            }
+            let contents = format!("ref: {target}\n");
+            self.filesystem().write(&lock, contents.as_bytes())?;
+            if reflog.is_some() {
+                self.filesystem().rename(&log_lock, &log_destination)?;
+            }
+            self.filesystem().rename(&lock, &destination)
+        })();
+        if result.is_err() {
+            let _ = self.filesystem().remove_file(&lock);
+            if reflog.is_some() {
+                let _ = self.filesystem().remove_file(&log_lock);
+            }
+        }
+        result
+    }
+
+    /// Delete a symbolic ref without dereferencing its target.
+    ///
+    /// `HEAD` cannot be deleted. The expected target provides compare-and-swap
+    /// protection, and a successful deletion also removes the ref's log.
+    ///
+    /// # Errors
+    /// Returns an error for `HEAD`, a missing/direct/stale ref, lock contention,
+    /// malformed storage, or filesystem failures.
+    pub fn delete_symbolic_reference(&self, name: &str, expected: &ReferenceName) -> Result<()> {
+        validate_read_name(name)?;
+        if name == "HEAD" {
+            return Err(Error::InvalidReference(
+                "deleting HEAD is not allowed".into(),
+            ));
+        }
+        let destination = self.git_path(name);
+        if let Some(parent) = destination.parent() {
+            self.filesystem().create_dir_all(parent)?;
+        }
+        let lock = lock_path(&destination);
+        self.filesystem().write_new(&lock, b"")?;
+        let result = (|| {
+            let reference = self.read_reference(name)?;
+            if reference.target != ReferenceTarget::Symbolic(expected.clone()) {
+                return Err(Error::ReferenceConflict(name.to_owned()));
+            }
+            self.filesystem().remove_file(&destination)?;
+            self.filesystem().remove_file(&lock)?;
+            let log = self.git_path(Path::new("logs").join(name));
+            match self.filesystem().remove_file(&log) {
+                Ok(()) | Err(Error::NotFound(_)) => Ok(()),
+                Err(error) => Err(error),
+            }
+        })();
+        if result.is_err() {
+            let _ = self.filesystem().remove_file(&lock);
+        }
+        result
     }
 
     /// Atomically create or update a direct reference.
@@ -859,6 +1018,16 @@ fn append_reflog_line(
     output.push(b'\n');
 }
 
+fn resolved_target(repository: &Repository, target: Option<&ReferenceTarget>) -> ObjectId {
+    match target {
+        Some(ReferenceTarget::Direct(id)) => *id,
+        Some(ReferenceTarget::Symbolic(name)) => repository
+            .resolve_reference(name.as_str())
+            .unwrap_or_else(|_| ObjectId::null()),
+        None => ObjectId::null(),
+    }
+}
+
 fn parse_reflog_line(line: &[u8]) -> Result<ReflogEntry> {
     if line.len() < ObjectId::HEX_LENGTH * 2 + 3 {
         return Err(Error::InvalidReference("truncated reflog line".into()));
@@ -970,6 +1139,93 @@ mod tests {
             repository.resolve_reference("refs/heads/a"),
             Err(Error::SymbolicReferenceLoop(_))
         ));
+    }
+
+    #[test]
+    fn creates_reads_logs_and_deletes_symbolic_references() {
+        let (repository, fs) = repository();
+        let first = ObjectId::from_str(FIRST).unwrap();
+        let branch = ReferenceName::branch("main").unwrap();
+        repository
+            .update_reference(&branch, first, PreviousValue::MustNotExist)
+            .unwrap();
+        let alias = ReferenceName::new("refs/meta/current").unwrap();
+        let signature = Signature::new("A U Thor", "author@example.com", 1, 0).unwrap();
+        repository
+            .update_symbolic_reference(
+                "refs/meta/alias",
+                &alias,
+                PreviousReferenceValue::MustNotExist,
+                None,
+            )
+            .unwrap();
+        repository
+            .update_symbolic_reference(
+                alias.as_str(),
+                &branch,
+                PreviousReferenceValue::MustNotExist,
+                Some((&signature, b"link")),
+            )
+            .unwrap();
+        assert_eq!(
+            repository
+                .symbolic_reference("refs/meta/alias", false)
+                .unwrap(),
+            alias
+        );
+        assert_eq!(
+            repository
+                .symbolic_reference("refs/meta/alias", true)
+                .unwrap(),
+            branch
+        );
+        assert_eq!(
+            repository.resolve_reference("refs/meta/alias").unwrap(),
+            first
+        );
+        assert_eq!(
+            repository.read_reflog("refs/meta/current").unwrap().len(),
+            1
+        );
+        assert!(matches!(
+            repository.update_symbolic_reference(
+                "refs/meta/current",
+                &alias,
+                PreviousReferenceValue::MustNotExist,
+                None,
+            ),
+            Err(Error::ReferenceConflict(_))
+        ));
+        repository
+            .delete_symbolic_reference("refs/meta/current", &branch)
+            .unwrap();
+        assert!(!fs.exists(Path::new("repo/.git/refs/meta/current")).unwrap());
+        assert!(
+            repository
+                .read_reflog("refs/meta/current")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn symbolic_reference_supports_unborn_targets_and_protects_head() {
+        let (repository, _) = repository();
+        let unborn = ReferenceName::branch("unborn").unwrap();
+        repository
+            .update_symbolic_reference("HEAD", &unborn, PreviousReferenceValue::Any, None)
+            .unwrap();
+        assert_eq!(repository.symbolic_reference("HEAD", true).unwrap(), unborn);
+        assert!(
+            repository
+                .delete_symbolic_reference("HEAD", &unborn)
+                .is_err()
+        );
+        assert!(
+            repository
+                .symbolic_reference("refs/heads/missing", true)
+                .is_err()
+        );
     }
 
     #[test]

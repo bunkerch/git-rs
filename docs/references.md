@@ -24,6 +24,16 @@ The lower-level `update_reference` API also supports exact compare-and-swap with
 `PreviousValue::MustExist`, which is useful when a caller must reject a stale
 write.
 
+`symbolic_reference(name, recurse)` reads symbolic refs without confusing a
+detached direct ref for a symbolic target. Recursive reads return the final
+symbolic target, including an unborn branch. `update_symbolic_reference` writes
+the canonical `ref: refs/...` form under a `.lock` and accepts
+`PreviousReferenceValue` so callers can compare-and-swap against a missing,
+direct, or symbolic current value. An optional identity/reason pair locks and
+updates the reflog with the old and new resolved IDs. `delete_symbolic_reference`
+deletes without dereferencing, checks the exact expected target, removes its
+reflog, and refuses to delete `HEAD`.
+
 Updates exclusively acquire `<ref>.lock`, inspect the current loose or packed
 value while holding that lock, write the new complete value, and atomically
 rename the lock over the loose ref. Failed transactions remove their lock.
@@ -59,6 +69,10 @@ organized around these upstream contracts:
 - `refs.c:check_refname_component` and `check_refname_format` define forbidden
   bytes, components, `.lock`, `..`, and `@{` restrictions.
 - `refs/refs-internal.h:SYMREF_MAXDEPTH` defines the five-hop symbolic limit.
+- `builtin/symbolic-ref.c:check_symref` defines recursive/immediate reads and
+  `HEAD` deletion protection.
+- `refs.c:refs_update_symref_extended` defines no-dereference transactional
+  symbolic updates.
 - `refs/files-backend.c:read_ref_internal` defines loose-first, packed fallback.
 - `refs/files-backend.c` and `lockfile.c` define exclusive `.lock` acquisition
   and atomic publication.
@@ -80,4 +94,6 @@ The host-backed example opens an existing repository and manages branches:
 cargo run --example branch -- my-repository create feature/new <40-hex-object-id>
 cargo run --example branch -- my-repository rename feature/new feature/ready
 cargo run --example branch -- my-repository delete feature/ready --force
+cargo run --example symbolic_ref -- my-repository HEAD
+cargo run --example symbolic_ref -- my-repository refs/meta/current refs/heads/main
 ```
