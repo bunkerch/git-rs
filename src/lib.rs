@@ -75,7 +75,10 @@ pub use fsck::{FsckOptions, FsckReport};
 pub use grep::{GrepBinaryMode, GrepMatch, GrepOptions, GrepTarget};
 pub use ignore::{IgnoreMatcher, IgnoreRule};
 pub use index::{Index, IndexEntry, IndexExtension, IndexVersion, StatData};
-pub use linked_worktree::{AddWorktreeOptions, LinkedWorktreeInfo, WorktreeTarget};
+pub use linked_worktree::{
+    AddWorktreeOptions, LinkedWorktreeInfo, WorktreePruneEntry, WorktreePruneOptions,
+    WorktreePruneReason, WorktreeTarget,
+};
 pub use ls_files::{LsFilesEntry, LsFilesKind, LsFilesOptions};
 pub use ls_tree::{LsTreeEntry, LsTreeOptions};
 pub use merge::{

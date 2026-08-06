@@ -64,6 +64,8 @@ documented in [`docs/commit.md`](docs/commit.md).
 Index versions 2–4 are documented in [`docs/index.md`](docs/index.md).
 Worktree staging and index-to-tree writing are documented in
 [`docs/worktree.md`](docs/worktree.md).
+Bounded linked-worktree registration pruning is documented in
+[`docs/worktree-prune.md`](docs/worktree-prune.md).
 Path-level index/worktree restoration is documented in
 [`docs/restore.md`](docs/restore.md).
 Safe discovery and removal of untracked worktree content is documented in

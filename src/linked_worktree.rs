@@ -35,7 +35,166 @@ pub struct LinkedWorktreeInfo {
     pub target: WorktreeTarget,
 }
 
+/// Why a linked-worktree administrative entry is eligible for pruning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorktreePruneReason {
+    NotDirectory,
+    MissingGitdir,
+    InvalidGitdir,
+    MissingWorktree,
+    Duplicate,
+}
+
+/// One administrative entry selected by [`Repository::prune_worktrees`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorktreePruneEntry {
+    name: String,
+    path: PathBuf,
+    reason: WorktreePruneReason,
+}
+
+impl WorktreePruneEntry {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    #[must_use]
+    pub const fn reason(&self) -> WorktreePruneReason {
+        self.reason
+    }
+}
+
+/// Resource and mutation settings for linked-worktree pruning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorktreePruneOptions {
+    /// Missing worktrees whose administrative index is no newer than this are
+    /// eligible. `u64::MAX` matches Git's default of pruning all missing ones.
+    pub expire_before: u64,
+    pub max_worktrees: usize,
+    pub dry_run: bool,
+}
+
+impl Default for WorktreePruneOptions {
+    fn default() -> Self {
+        Self {
+            expire_before: u64::MAX,
+            max_worktrees: 100_000,
+            dry_run: true,
+        }
+    }
+}
+
 impl Repository {
+    /// Discover and optionally remove stale linked-worktree registrations.
+    ///
+    /// Only the administrative entry below `worktrees/` is removed. A
+    /// `locked` file protects an entry, including a registration whose target
+    /// is currently unavailable. The scan is bounded by `max_worktrees`.
+    ///
+    /// # Errors
+    /// Returns an error for an exceeded scan bound, unreadable storage,
+    /// invalid non-UTF-8 names, or a failed administrative removal.
+    pub fn prune_worktrees(
+        &self,
+        options: &WorktreePruneOptions,
+    ) -> Result<Vec<WorktreePruneEntry>> {
+        let root = self.common_dir().join("worktrees");
+        let names = match self.filesystem().read_dir(&root) {
+            Ok(names) => names,
+            Err(Error::NotFound(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        if names.len() > options.max_worktrees {
+            return Err(Error::InvalidRepository(format!(
+                "worktree count {} exceeds limit {}",
+                names.len(),
+                options.max_worktrees
+            )));
+        }
+
+        let mut entries = Vec::new();
+        let mut kept = vec![(
+            self.common_dir().to_path_buf(),
+            None::<String>,
+            None::<PathBuf>,
+        )];
+        for name in names {
+            let name_string = name
+                .to_str()
+                .ok_or_else(|| Error::InvalidRepository("non-UTF-8 worktree name".into()))?
+                .to_owned();
+            let admin = root.join(&name);
+            let metadata = self.filesystem().metadata(&admin)?;
+            let mut live_path = None;
+            let reason = if !metadata.is_dir() {
+                Some(WorktreePruneReason::NotDirectory)
+            } else if self.filesystem().exists(&admin.join("locked"))? {
+                None
+            } else {
+                match self.filesystem().read(&admin.join("gitdir")) {
+                    Err(Error::NotFound(_)) => Some(WorktreePruneReason::MissingGitdir),
+                    Err(error) => return Err(error),
+                    Ok(contents) => match parse_path_file(&contents)
+                        .and_then(|value| resolve_worktree_path(&admin, &value))
+                    {
+                        Err(_) => Some(WorktreePruneReason::InvalidGitdir),
+                        Ok(dot_git) if self.filesystem().exists(&dot_git)? => {
+                            live_path = Some(dot_git);
+                            None
+                        }
+                        Ok(_) => {
+                            let expired = match self.filesystem().metadata(&admin.join("index")) {
+                                Ok(index) => {
+                                    u64::from(index.stat().mtime_seconds) <= options.expire_before
+                                }
+                                Err(Error::NotFound(_)) => true,
+                                Err(error) => return Err(error),
+                            };
+                            expired.then_some(WorktreePruneReason::MissingWorktree)
+                        }
+                    },
+                }
+            };
+            if let Some(reason) = reason {
+                entries.push(WorktreePruneEntry {
+                    name: name_string,
+                    path: admin,
+                    reason,
+                });
+            } else if let Some(path) = live_path {
+                kept.push((path, Some(name_string), Some(admin)));
+            }
+        }
+        kept.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        for pair in kept.windows(2) {
+            if pair[0].0 == pair[1].0 {
+                let (_, Some(name), Some(path)) = &pair[1] else {
+                    continue;
+                };
+                entries.push(WorktreePruneEntry {
+                    name: name.clone(),
+                    path: path.clone(),
+                    reason: WorktreePruneReason::Duplicate,
+                });
+            }
+        }
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        if !options.dry_run {
+            for entry in &entries {
+                remove_tree(self.filesystem(), entry.path())?;
+            }
+            match self.filesystem().remove_dir(&root) {
+                Ok(()) | Err(Error::DirectoryNotEmpty(_) | Error::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(entries)
+    }
+
     /// Create and register a linked worktree sharing this repository's object
     /// database, refs, and configuration.
     ///
@@ -341,6 +500,31 @@ fn resolve_relative(base: &Path, value: &Path) -> Result<PathBuf> {
     Ok(components.into_iter().collect())
 }
 
+fn resolve_worktree_path(base: &Path, value: &Path) -> Result<PathBuf> {
+    if value.is_absolute() {
+        let mut path = PathBuf::new();
+        for component in value.components() {
+            match component {
+                Component::RootDir => {}
+                Component::Normal(value) => path.push(value),
+                _ => {
+                    return Err(Error::InvalidRepository(
+                        "invalid absolute worktree path".into(),
+                    ));
+                }
+            }
+        }
+        if path.as_os_str().is_empty() {
+            return Err(Error::InvalidRepository(
+                "invalid absolute worktree path".into(),
+            ));
+        }
+        Ok(path)
+    } else {
+        resolve_relative(base, value)
+    }
+}
+
 fn remove_tree(filesystem: &dyn crate::FileSystem, path: &Path) -> Result<()> {
     let metadata = filesystem.metadata(path)?;
     if metadata.is_dir() {
@@ -357,7 +541,7 @@ fn remove_tree(filesystem: &dyn crate::FileSystem, path: &Path) -> Result<()> {
 mod tests {
     use std::path::Path;
 
-    use super::{AddWorktreeOptions, WorktreeTarget};
+    use super::{AddWorktreeOptions, WorktreePruneOptions, WorktreePruneReason, WorktreeTarget};
     use crate::{
         CommitBuilder, EntryMode, FileSystem, InitOptions, MemoryFileSystem, ObjectKind,
         PreviousValue, ReferenceName, Repository, Signature, Tree, TreeEntry,
@@ -458,6 +642,94 @@ mod tests {
         repository.remove_worktree("topic-work", true).unwrap();
         assert!(!filesystem.exists(Path::new("topic-work")).unwrap());
         assert!(repository.linked_worktrees().unwrap().is_empty());
+    }
+
+    #[test]
+    fn prunes_only_eligible_unlocked_administrative_entries() {
+        let filesystem = MemoryFileSystem::new();
+        let repository =
+            Repository::init(filesystem.clone(), "main", &InitOptions::default()).unwrap();
+        let root = Path::new("main/.git/worktrees");
+        filesystem.create_dir_all(root).unwrap();
+
+        let live = root.join("live");
+        filesystem.create_dir_all(&live).unwrap();
+        filesystem
+            .write(&live.join("gitdir"), b"../../../../live/.git\n")
+            .unwrap();
+        filesystem.create_dir_all(Path::new("live")).unwrap();
+        filesystem
+            .write(Path::new("live/.git"), b"gitdir: elsewhere\n")
+            .unwrap();
+
+        let missing = root.join("missing");
+        filesystem.create_dir_all(&missing).unwrap();
+        filesystem
+            .write(&missing.join("gitdir"), b"../../../../gone/.git\n")
+            .unwrap();
+        filesystem.write(&missing.join("index"), b"index").unwrap();
+
+        let locked = root.join("locked");
+        filesystem.create_dir_all(&locked).unwrap();
+        filesystem
+            .write(&locked.join("locked"), b"portable device\n")
+            .unwrap();
+
+        filesystem.create_dir_all(&root.join("malformed")).unwrap();
+        filesystem
+            .write(&root.join("stray"), b"not a directory")
+            .unwrap();
+        let duplicate = root.join("live-copy");
+        filesystem.create_dir_all(&duplicate).unwrap();
+        filesystem
+            .write(&duplicate.join("gitdir"), b"../../../../live/.git\n")
+            .unwrap();
+
+        let options = WorktreePruneOptions {
+            expire_before: 0,
+            ..Default::default()
+        };
+        let entries = repository.prune_worktrees(&options).unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].name(), "live-copy");
+        assert_eq!(entries[0].reason(), WorktreePruneReason::Duplicate);
+        assert_eq!(entries[1].name(), "malformed");
+        assert_eq!(entries[1].reason(), WorktreePruneReason::MissingGitdir);
+        assert_eq!(entries[2].name(), "missing");
+        assert_eq!(entries[2].reason(), WorktreePruneReason::MissingWorktree);
+        assert_eq!(entries[3].reason(), WorktreePruneReason::NotDirectory);
+        assert!(filesystem.exists(&missing).unwrap());
+
+        let removed = repository
+            .prune_worktrees(&WorktreePruneOptions {
+                dry_run: false,
+                ..options
+            })
+            .unwrap();
+        assert_eq!(removed, entries);
+        assert!(filesystem.exists(&live).unwrap());
+        assert!(!filesystem.exists(&duplicate).unwrap());
+        assert!(filesystem.exists(&locked).unwrap());
+        assert!(!filesystem.exists(&missing).unwrap());
+        assert!(!filesystem.exists(&root.join("malformed")).unwrap());
+        assert!(!filesystem.exists(&root.join("stray")).unwrap());
+    }
+
+    #[test]
+    fn bounds_worktree_prune_scans() {
+        let filesystem = MemoryFileSystem::new();
+        let repository =
+            Repository::init(filesystem.clone(), "main", &InitOptions::default()).unwrap();
+        filesystem
+            .create_dir_all(Path::new("main/.git/worktrees/one"))
+            .unwrap();
+        let error = repository
+            .prune_worktrees(&WorktreePruneOptions {
+                max_worktrees: 0,
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds limit"));
     }
 
     fn commit(
