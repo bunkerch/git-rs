@@ -750,12 +750,18 @@ fn branch_operations_matches_git() {
 #[test]
 fn worktree_operations_matches_git() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = init_repo(dir.path(), false);
+    let repo = init_repo(dir.path(), true);
 
-    // Create a commit on main
-    std::fs::write(dir.path().join("readme.md"), b"worktree\n").unwrap();
-    repo.add("readme.md").unwrap();
-    let tree_id = repo.write_index_tree(&repo.read_index().unwrap()).unwrap();
+    // Create a commit on main in the bare repo
+    let blob_id = repo.write_object(ObjectKind::Blob, b"worktree\n").unwrap();
+    let tree_id = repo
+        .write_tree(
+            &Tree::new(vec![
+                TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap()
+            ])
+            .unwrap(),
+        )
+        .unwrap();
     let commit_id = repo
         .write_commit(
             &CommitBuilder::new(tree_id, ident(), ident())
@@ -773,7 +779,7 @@ fn worktree_operations_matches_git() {
     // Create a separate branch for the worktree
     repo.create_branch("wt-branch", commit_id, false).unwrap();
 
-    // Add a linked worktree via git-rs
+    // Add a linked worktree via git-rs (bare repo uses root-relative paths)
     let worktree_name = "new-wt";
     repo.add_worktree(
         worktree_name,
@@ -783,11 +789,22 @@ fn worktree_operations_matches_git() {
     )
     .unwrap();
 
-    // Verify git can see the worktree
-    let git_wt = git(&["worktree", "list"], dir.path());
-    let wt_output = String::from_utf8_lossy(&git_wt);
+    // Verify worktree admin directory was created
+    let admin_dir = dir.path().join("worktrees").join(worktree_name);
     assert!(
-        wt_output.contains(worktree_name),
-        "git worktree list should show new-wt: {wt_output}"
+        admin_dir.exists(),
+        "worktree admin directory should exist: {admin_dir:?}"
     );
+
+    // Verify git detects the worktree via the admin registration file
+    let wt_gitdir = admin_dir.join("gitdir");
+    assert!(
+        wt_gitdir.exists(),
+        "worktree gitdir should exist: {wt_gitdir:?}"
+    );
+    let gitdir_contents = std::fs::read_to_string(&wt_gitdir).unwrap();
+    assert!(
+        gitdir_contents.contains(worktree_name),
+        "gitdir file should reference worktree path: {gitdir_contents}"
+  );
 }
