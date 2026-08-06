@@ -40,6 +40,7 @@ pub mod mailmap;
 pub mod maintenance;
 pub mod merge;
 pub mod merge_file;
+pub mod mktree;
 pub mod multi_pack_index;
 pub mod name_rev;
 pub mod notes;
@@ -141,6 +142,7 @@ pub use merge::{
 pub use merge_file::{
     MergeFileFavor, MergeFileOptions, MergeFileResult, MergeFileStyle, merge_file,
 };
+pub use mktree::MkTreeOptions;
 pub use multi_pack_index::{
     MultiPackIndex, MultiPackIndexEntry, MultiPackIndexOptions, MultiPackIndexReport,
 };
