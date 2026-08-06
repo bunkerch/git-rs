@@ -27,6 +27,8 @@ Typed trees and commits are documented in
 Index versions 2–4 are documented in [`docs/index.md`](docs/index.md).
 Worktree staging and index-to-tree writing are documented in
 [`docs/worktree.md`](docs/worktree.md).
+Staged, unstaged, unmerged, and untracked reporting is documented in
+[`docs/status.md`](docs/status.md).
 
 To create a host-backed repository with the included example:
 

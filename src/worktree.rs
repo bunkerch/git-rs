@@ -97,8 +97,7 @@ impl Repository {
         let work_tree = self.work_tree().ok_or_else(|| {
             Error::InvalidRepository("cannot check out into a bare repository".into())
         })?;
-        let mut desired = Vec::new();
-        self.flatten_tree(tree, &[], options.max_object_size, &mut desired)?;
+        let mut desired = self.flattened_tree(tree, options.max_object_size)?;
         desired.sort_unstable_by(|left, right| left.path.cmp(&right.path));
 
         let current = self.read_index()?;
@@ -243,12 +242,18 @@ impl Repository {
         Ok(written)
     }
 
+    pub(crate) fn flattened_tree(&self, id: ObjectId, max_size: usize) -> Result<Vec<TreeLeaf>> {
+        let mut entries = Vec::new();
+        self.flatten_tree(id, &[], max_size, &mut entries)?;
+        Ok(entries)
+    }
+
     fn flatten_tree(
         &self,
         id: ObjectId,
         prefix: &[u8],
         max_size: usize,
-        output: &mut Vec<CheckoutEntry>,
+        output: &mut Vec<TreeLeaf>,
     ) -> Result<()> {
         for entry in self.read_tree(id, max_size)?.entries() {
             let mut path = prefix.to_owned();
@@ -259,7 +264,7 @@ impl Repository {
             if entry.mode() == EntryMode::Tree {
                 self.flatten_tree(entry.id(), &path, max_size, output)?;
             } else {
-                output.push(CheckoutEntry {
+                output.push(TreeLeaf {
                     raw_mode: tree_mode(entry.mode()),
                     mode: entry.mode(),
                     path,
@@ -370,11 +375,11 @@ impl Repository {
 }
 
 #[derive(Clone, Debug)]
-struct CheckoutEntry {
-    raw_mode: u32,
-    mode: EntryMode,
-    path: Vec<u8>,
-    id: ObjectId,
+pub(crate) struct TreeLeaf {
+    pub(crate) raw_mode: u32,
+    pub(crate) mode: EntryMode,
+    pub(crate) path: Vec<u8>,
+    pub(crate) id: ObjectId,
 }
 
 const fn tree_mode(mode: EntryMode) -> u32 {
