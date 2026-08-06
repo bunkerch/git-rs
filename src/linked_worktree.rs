@@ -99,6 +99,55 @@ impl Default for WorktreePruneOptions {
 }
 
 impl Repository {
+    /// Repair both linking files after a linked worktree has been moved to
+    /// `path` outside this library.
+    ///
+    /// Returns `true` when either file changed. Paths are written in Git's
+    /// relative-worktree format so the result remains portable inside an
+    /// abstract storage namespace.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid registration or destination, a
+    /// non-directory destination, a directory at `<path>/.git`, lock
+    /// contention, or storage publication failure.
+    pub fn repair_worktree(&self, name: &str, path: impl AsRef<Path>) -> Result<bool> {
+        let admin = self.worktree_admin_dir(name)?;
+        let path = normalized_storage_path(path.as_ref())?;
+        let metadata = self.filesystem().metadata(&path)?;
+        if !metadata.is_dir() {
+            return Err(Error::NotDirectory(path));
+        }
+        let dot_git = path.join(".git");
+        match self.filesystem().metadata(&dot_git) {
+            Ok(metadata) if metadata.is_dir() => return Err(Error::IsDirectory(dot_git)),
+            Ok(_) | Err(Error::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+
+        let dot_git_contents =
+            format!("gitdir: {}\n", relative_path(&path, &admin)?.display()).into_bytes();
+        let admin_contents =
+            format!("{}\n", relative_path(&admin, &dot_git)?.display()).into_bytes();
+        let current_dot_git = optional_read(self.filesystem(), &dot_git)?;
+        let current_admin = optional_read(self.filesystem(), &admin.join("gitdir"))?;
+        if current_dot_git.as_deref() == Some(dot_git_contents.as_slice())
+            && current_admin.as_deref() == Some(admin_contents.as_slice())
+        {
+            return Ok(false);
+        }
+
+        self.enable_relative_worktrees()?;
+        publish_linking_files(
+            self.filesystem(),
+            &admin.join("gitdir"),
+            &admin_contents,
+            current_admin.as_deref(),
+            &dot_git,
+            &dot_git_contents,
+        )?;
+        Ok(true)
+    }
+
     /// Return the trimmed lock reason, or `None` when the worktree is unlocked.
     /// An empty string represents a lock without a stated reason.
     ///
@@ -634,13 +683,62 @@ fn remove_tree(filesystem: &dyn crate::FileSystem, path: &Path) -> Result<()> {
     }
 }
 
+fn optional_read(filesystem: &dyn crate::FileSystem, path: &Path) -> Result<Option<Vec<u8>>> {
+    match filesystem.read(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(Error::NotFound(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn publish_linking_files(
+    filesystem: &dyn crate::FileSystem,
+    admin_path: &Path,
+    admin_contents: &[u8],
+    old_admin_contents: Option<&[u8]>,
+    dot_git_path: &Path,
+    dot_git_contents: &[u8],
+) -> Result<()> {
+    let admin_lock = appended_lock_path(admin_path);
+    let dot_git_lock = appended_lock_path(dot_git_path);
+    filesystem.write_new(&admin_lock, admin_contents)?;
+    if let Err(error) = filesystem.write_new(&dot_git_lock, dot_git_contents) {
+        let _ = filesystem.remove_file(&admin_lock);
+        return Err(error);
+    }
+    if let Err(error) = filesystem.rename(&admin_lock, admin_path) {
+        let _ = filesystem.remove_file(&admin_lock);
+        let _ = filesystem.remove_file(&dot_git_lock);
+        return Err(error);
+    }
+    if let Err(error) = filesystem.rename(&dot_git_lock, dot_git_path) {
+        let _ = filesystem.remove_file(&dot_git_lock);
+        match old_admin_contents {
+            Some(contents) => {
+                let _ = filesystem.write(admin_path, contents);
+            }
+            None => {
+                let _ = filesystem.remove_file(admin_path);
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn appended_lock_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".lock");
+    PathBuf::from(value)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
     use super::{
         AddWorktreeOptions, RemoveWorktreeOptions, WorktreePruneOptions, WorktreePruneReason,
-        WorktreeTarget,
+        WorktreeTarget, remove_tree,
     };
     use crate::{
         CommitBuilder, EntryMode, FileSystem, InitOptions, MemoryFileSystem, ObjectKind,
@@ -791,6 +889,77 @@ mod tests {
             )
             .unwrap();
         assert!(!filesystem.exists(Path::new("detached-work")).unwrap());
+    }
+
+    #[test]
+    fn repairs_both_links_after_an_external_worktree_move() {
+        let filesystem = MemoryFileSystem::new();
+        let repository =
+            Repository::init(filesystem.clone(), "main", &InitOptions::default()).unwrap();
+        let tip = commit(&repository, None, b"main\n");
+        repository
+            .add_worktree(
+                "old-place",
+                "moved",
+                &WorktreeTarget::Detached(tip),
+                &AddWorktreeOptions {
+                    checkout: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let old_dot_git = filesystem.read(Path::new("old-place/.git")).unwrap();
+        filesystem.create_dir_all(Path::new("new-place")).unwrap();
+        filesystem
+            .write(Path::new("new-place/.git"), &old_dot_git)
+            .unwrap();
+        remove_tree(&filesystem, Path::new("old-place")).unwrap();
+
+        let old_admin = filesystem
+            .read(Path::new("main/.git/worktrees/moved/gitdir"))
+            .unwrap();
+        filesystem
+            .write_new(Path::new("new-place/.git.lock"), b"busy")
+            .unwrap();
+        assert!(repository.repair_worktree("moved", "new-place").is_err());
+        assert_eq!(
+            filesystem
+                .read(Path::new("main/.git/worktrees/moved/gitdir"))
+                .unwrap(),
+            old_admin
+        );
+        assert_eq!(
+            filesystem.read(Path::new("new-place/.git")).unwrap(),
+            old_dot_git
+        );
+        assert!(
+            !filesystem
+                .exists(Path::new("main/.git/worktrees/moved/gitdir.lock"))
+                .unwrap()
+        );
+        filesystem
+            .remove_file(Path::new("new-place/.git.lock"))
+            .unwrap();
+
+        assert!(repository.repair_worktree("moved", "new-place").unwrap());
+        assert_eq!(
+            filesystem.read(Path::new("new-place/.git")).unwrap(),
+            b"gitdir: ../main/.git/worktrees/moved\n"
+        );
+        assert_eq!(
+            filesystem
+                .read(Path::new("main/.git/worktrees/moved/gitdir"))
+                .unwrap(),
+            b"../../../../new-place/.git\n"
+        );
+        assert!(!repository.repair_worktree("moved", "new-place").unwrap());
+        assert_eq!(
+            Repository::open(filesystem, "new-place")
+                .unwrap()
+                .resolve_reference("HEAD")
+                .unwrap(),
+            tip
+        );
     }
 
     #[test]

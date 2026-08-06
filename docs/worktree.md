@@ -185,6 +185,32 @@ Call `remove_worktree_with_options` with both `force` and `override_lock` when
 the caller has independently authorized both risks. Pruning always retains
 locked registrations.
 
+## Repairing externally moved worktrees
+
+When another system moves a linked worktree directory, repair both directions
+of Git's registration with its stable administrative name:
+
+```rust
+# use git_rs::Repository;
+# fn example(repository: &Repository) -> git_rs::Result<()> {
+let changed = repository.repair_worktree("topic-work", "new/topic-work")?;
+println!("link files changed: {changed}");
+# Ok(())
+# }
+```
+
+The destination must already be a directory. Repair writes the worktree's
+`.git` file and the common directory's `worktrees/<name>/gitdir` backlink using
+relative paths. Both complete files are staged with create-only lock files
+before either is published; if publishing `.git` fails, the old administrative
+backlink is restored. An already-correct pair returns `false` without writing.
+The operation moves no worktree content and therefore works identically with
+memory, host, object-store, and hybrid adapters.
+
+The explicit administrative name avoids guessing ownership from a corrupt path
+and lets callers repair a missing `.git` file after their storage layer moves
+the worktree.
+
 ## Filesystem requirements
 
 Adapters expose no-follow metadata, symlink target reads/creation, executable
@@ -218,3 +244,6 @@ provide stat identity enable Git's fast unchanged-file checks.
 - `worktree.c:worktree_lock_reason` and `builtin/worktree.c:lock_worktree` /
   `unlock_worktree` define lock-file creation, trimmed display reasons, and
   state errors.
+- `worktree.c:repair_gitfile`, `repair_worktree_at_path`, and
+  `write_worktree_linking_files` define bidirectional repair and relative-link
+  formatting after external moves.
