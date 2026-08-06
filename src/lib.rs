@@ -18,6 +18,7 @@ pub mod refs;
 pub mod repository;
 pub mod revision;
 pub mod status;
+pub mod tag;
 pub mod tree;
 pub mod upload_pack;
 pub mod worktree;
@@ -55,6 +56,7 @@ pub use refs::{
 pub use repository::{InitOptions, Repository};
 pub use revision::{GraphOptions, Revision, RevisionWalkOptions};
 pub use status::{ChangeKind, RepositoryStatus, StatusEntry, StatusOptions};
+pub use tag::{AnnotatedTag, PeeledObject, TagBuilder};
 pub use tree::{EntryMode, Tree, TreeEntry};
 pub use upload_pack::{UploadPackOptions, UploadPackRequest};
 pub use worktree::CheckoutOptions;

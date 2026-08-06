@@ -384,7 +384,7 @@ impl Repository {
                             .map(crate::TreeEntry::id),
                     );
                 }
-                ObjectKind::Tag => stack.push(parse_tag_target(data)?),
+                ObjectKind::Tag => stack.push(crate::AnnotatedTag::parse(data)?.target()),
                 ObjectKind::Blob => {}
             }
         }
@@ -492,17 +492,6 @@ fn protocol_line_message(message: &str) -> String {
             }
         })
         .collect()
-}
-
-fn parse_tag_target(data: &[u8]) -> Result<ObjectId> {
-    let line = data
-        .split(|byte| *byte == b'\n')
-        .next()
-        .ok_or_else(|| Error::InvalidObject("tag has no object header".into()))?;
-    let value = line
-        .strip_prefix(b"object ")
-        .ok_or_else(|| Error::InvalidObject("tag has no object header".into()))?;
-    parse_id(value).map_err(|_| Error::InvalidObject("invalid tag target".into()))
 }
 
 fn append_packet(output: &mut Vec<u8>, data: &[u8]) -> Result<()> {

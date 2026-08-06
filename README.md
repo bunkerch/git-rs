@@ -50,6 +50,8 @@ Cherry-pick and revert behavior is documented in
 [`docs/replay.md`](docs/replay.md).
 Typed tree/index differences and unified patches are documented in
 [`docs/diff.md`](docs/diff.md).
+Lightweight and annotated tag operations are documented in
+[`docs/tags.md`](docs/tags.md).
 
 To create a host-backed repository with the included example:
 

@@ -293,7 +293,7 @@ impl Repository {
                         }
                     }
                 }
-                ObjectKind::Tag => stack.push(parse_tag_target(object.data())?),
+                ObjectKind::Tag => stack.push(crate::AnnotatedTag::parse(object.data())?.target()),
                 ObjectKind::Blob => {}
             }
         }
@@ -345,18 +345,6 @@ fn validate_capabilities(capabilities: &[Capability]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn parse_tag_target(data: &[u8]) -> Result<ObjectId> {
-    let line = data
-        .split(|byte| *byte == b'\n')
-        .next()
-        .ok_or_else(|| Error::InvalidObject("tag has no object header".into()))?;
-    let value = line
-        .strip_prefix(b"object ")
-        .ok_or_else(|| Error::InvalidObject("tag has no object header".into()))?;
-    parse_exact_id(value, "tag object")
-        .map_err(|_| Error::InvalidObject("invalid tag target".into()))
 }
 
 fn append_packet(output: &mut Vec<u8>, data: &[u8]) -> Result<()> {
