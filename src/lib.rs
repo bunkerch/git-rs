@@ -10,6 +10,7 @@ pub mod commit;
 pub mod commit_operation;
 pub mod config;
 pub mod count_objects;
+pub mod cruft;
 pub mod describe;
 pub mod diff;
 pub mod error;
@@ -66,6 +67,7 @@ pub use config::{Config, ConfigEntry};
 pub use count_objects::{
     CountObjectsOptions, CountObjectsReport, ObjectGarbage, ObjectGarbageReason,
 };
+pub use cruft::CruftMtimes;
 pub use describe::{DescribeOptions, Description};
 pub use diff::{DiffEntry, DiffKind, DiffOptions};
 pub use error::{Error, Result};

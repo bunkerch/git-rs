@@ -14,8 +14,17 @@ fn main() -> git_rs::Result<()> {
         .file_name()
         .expect("repository path must name a directory");
     let repository = Repository::open(HostFileSystem::new(storage_root)?, repository_name)?;
+    let cruft = arguments.iter().any(|argument| argument == "--cruft");
+    let cruft_expire_before = arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--cruft-expire-before="))
+        .map(str::parse::<u64>)
+        .transpose()
+        .expect("cruft expiry must be Unix seconds");
     let result = repository.repack(&RepackOptions {
         include_unreachable: arguments.iter().any(|argument| argument == "--all-objects"),
+        cruft,
+        cruft_expire_before,
         prune_loose: arguments.iter().any(|argument| argument == "--prune-loose"),
         delete_redundant_packs: arguments
             .iter()
@@ -30,6 +39,14 @@ fn main() -> git_rs::Result<()> {
     if let Some(pack) = result.pack {
         println!("pack={}", pack.pack_path.display());
         println!("index={}", pack.index_path.display());
+    }
+    if let Some(pack) = result.cruft_pack {
+        println!("cruft-pack={}", pack.pack_path.display());
+        println!("cruft-index={}", pack.index_path.display());
+        println!(
+            "cruft-mtimes={}",
+            pack.pack_path.with_extension("mtimes").display()
+        );
     }
     Ok(())
 }
