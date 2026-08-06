@@ -128,6 +128,8 @@ Git-compatible object annotations, including fanout notes trees and
 transactional updates, are documented in [`docs/notes.md`](docs/notes.md).
 Transparent object replacement, raw reads, bounded chains, and replacement ref
 transactions are documented in [`docs/replace.md`](docs/replace.md).
+Gitlink submodule discovery, initialization, status, and transport-neutral
+checkout updates are documented in [`docs/submodules.md`](docs/submodules.md).
 
 To create a host-backed repository with the included example:
 

@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use crate::{
     Capability, CheckoutOptions, Error, FileSystem, GraphOptions, IncomingPackOptions, InitOptions,
@@ -281,6 +282,22 @@ impl Repository {
         transport: &mut T,
         options: &CloneOptions,
     ) -> Result<(Self, FetchResult)> {
+        Self::clone_from_shared(Arc::new(filesystem), path, transport, options)
+    }
+
+    /// Clone using a shared dynamically dispatched storage adapter.
+    ///
+    /// This is useful for nested repositories such as submodules, where the
+    /// child must retain the same routing adapter as its superproject.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::clone_from`].
+    pub fn clone_from_shared<T: UploadPackTransport>(
+        filesystem: Arc<dyn FileSystem>,
+        path: impl AsRef<Path>,
+        transport: &mut T,
+        options: &CloneOptions,
+    ) -> Result<(Self, FetchResult)> {
         validate_remote_name(&options.remote_name)?;
         let advertisement = RemoteAdvertisement::parse(&transport.advertise()?)?;
         let default = advertisement.default_branch();
@@ -288,7 +305,7 @@ impl Repository {
             .and_then(|reference| reference.name.strip_prefix("refs/heads/"))
             .unwrap_or("main")
             .to_owned();
-        let repository = Self::init(
+        let repository = Self::init_shared(
             filesystem,
             path,
             &InitOptions {

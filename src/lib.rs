@@ -57,6 +57,7 @@ pub mod show_ref;
 pub mod sparse_checkout;
 pub mod stash;
 pub mod status;
+pub mod submodule;
 pub mod tag;
 pub mod tree;
 pub mod upload_pack;
@@ -145,6 +146,10 @@ pub use show_ref::{ShowRefEntry, ShowRefOptions};
 pub use sparse_checkout::{SparseCheckoutOptions, SparseCheckoutReport, SparseCheckoutState};
 pub use stash::{StashApplyOptions, StashApplyResult, StashEntry, StashPushOptions};
 pub use status::{ChangeKind, RepositoryStatus, StatusEntry, StatusOptions};
+pub use submodule::{
+    Submodule, SubmoduleOptions, SubmoduleStatus, SubmoduleStatusKind, SubmoduleUpdateOptions,
+    SubmoduleUpdateReport,
+};
 pub use tag::{AnnotatedTag, PeeledObject, TagBuilder};
 pub use tree::{EntryMode, Tree, TreeEntry};
 pub use upload_pack::{UploadPackOptions, UploadPackRequest};

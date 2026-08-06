@@ -73,9 +73,8 @@ impl Repository {
     pub fn open_shared(fs: Arc<dyn FileSystem>, path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let non_bare = path.join(".git");
-        let (git_dir, common_dir, work_tree) = if fs.exists(&non_bare.join("HEAD"))? {
-            (non_bare.clone(), non_bare, Some(path.to_path_buf()))
-        } else if fs.metadata(&non_bare).is_ok_and(crate::Metadata::is_file) {
+        let gitfile = fs.metadata(&non_bare).is_ok_and(crate::Metadata::is_file);
+        let (git_dir, common_dir, work_tree) = if gitfile {
             let pointer = parse_gitdir_file(&fs.read(&non_bare)?)?;
             let git_dir = resolve_indirection(path, &pointer)?;
             if !fs.exists(&git_dir.join("HEAD"))? {
@@ -90,6 +89,8 @@ impl Repository {
                 Err(error) => return Err(error),
             };
             (git_dir, common_dir, Some(path.to_path_buf()))
+        } else if fs.exists(&non_bare.join("HEAD"))? {
+            (non_bare.clone(), non_bare, Some(path.to_path_buf()))
         } else if fs.exists(&path.join("HEAD"))? {
             (path.to_path_buf(), path.to_path_buf(), None)
         } else {
@@ -393,5 +394,26 @@ mod tests {
             Some(Path::new("work"))
         );
         assert_eq!(Repository::open(fs, "bare.git").unwrap().work_tree(), None);
+    }
+
+    #[test]
+    fn opens_gitfile_worktrees_without_treating_gitfile_as_directory() {
+        let fs = MemoryFileSystem::new();
+        Repository::init(
+            fs.clone(),
+            "admin",
+            &InitOptions {
+                bare: true,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        fs.create_dir_all(Path::new("work")).unwrap();
+        fs.write(Path::new("work/.git"), b"gitdir: ../admin\n")
+            .unwrap();
+
+        let repository = Repository::open(fs, "work").unwrap();
+        assert_eq!(repository.git_dir(), Path::new("admin"));
+        assert_eq!(repository.work_tree(), Some(Path::new("work")));
     }
 }
