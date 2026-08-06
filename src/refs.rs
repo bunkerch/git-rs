@@ -194,22 +194,7 @@ impl Repository {
     /// Returns an error for malformed references or storage failures.
     #[allow(clippy::case_sensitive_file_extension_comparisons)]
     pub fn branches(&self) -> Result<Vec<Reference>> {
-        let mut branches = self.packed_references_with_prefix("refs/heads/")?;
-        let root = self.git_path("refs/heads");
-        let mut directories = vec![(root, String::from("refs/heads"))];
-        while let Some((directory, prefix)) = directories.pop() {
-            for child in self.filesystem().read_dir(&directory)? {
-                let path = directory.join(&child);
-                let name = format!("{prefix}/{}", child.to_string_lossy());
-                let metadata = self.filesystem().metadata(&path)?;
-                if metadata.is_dir() {
-                    directories.push((path, name));
-                } else if metadata.is_file() && !name.ends_with(".lock") {
-                    branches.insert(name.clone(), self.read_loose_reference(&name)?);
-                }
-            }
-        }
-        Ok(branches.into_values().collect())
+        self.references_with_prefix_bounded("refs/heads/", usize::MAX, usize::MAX)
     }
 
     /// List every loose and packed reference below `refs/` in bytewise order.
@@ -221,18 +206,47 @@ impl Repository {
     /// Returns an error for malformed references or storage failures.
     #[allow(clippy::case_sensitive_file_extension_comparisons)]
     pub fn references(&self) -> Result<Vec<Reference>> {
-        let mut references = self.packed_references_with_prefix("refs/")?;
+        self.references_with_prefix_bounded("refs/", usize::MAX, usize::MAX)
+    }
+
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    pub(crate) fn references_with_prefix_bounded(
+        &self,
+        prefix: &str,
+        max_references: usize,
+        max_depth: usize,
+    ) -> Result<Vec<Reference>> {
+        let mut references = self.packed_references_with_prefix_bounded(prefix, max_references)?;
+        if references.len() > max_references {
+            return Err(Error::InvalidRepository(
+                "reference enumeration exceeds limit".into(),
+            ));
+        }
         let root = self.git_path("refs");
-        let mut directories = vec![(root, String::from("refs"))];
-        while let Some((directory, prefix)) = directories.pop() {
+        let mut directories = vec![(root, String::from("refs"), 0usize)];
+        while let Some((directory, directory_name, depth)) = directories.pop() {
+            if depth > max_depth {
+                return Err(Error::InvalidRepository(
+                    "reference enumeration exceeds depth limit".into(),
+                ));
+            }
             for child in self.filesystem().read_dir(&directory)? {
                 let path = directory.join(&child);
-                let name = format!("{prefix}/{}", child.to_string_lossy());
+                let name = format!("{directory_name}/{}", child.to_string_lossy());
                 let metadata = self.filesystem().metadata(&path)?;
                 if metadata.is_dir() {
-                    directories.push((path, name));
-                } else if metadata.is_file() && !name.ends_with(".lock") {
+                    let directory_prefix = format!("{name}/");
+                    if prefix.starts_with(&directory_prefix) || name.starts_with(prefix) {
+                        directories.push((path, name, depth.saturating_add(1)));
+                    }
+                } else if metadata.is_file() && !name.ends_with(".lock") && name.starts_with(prefix)
+                {
                     references.insert(name.clone(), self.read_loose_reference(&name)?);
+                    if references.len() > max_references {
+                        return Err(Error::InvalidRepository(
+                            "reference enumeration exceeds limit".into(),
+                        ));
+                    }
                 }
             }
         }
@@ -863,6 +877,14 @@ impl Repository {
     }
 
     fn packed_references_with_prefix(&self, prefix: &str) -> Result<BTreeMap<String, Reference>> {
+        self.packed_references_with_prefix_bounded(prefix, usize::MAX)
+    }
+
+    fn packed_references_with_prefix_bounded(
+        &self,
+        prefix: &str,
+        max_references: usize,
+    ) -> Result<BTreeMap<String, Reference>> {
         let contents = match self.filesystem().read(&self.git_path("packed-refs")) {
             Ok(contents) => contents,
             Err(Error::NotFound(_)) => return Ok(BTreeMap::new()),
@@ -891,6 +913,11 @@ impl Repository {
                         target: ReferenceTarget::Direct(ObjectId::from_str(hex)?),
                     },
                 );
+                if references.len() > max_references {
+                    return Err(Error::InvalidRepository(
+                        "packed reference enumeration exceeds limit".into(),
+                    ));
+                }
             }
         }
         Ok(references)

@@ -21,6 +21,8 @@ See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/filesystems.md`](docs/filesystems.md) for the design and adapter contract.
 Reference and branch APIs are covered in
 [`docs/references.md`](docs/references.md).
+Bounded resolved reference inventory and annotated-tag dereferencing are
+documented in [`docs/show-ref.md`](docs/show-ref.md).
 Atomic loose-reference consolidation is documented in
 [`docs/pack-refs.md`](docs/pack-refs.md).
 Loose objects are documented in [`docs/objects.md`](docs/objects.md), and packed
