@@ -687,3 +687,107 @@ fn upload_pack_v2_advertisement_matches_git() {
         "v2 should end with flush"
     );
 }
+
+/// Verify git-rs branch creation and listing matches `git branch`.
+#[test]
+fn branch_operations_matches_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), true);
+
+    // Create a commit
+    let blob_id = repo.write_object(ObjectKind::Blob, b"branch test\n").unwrap();
+    let tree_id = repo.write_tree(
+        &Tree::new(vec![TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap()]).unwrap(),
+    )
+    .unwrap();
+    let commit_id = repo
+        .write_commit(
+            &CommitBuilder::new(tree_id, ident(), ident())
+                .message(b"branch\n".to_vec())
+                .build(),
+        )
+        .unwrap();
+    repo.update_reference(
+        &ReferenceName::branch("main").unwrap(),
+        commit_id,
+        git_rs::PreviousValue::MustNotExist,
+    )
+    .unwrap();
+
+    // Create a feature branch via git-rs
+    repo.create_branch("feature", commit_id, false).unwrap();
+
+    // Verify git can see both branches
+    let git_branches = git(&["branch", "--list"], dir.path());
+    let branches = String::from_utf8_lossy(&git_branches);
+    assert!(branches.contains("main"), "missing main branch: {branches}");
+    assert!(branches.contains("feature"), "missing feature branch: {branches}");
+
+    // Rename branch via git-rs (rename_branch takes options + committer)
+    repo.rename_branch(
+        "feature",
+        "renamed",
+        &git_rs::RenameBranchOptions::default(),
+        &ident(),
+    )
+    .unwrap();
+
+    // Verify git sees renamed branch
+    let git_branches = git(&["branch", "--list"], dir.path());
+    let branches = String::from_utf8_lossy(&git_branches);
+    assert!(!branches.contains("feature"), "feature should be gone after rename: {branches}");
+    assert!(branches.contains("renamed"), "renamed branch missing: {branches}");
+
+    // Delete branch via git-rs
+    repo.delete_branch("renamed", &git_rs::DeleteBranchOptions::default()).unwrap();
+
+    let git_branches = git(&["branch", "--list"], dir.path());
+    let branches = String::from_utf8_lossy(&git_branches);
+    assert!(!branches.contains("renamed"), "renamed should be deleted: {branches}");
+}
+
+/// Verify git-rs worktree add and prune match `git worktree` behavior.
+#[test]
+fn worktree_operations_matches_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), false);
+
+    // Create a commit on main
+    std::fs::write(dir.path().join("readme.md"), b"worktree\n").unwrap();
+    repo.add("readme.md").unwrap();
+    let tree_id = repo.write_index_tree(&repo.read_index().unwrap()).unwrap();
+    let commit_id = repo
+        .write_commit(
+            &CommitBuilder::new(tree_id, ident(), ident())
+                .message(b"worktree\n".to_vec())
+                .build(),
+        )
+        .unwrap();
+    repo.update_reference(
+        &ReferenceName::branch("main").unwrap(),
+        commit_id,
+        git_rs::PreviousValue::MustNotExist,
+    )
+    .unwrap();
+
+    // Create a separate branch for the worktree
+    repo.create_branch("wt-branch", commit_id, false).unwrap();
+
+    // Add a linked worktree via git-rs
+    let worktree_name = "new-wt";
+    repo.add_worktree(
+        worktree_name,
+        worktree_name,
+        &git_rs::WorktreeTarget::Branch("wt-branch".into()),
+        &git_rs::AddWorktreeOptions::default(),
+    )
+    .unwrap();
+
+    // Verify git can see the worktree
+    let git_wt = git(&["worktree", "list"], dir.path());
+    let wt_output = String::from_utf8_lossy(&git_wt);
+    assert!(
+        wt_output.contains(worktree_name),
+        "git worktree list should show new-wt: {wt_output}"
+    );
+}
