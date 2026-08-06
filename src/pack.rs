@@ -10,6 +10,69 @@ const PACK_HEADER_SIZE: usize = 12;
 const HASH_SIZE: usize = 20;
 const MAX_DELTA_DEPTH: usize = 64;
 
+/// Controls pack construction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackOptions {
+    /// Maximum size accepted while loading each source object.
+    pub max_object_size: usize,
+    /// Try compact, depth-one deltas against an earlier object of the same type.
+    pub use_deltas: bool,
+}
+
+impl Default for PackOptions {
+    fn default() -> Self {
+        Self {
+            max_object_size: 1024 * 1024 * 1024,
+            use_deltas: true,
+        }
+    }
+}
+
+/// Complete Git-compatible pack and version-2 index bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackBundle {
+    pack: Vec<u8>,
+    index: Vec<u8>,
+    checksum: [u8; HASH_SIZE],
+    object_count: usize,
+}
+
+impl PackBundle {
+    #[must_use]
+    pub fn pack(&self) -> &[u8] {
+        &self.pack
+    }
+
+    #[must_use]
+    pub fn index(&self) -> &[u8] {
+        &self.index
+    }
+
+    #[must_use]
+    pub const fn checksum(&self) -> &[u8; HASH_SIZE] {
+        &self.checksum
+    }
+
+    #[must_use]
+    pub const fn object_count(&self) -> usize {
+        self.object_count
+    }
+
+    #[must_use]
+    pub fn stem(&self) -> String {
+        format!("pack-{}", hex_hash(self.checksum))
+    }
+}
+
+/// Paths of a pack published in a repository object database.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WrittenPack {
+    pub pack_path: PathBuf,
+    pub index_path: PathBuf,
+    pub checksum: [u8; HASH_SIZE],
+    pub object_count: usize,
+}
+
 /// An object location and integrity checksum from a pack index.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PackIndexEntry {
@@ -124,6 +187,85 @@ impl PackIndex {
 }
 
 impl Repository {
+    /// Build a deterministic pack containing the requested objects.
+    ///
+    /// Duplicate IDs are emitted once. Source objects may be loose or packed,
+    /// and all access remains routed through this repository's filesystem.
+    ///
+    /// # Errors
+    /// Returns an error for an absent or corrupt source object, an excessive
+    /// object count, or a source object above the configured size limit.
+    pub fn build_pack(&self, ids: &[ObjectId], options: &PackOptions) -> Result<PackBundle> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut objects = Vec::with_capacity(ids.len());
+        for id in ids.iter().copied() {
+            if seen.insert(id) {
+                let object = self.read_object(id, options.max_object_size)?;
+                objects.push(PackSource {
+                    id,
+                    kind: object.kind(),
+                    data: object.into_data(),
+                });
+            }
+        }
+        build_pack(&objects, options)
+    }
+
+    /// Build and publish a pack under `objects/pack`.
+    ///
+    /// The pack is published before its index, so concurrent readers never
+    /// discover an index naming an incomplete pack. Content-addressed existing
+    /// files are accepted only when their bytes match exactly.
+    ///
+    /// # Errors
+    /// Returns an error when building, validating, or publishing either file
+    /// fails.
+    pub fn write_pack(&self, ids: &[ObjectId], options: &PackOptions) -> Result<WrittenPack> {
+        let bundle = self.build_pack(ids, options)?;
+        let stem = bundle.stem();
+        let pack_relative = Path::new("objects/pack").join(format!("{stem}.pack"));
+        let index_relative = Path::new("objects/pack").join(format!("{stem}.idx"));
+        self.publish_pack_file(&pack_relative, bundle.pack())?;
+        self.publish_pack_file(&index_relative, bundle.index())?;
+        Ok(WrittenPack {
+            pack_path: self.git_path(&pack_relative),
+            index_path: self.git_path(&index_relative),
+            checksum: bundle.checksum,
+            object_count: bundle.object_count,
+        })
+    }
+
+    fn publish_pack_file(&self, relative: &Path, expected: &[u8]) -> Result<()> {
+        let path = self.git_path(relative);
+        if self.filesystem().exists(&path)? {
+            if self.filesystem().read(&path)? == expected {
+                return Ok(());
+            }
+            return invalid("content-addressed pack path contains different bytes");
+        }
+        let extension = relative
+            .extension()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| pack_error("pack path has no extension"))?;
+        let lock_relative = relative.with_extension(format!("{extension}.lock"));
+        let lock_path = self.git_path(&lock_relative);
+        self.filesystem().write_new(&lock_path, expected)?;
+        if self.filesystem().exists(&path)? {
+            let matches = self.filesystem().read(&path)? == expected;
+            self.filesystem().remove_file(&lock_path)?;
+            return if matches {
+                Ok(())
+            } else {
+                invalid("content-addressed pack path changed during publication")
+            };
+        }
+        if let Err(error) = self.filesystem().rename(&lock_path, &path) {
+            let _ = self.filesystem().remove_file(&lock_path);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub(crate) fn read_packed_object(&self, id: ObjectId, max_size: usize) -> Result<Object> {
         let directory = self.git_path("objects/pack");
         let paths = match self.filesystem().read_dir(&directory) {
@@ -153,6 +295,250 @@ impl Repository {
         }
         Err(Error::NotFound(self.git_path(object_label(id))))
     }
+}
+
+struct PackSource {
+    id: ObjectId,
+    kind: ObjectKind,
+    data: Vec<u8>,
+}
+
+fn build_pack(objects: &[PackSource], options: &PackOptions) -> Result<PackBundle> {
+    let object_count = u32::try_from(objects.len())
+        .map_err(|_| pack_error("pack contains more than u32::MAX objects"))?;
+    let mut pack = Vec::new();
+    pack.extend_from_slice(b"PACK");
+    pack.extend_from_slice(&2_u32.to_be_bytes());
+    pack.extend_from_slice(&object_count.to_be_bytes());
+    let mut entries: Vec<PackIndexEntry> = Vec::with_capacity(objects.len());
+    let mut direct_bases: [Option<usize>; 4] = [None; 4];
+
+    for (position, object) in objects.iter().enumerate() {
+        let offset = u64::try_from(pack.len()).map_err(|_| pack_error("pack offset overflow"))?;
+        let direct = direct_entry(object.kind, &object.data);
+        let kind_slot = kind_slot(object.kind);
+        let selected = if options.use_deltas {
+            direct_bases[kind_slot]
+                .and_then(|base_position| {
+                    let base: &PackSource = &objects[base_position];
+                    let delta = create_delta(&base.data, &object.data)?;
+                    let distance = offset.checked_sub(entries[base_position].offset)?;
+                    let candidate = ofs_delta_entry(distance, &delta);
+                    (candidate.len() < direct.len()).then_some(candidate)
+                })
+                .unwrap_or_else(|| direct.clone())
+        } else {
+            direct.clone()
+        };
+        let is_direct = selected.len() == direct.len() && selected == direct;
+        entries.push(PackIndexEntry {
+            id: object.id,
+            crc32: crc32(&selected),
+            offset,
+        });
+        pack.extend_from_slice(&selected);
+        if is_direct {
+            direct_bases[kind_slot] = Some(position);
+        }
+    }
+
+    let checksum = sha1::digest(&pack);
+    pack.extend_from_slice(&checksum);
+    let index = encode_index(&entries, checksum)?;
+    let parsed = PackIndex::parse(&index)?;
+    validate_pack(&pack, &parsed)?;
+    Ok(PackBundle {
+        pack,
+        index,
+        checksum,
+        object_count: objects.len(),
+    })
+}
+
+fn direct_entry(kind: ObjectKind, data: &[u8]) -> Vec<u8> {
+    let mut entry = encode_object_header(kind_type(kind), data.len() as u64);
+    entry.extend(miniz_oxide::deflate::compress_to_vec_zlib(data, 6));
+    entry
+}
+
+fn ofs_delta_entry(distance: u64, delta: &[u8]) -> Vec<u8> {
+    let mut entry = encode_object_header(6, delta.len() as u64);
+    entry.extend(encode_ofs_distance(distance));
+    entry.extend(miniz_oxide::deflate::compress_to_vec_zlib(delta, 6));
+    entry
+}
+
+fn encode_object_header(object_type: u8, mut size: u64) -> Vec<u8> {
+    let mut byte = (object_type << 4) | u8::try_from(size & 15).expect("four bits fit");
+    size >>= 4;
+    let mut output = Vec::with_capacity(10);
+    while size != 0 {
+        output.push(byte | 0x80);
+        byte = u8::try_from(size & 0x7f).expect("seven bits fit");
+        size >>= 7;
+    }
+    output.push(byte);
+    output
+}
+
+fn encode_ofs_distance(mut distance: u64) -> Vec<u8> {
+    debug_assert!(distance > 0);
+    let mut reversed = vec![(distance & 0x7f) as u8];
+    while {
+        distance >>= 7;
+        distance != 0
+    } {
+        distance -= 1;
+        reversed.push(0x80 | (distance & 0x7f) as u8);
+    }
+    reversed.reverse();
+    reversed
+}
+
+fn create_delta(base: &[u8], target: &[u8]) -> Option<Vec<u8>> {
+    if base.len() > u32::MAX as usize || target.len() > u32::MAX as usize {
+        return None;
+    }
+    let prefix = base
+        .iter()
+        .zip(target)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let max_suffix = base.len().min(target.len()).saturating_sub(prefix);
+    let suffix = base[base.len() - max_suffix..]
+        .iter()
+        .rev()
+        .zip(target[target.len() - max_suffix..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut delta = Vec::new();
+    encode_delta_varint(base.len() as u64, &mut delta);
+    encode_delta_varint(target.len() as u64, &mut delta);
+    emit_copy(0, prefix, &mut delta);
+    emit_literals(&target[prefix..target.len() - suffix], &mut delta);
+    emit_copy(base.len() - suffix, suffix, &mut delta);
+    Some(delta)
+}
+
+fn emit_literals(mut data: &[u8], output: &mut Vec<u8>) {
+    while !data.is_empty() {
+        let length = data.len().min(127);
+        output.push(u8::try_from(length).expect("literal chunks are at most 127 bytes"));
+        output.extend_from_slice(&data[..length]);
+        data = &data[length..];
+    }
+}
+
+fn emit_copy(mut offset: usize, mut size: usize, output: &mut Vec<u8>) {
+    while size != 0 {
+        let chunk = size.min(0x00ff_ffff);
+        let mut opcode = 0x80_u8;
+        let mut parameters = Vec::with_capacity(7);
+        for (bit, shift) in [(1, 0), (2, 8), (4, 16), (8, 24)] {
+            let byte = u8::try_from((offset >> shift) & 0xff).expect("masked to one byte");
+            if byte != 0 {
+                opcode |= bit;
+                parameters.push(byte);
+            }
+        }
+        if chunk != 0x10000 {
+            for (bit, shift) in [(0x10, 0), (0x20, 8), (0x40, 16)] {
+                let byte = u8::try_from((chunk >> shift) & 0xff).expect("masked to one byte");
+                if byte != 0 {
+                    opcode |= bit;
+                    parameters.push(byte);
+                }
+            }
+        }
+        output.push(opcode);
+        output.extend(parameters);
+        offset += chunk;
+        size -= chunk;
+    }
+}
+
+fn encode_delta_varint(mut value: u64, output: &mut Vec<u8>) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        output.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+fn encode_index(entries: &[PackIndexEntry], pack_checksum: [u8; HASH_SIZE]) -> Result<Vec<u8>> {
+    let mut sorted = entries.to_vec();
+    sorted.sort_unstable_by_key(|entry| entry.id);
+    if sorted.windows(2).any(|pair| pair[0].id == pair[1].id) {
+        return invalid("duplicate object ID while writing index");
+    }
+    let mut index = Vec::new();
+    index.extend_from_slice(&INDEX_MAGIC);
+    index.extend_from_slice(&2_u32.to_be_bytes());
+    let mut position = 0;
+    for bucket in 0..256 {
+        while position < sorted.len() && usize::from(sorted[position].id.as_bytes()[0]) <= bucket {
+            position += 1;
+        }
+        index.extend_from_slice(
+            &u32::try_from(position)
+                .map_err(|_| pack_error("index object count overflow"))?
+                .to_be_bytes(),
+        );
+    }
+    for entry in &sorted {
+        index.extend_from_slice(entry.id.as_bytes());
+    }
+    for entry in &sorted {
+        index.extend_from_slice(&entry.crc32.to_be_bytes());
+    }
+    let mut large = Vec::new();
+    for entry in &sorted {
+        if let Ok(offset) = u32::try_from(entry.offset)
+            && offset < 0x8000_0000
+        {
+            index.extend_from_slice(&offset.to_be_bytes());
+        } else {
+            let position = u32::try_from(large.len())
+                .map_err(|_| pack_error("large-offset table overflow"))?;
+            index.extend_from_slice(&(0x8000_0000 | position).to_be_bytes());
+            large.push(entry.offset);
+        }
+    }
+    for offset in large {
+        index.extend_from_slice(&offset.to_be_bytes());
+    }
+    index.extend_from_slice(&pack_checksum);
+    index.extend_from_slice(&sha1::digest(&index));
+    Ok(index)
+}
+
+const fn kind_type(kind: ObjectKind) -> u8 {
+    match kind {
+        ObjectKind::Commit => 1,
+        ObjectKind::Tree => 2,
+        ObjectKind::Blob => 3,
+        ObjectKind::Tag => 4,
+    }
+}
+
+fn kind_slot(kind: ObjectKind) -> usize {
+    usize::from(kind_type(kind) - 1)
+}
+
+fn hex_hash(hash: [u8; HASH_SIZE]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(HASH_SIZE * 2);
+    for byte in hash {
+        text.push(char::from(HEX[usize::from(byte >> 4)]));
+        text.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    text
 }
 
 fn validate_pack(pack: &[u8], index: &PackIndex) -> Result<()> {
@@ -426,16 +812,32 @@ fn kind_from_type(value: u8) -> Result<ObjectKind> {
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = !0_u32;
     for byte in data {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = if crc & 1 == 0 {
-                crc >> 1
-            } else {
-                (crc >> 1) ^ 0xedb8_8320
-            };
-        }
+        let index = usize::from(((crc ^ u32::from(*byte)) & 0xff) as u8);
+        crc = CRC32_TABLE[index] ^ (crc >> 8);
     }
     !crc
+}
+
+const CRC32_TABLE: [u32; 256] = make_crc32_table();
+
+const fn make_crc32_table() -> [u32; 256] {
+    let mut table = [0_u32; 256];
+    let mut index = 0_u32;
+    while index < 256 {
+        let mut value = index;
+        let mut bit = 0;
+        while bit < 8 {
+            value = if value & 1 == 0 {
+                value >> 1
+            } else {
+                (value >> 1) ^ 0xedb_88320
+            };
+            bit += 1;
+        }
+        table[index as usize] = value;
+        index += 1;
+    }
+    table
 }
 
 fn be_u32(data: &[u8], offset: usize) -> Result<u32> {
@@ -494,7 +896,9 @@ mod tests {
 
     use super::{PackIndex, apply_delta, crc32};
     use crate::object::sha1;
-    use crate::{FileSystem, InitOptions, MemoryFileSystem, ObjectId, ObjectKind, Repository};
+    use crate::{
+        FileSystem, InitOptions, MemoryFileSystem, ObjectId, ObjectKind, PackOptions, Repository,
+    };
 
     #[test]
     fn crc_matches_standard_vector() {
@@ -549,6 +953,50 @@ mod tests {
         assert!(PackIndex::parse(&index).is_err());
     }
 
+    #[test]
+    fn builds_publishes_and_reads_a_delta_pack_in_memory() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let base_data = vec![b'a'; 4096];
+        let mut target_data = base_data.clone();
+        target_data[2048..2052].copy_from_slice(b"rust");
+        let base = repository
+            .write_object(ObjectKind::Blob, &base_data)
+            .unwrap();
+        let target = repository
+            .write_object(ObjectKind::Blob, &target_data)
+            .unwrap();
+
+        let bundle = repository
+            .build_pack(&[base, target, base], &PackOptions::default())
+            .unwrap();
+        assert_eq!(bundle.object_count(), 2);
+        let index = PackIndex::parse(bundle.index()).unwrap();
+        let target_offset = usize::try_from(index.find(target).unwrap().offset).unwrap();
+        assert_eq!((bundle.pack()[target_offset] >> 4) & 7, 6);
+        let written = repository
+            .write_pack(&[base, target], &PackOptions::default())
+            .unwrap();
+        assert_eq!(written.object_count, 2);
+        assert!(fs.exists(&written.pack_path).unwrap());
+        assert!(fs.exists(&written.index_path).unwrap());
+
+        remove_loose(&fs, base);
+        remove_loose(&fs, target);
+        let object = repository.read_object(target, 8192).unwrap();
+        assert_eq!(object.kind(), ObjectKind::Blob);
+        assert_eq!(object.data(), target_data);
+    }
+
+    #[test]
+    fn builds_a_valid_empty_pack_and_index() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs, "repo", &InitOptions::default()).unwrap();
+        let bundle = repository.build_pack(&[], &PackOptions::default()).unwrap();
+        assert_eq!(bundle.object_count(), 0);
+        assert_eq!(PackIndex::parse(bundle.index()).unwrap().entries(), &[]);
+    }
+
     fn one_object_index(id: ObjectId, crc: u32, offset: u32, pack_checksum: [u8; 20]) -> Vec<u8> {
         let mut index = Vec::new();
         index.extend_from_slice(&[0xff, b't', b'O', b'c']);
@@ -565,5 +1013,13 @@ mod tests {
         let checksum = sha1::digest(&index);
         index.extend_from_slice(&checksum);
         index
+    }
+
+    fn remove_loose(fs: &MemoryFileSystem, id: ObjectId) {
+        let hex = id.to_string();
+        let path = Path::new("repo/.git/objects")
+            .join(&hex[..2])
+            .join(&hex[2..]);
+        fs.remove_file(&path).unwrap();
     }
 }

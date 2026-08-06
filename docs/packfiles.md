@@ -21,12 +21,48 @@ Before returning an object, the implementation validates:
 storage adapter or higher-level object cache can validate and retain index data
 without duplicating the format parser.
 
+## Creating packs
+
+`Repository::build_pack` returns a `PackBundle` containing a complete pack and
+index without assuming where either will be stored. `Repository::write_pack`
+publishes the same bytes under Git's content-derived
+`objects/pack/pack-<checksum>.{pack,idx}` names through `FileSystem`.
+
+```rust
+# use git_rs::{InitOptions, MemoryFileSystem, ObjectKind, PackOptions, Repository};
+# let repository = Repository::init(MemoryFileSystem::new(), "repo", &InitOptions::default())?;
+let first = repository.write_object(ObjectKind::Blob, b"first contents")?;
+let second = repository.write_object(ObjectKind::Blob, b"second contents")?;
+let written = repository.write_pack(&[first, second], &PackOptions::default())?;
+assert_eq!(written.object_count, 2);
+# Ok::<(), git_rs::Error>(())
+```
+
+Input IDs are de-duplicated without changing their first-seen order. The writer
+uses direct entries for every object type and evaluates depth-one OFS deltas
+against an earlier direct object of the same type. A delta is selected only when
+its complete encoded entry is smaller. This bounds reconstruction depth while
+still compacting similar content. CRC-32 uses a compile-time lookup table, and
+the index is sorted once by object ID.
+
+Pack bytes are published before index bytes. Since readers discover packs by
+their index, they cannot observe an index for a partially published pack.
+Existing content-addressed files must match byte-for-byte.
+
+The `pack_objects` example writes a pack stream to standard output:
+
+```text
+cargo run --example pack_objects -- my-repository <object-id>...
+```
+
 ## Git source comparison
 
 The implementation was compared directly with:
 
 - `pack.h:PACK_IDX_SIGNATURE` and `packfile.c:load_idx` for index layout and
   validation;
+- `pack-write.c:write_pack_header`, `write_idx_file`, and
+  `encode_in_pack_object_header` for pack and index emission;
 - `packfile.c:unpack_object_header_buffer` for packed object headers;
 - `packfile.c:unpack_delta_entry` for delta base handling and depth behavior;
 - `patch-delta.c:patch_delta` for delta varints, copy/insert opcodes, the special

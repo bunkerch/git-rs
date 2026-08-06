@@ -19,7 +19,7 @@ pub use fs::{FileStat, FileSystem, HostFileSystem, MemoryFileSystem, Metadata};
 pub use index::{Index, IndexEntry, IndexExtension, IndexVersion, StatData};
 pub use object::{Object, ObjectId, ObjectKind};
 pub use operations::{ResetMode, ResetOptions, SwitchOptions};
-pub use pack::{PackIndex, PackIndexEntry};
+pub use pack::{PackBundle, PackIndex, PackIndexEntry, PackOptions, WrittenPack};
 pub use refs::{PreviousValue, Reference, ReferenceName, ReferenceTarget, ReflogEntry};
 pub use repository::{InitOptions, Repository};
 pub use status::{ChangeKind, RepositoryStatus, StatusEntry, StatusOptions};
