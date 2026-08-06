@@ -36,6 +36,7 @@ pub mod mailmap;
 pub mod maintenance;
 pub mod merge;
 pub mod multi_pack_index;
+pub mod name_rev;
 pub mod notes;
 pub mod object;
 pub mod operations;
@@ -123,6 +124,7 @@ pub use merge::{
 pub use multi_pack_index::{
     MultiPackIndex, MultiPackIndexEntry, MultiPackIndexOptions, MultiPackIndexReport,
 };
+pub use name_rev::{NameRevEntry, NameRevOptions};
 pub use notes::{DEFAULT_NOTES_REF, Note, NotesOptions};
 pub use object::{Object, ObjectId, ObjectKind};
 pub use operations::{ResetMode, ResetOptions, SwitchOptions};
