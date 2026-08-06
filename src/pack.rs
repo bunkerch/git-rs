@@ -1,6 +1,7 @@
 //! Validated Git pack index and packed-object reading.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::object::sha1;
 use crate::{Error, Object, ObjectId, ObjectKind, Repository, Result};
@@ -85,6 +86,7 @@ pub struct PackIndexEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackIndex {
     entries: Vec<PackIndexEntry>,
+    offsets: Vec<u64>,
     pack_checksum: [u8; HASH_SIZE],
 }
 
@@ -161,8 +163,14 @@ impl PackIndex {
                 return invalid("fanout does not match object IDs");
             }
         }
+        let mut offsets = entries.iter().map(|entry| entry.offset).collect::<Vec<_>>();
+        offsets.sort_unstable();
+        if offsets.windows(2).any(|pair| pair[0] == pair[1]) {
+            return invalid("multiple objects have the same pack offset");
+        }
         Ok(Self {
             entries,
+            offsets,
             pack_checksum: read_hash(data, trailer_start)?,
         })
     }
@@ -183,6 +191,17 @@ impl PackIndex {
             .binary_search_by_key(&id, |entry| entry.id)
             .ok()
             .map(|index| self.entries[index])
+    }
+
+    fn object_end(&self, offset: u64, pack_end: usize) -> Result<usize> {
+        let position = self
+            .offsets
+            .binary_search(&offset)
+            .map_err(|_| pack_error("object offset absent from index"))?;
+        self.offsets.get(position + 1).copied().map_or_else(
+            || Ok(pack_end),
+            |next| usize::try_from(next).map_err(|_| pack_error("pack offset overflow")),
+        )
     }
 }
 
@@ -280,13 +299,12 @@ impl Repository {
                 continue;
             }
             let index_path = directory.join(child);
-            let index = PackIndex::parse(&self.filesystem().read(&index_path)?)?;
+            let index = self.cached_pack_index(&index_path)?;
             if index.find(id).is_none() {
                 continue;
             }
             let pack_path = index_path.with_extension("pack");
-            let pack = self.filesystem().read(&pack_path)?;
-            validate_pack(&pack, &index)?;
+            let pack = self.cached_pack_data(&pack_path, &index)?;
             let (kind, data) = resolve(&pack, &index, id, max_size, 0)?;
             if ObjectId::compute(kind, &data) != id {
                 return invalid("resolved packed object hash mismatch");
@@ -294,6 +312,49 @@ impl Repository {
             return Ok(Object::from_parts(kind, data));
         }
         Err(Error::NotFound(self.git_path(object_label(id))))
+    }
+
+    fn cached_pack_index(&self, path: &Path) -> Result<Arc<PackIndex>> {
+        if let Some(index) = self
+            .pack_indexes
+            .read()
+            .map_err(|_| pack_error("pack index cache lock poisoned"))?
+            .get(path)
+            .cloned()
+        {
+            return Ok(index);
+        }
+        let parsed = Arc::new(PackIndex::parse(&self.filesystem().read(path)?)?);
+        let mut cache = self
+            .pack_indexes
+            .write()
+            .map_err(|_| pack_error("pack index cache lock poisoned"))?;
+        Ok(cache
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::clone(&parsed))
+            .clone())
+    }
+
+    fn cached_pack_data(&self, path: &Path, index: &PackIndex) -> Result<Arc<Vec<u8>>> {
+        if let Some(pack) = self
+            .pack_data
+            .read()
+            .map_err(|_| pack_error("pack data cache lock poisoned"))?
+            .get(path)
+            .cloned()
+        {
+            return Ok(pack);
+        }
+        let bytes = Arc::new(self.filesystem().read(path)?);
+        validate_pack(&bytes, index)?;
+        let mut cache = self
+            .pack_data
+            .write()
+            .map_err(|_| pack_error("pack data cache lock poisoned"))?;
+        Ok(cache
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::clone(&bytes))
+            .clone())
     }
 }
 
@@ -573,13 +634,7 @@ fn resolve(
         .find(id)
         .ok_or_else(|| pack_error("object absent from index"))?;
     let start = usize::try_from(entry.offset).map_err(|_| pack_error("offset overflow"))?;
-    let end = index
-        .entries
-        .iter()
-        .filter_map(|candidate| usize::try_from(candidate.offset).ok())
-        .filter(|offset| *offset > start)
-        .min()
-        .unwrap_or(pack.len() - HASH_SIZE);
+    let end = index.object_end(entry.offset, pack.len() - HASH_SIZE)?;
     if start < PACK_HEADER_SIZE || start >= end || end > pack.len() - HASH_SIZE {
         return invalid("object offset is outside pack");
     }

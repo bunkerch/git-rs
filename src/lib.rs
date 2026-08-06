@@ -12,6 +12,7 @@ pub mod refs;
 pub mod repository;
 pub mod status;
 pub mod tree;
+pub mod upload_pack;
 pub mod worktree;
 
 pub use commit::{Commit, CommitBuilder, ExtraHeader, Signature};
@@ -26,4 +27,5 @@ pub use refs::{PreviousValue, Reference, ReferenceName, ReferenceTarget, ReflogE
 pub use repository::{InitOptions, Repository};
 pub use status::{ChangeKind, RepositoryStatus, StatusEntry, StatusOptions};
 pub use tree::{EntryMode, Tree, TreeEntry};
+pub use upload_pack::{UploadPackOptions, UploadPackRequest};
 pub use worktree::CheckoutOptions;

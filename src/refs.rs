@@ -162,6 +162,33 @@ impl Repository {
         Ok(branches.into_values().collect())
     }
 
+    /// List every loose and packed reference below `refs/` in bytewise order.
+    ///
+    /// Loose references override packed references with the same name. Lock
+    /// files are excluded and symbolic references are preserved.
+    ///
+    /// # Errors
+    /// Returns an error for malformed references or storage failures.
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    pub fn references(&self) -> Result<Vec<Reference>> {
+        let mut references = self.packed_references_with_prefix("refs/")?;
+        let root = self.git_path("refs");
+        let mut directories = vec![(root, String::from("refs"))];
+        while let Some((directory, prefix)) = directories.pop() {
+            for child in self.filesystem().read_dir(&directory)? {
+                let path = directory.join(&child);
+                let name = format!("{prefix}/{}", child.to_string_lossy());
+                let metadata = self.filesystem().metadata(&path)?;
+                if metadata.is_dir() {
+                    directories.push((path, name));
+                } else if metadata.is_file() && !name.ends_with(".lock") {
+                    references.insert(name.clone(), self.read_loose_reference(&name)?);
+                }
+            }
+        }
+        Ok(references.into_values().collect())
+    }
+
     /// Read a loose or packed reference without following a symbolic target.
     ///
     /// `HEAD` is accepted as a pseudoref; other names must be fully-qualified.

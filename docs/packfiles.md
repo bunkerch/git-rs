@@ -21,6 +21,12 @@ Before returning an object, the implementation validates:
 storage adapter or higher-level object cache can validate and retain index data
 without duplicating the format parser.
 
+Repository handles cache validated indexes and immutable content-addressed pack
+bytes across clones of the handle. Newly appearing index filenames are still
+discovered on each lookup. Sorted offset tables make entry-boundary lookup
+logarithmic instead of scanning every index entry; this is important during
+reachability walks over an already packed repository.
+
 ## Creating packs
 
 `Repository::build_pack` returns a `PackBundle` containing a complete pack and

@@ -25,6 +25,8 @@ Loose objects are documented in [`docs/objects.md`](docs/objects.md), and packed
 object reads in [`docs/packfiles.md`](docs/packfiles.md).
 Wire-format primitives are documented in
 [`docs/protocol.md`](docs/protocol.md).
+Server-side fetch negotiation is documented in
+[`docs/upload-pack.md`](docs/upload-pack.md).
 Typed trees and commits are documented in
 [`docs/trees-and-commits.md`](docs/trees-and-commits.md).
 Index versions 2–4 are documented in [`docs/index.md`](docs/index.md).

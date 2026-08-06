@@ -1,5 +1,6 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::{FileSystem, Result};
 
@@ -23,6 +24,8 @@ pub struct Repository {
     fs: Arc<dyn FileSystem>,
     git_dir: PathBuf,
     work_tree: Option<PathBuf>,
+    pub(crate) pack_indexes: Arc<RwLock<BTreeMap<PathBuf, Arc<crate::PackIndex>>>>,
+    pub(crate) pack_data: Arc<RwLock<BTreeMap<PathBuf, Arc<Vec<u8>>>>>,
 }
 
 impl Repository {
@@ -59,6 +62,8 @@ impl Repository {
             fs,
             git_dir,
             work_tree,
+            pack_indexes: Arc::new(RwLock::new(BTreeMap::new())),
+            pack_data: Arc::new(RwLock::new(BTreeMap::new())),
         };
         repository.read_reference("HEAD")?;
         Ok(repository)
@@ -109,6 +114,8 @@ impl Repository {
             fs,
             git_dir,
             work_tree,
+            pack_indexes: Arc::new(RwLock::new(BTreeMap::new())),
+            pack_data: Arc::new(RwLock::new(BTreeMap::new())),
         };
         repository.write_atomic(
             Path::new("HEAD"),
