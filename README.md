@@ -44,6 +44,8 @@ Ref-moving operations and their logs are documented in
 [`docs/reset-switch-reflog.md`](docs/reset-switch-reflog.md).
 Revision walking, ancestry, and merge bases are documented in
 [`docs/revisions.md`](docs/revisions.md).
+Fast-forward, three-way, conflict, continue, and abort behavior is documented
+in [`docs/merge.md`](docs/merge.md).
 
 To create a host-backed repository with the included example:
 

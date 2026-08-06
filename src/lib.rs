@@ -6,6 +6,7 @@ pub mod fetch;
 pub mod fs;
 pub mod index;
 pub mod linked_worktree;
+pub mod merge;
 pub mod object;
 pub mod operations;
 pub mod pack;
@@ -29,6 +30,7 @@ pub use fetch::{
 pub use fs::{FileStat, FileSystem, HostFileSystem, MemoryFileSystem, Metadata};
 pub use index::{Index, IndexEntry, IndexExtension, IndexVersion, StatData};
 pub use linked_worktree::{AddWorktreeOptions, LinkedWorktreeInfo, WorktreeTarget};
+pub use merge::{FastForwardMode, MergeOptions, MergeResult};
 pub use object::{Object, ObjectId, ObjectKind};
 pub use operations::{ResetMode, ResetOptions, SwitchOptions};
 pub use pack::{
