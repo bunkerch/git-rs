@@ -33,6 +33,46 @@ paths, and untracked file/directory obstructions. Entries unchanged between the
 current index and target preserve local modifications. `CheckoutOptions::force`
 requests exact materialization instead.
 
+## Linked worktrees
+
+`Repository::add_worktree` creates Git's linked-worktree layout without
+assuming host storage. The worktree contains a `.git` indirection file, while
+the common repository stores per-worktree `HEAD`, index, backlink, and
+`commondir` files below `.git/worktrees/<name>`. Objects, refs, packed refs,
+reflogs, hooks, and configuration remain shared. Relative links keep the layout
+meaningful inside an in-memory or remote storage namespace; the repository
+format is upgraded to Git's `extensions.relativeWorktrees` format.
+
+```rust
+# use git_rs::{AddWorktreeOptions, Repository, WorktreeTarget};
+# fn example(repository: &Repository) -> git_rs::Result<()> {
+let linked = repository.add_worktree(
+    "topic-work",
+    "topic-work",
+    &WorktreeTarget::Branch("topic".into()),
+    &AddWorktreeOptions::default(),
+)?;
+assert_eq!(
+    linked.resolve_reference("HEAD")?,
+    repository.resolve_reference("refs/heads/topic")?,
+);
+# Ok(())
+# }
+```
+
+Storage paths passed to the API remain normalized and cannot contain `..`; an
+adapter can place the main and linked paths anywhere within a shared namespace.
+Each branch may be active in only one worktree. `linked_worktrees` reads the
+registrations, and `remove_worktree` refuses staged, unstaged, or untracked
+changes unless `force` is set. Removal recursively targets only the registered
+worktree and its matching administrative directory.
+
+The host-backed example is:
+
+```console
+cargo run --example worktree -- repository linked-path linked-name topic
+```
+
 ## Filesystem requirements
 
 Adapters expose no-follow metadata, symlink target reads/creation, executable
@@ -51,3 +91,6 @@ provide stat identity enable Git's fast unchanged-file checks.
   worktree comparisons.
 - `unpack-trees.c:verify_uptodate` and `verify_absent` define modified-file and
   untracked-path checkout protection.
+- `worktree.c:get_worktrees`, `write_worktree_linking_files`, and
+  `builtin/worktree.c:add_worktree` define common-directory routing, relative
+  linking files, registration, checkout exclusivity, and removal safety.

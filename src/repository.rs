@@ -23,12 +23,33 @@ impl Default for InitOptions {
 pub struct Repository {
     fs: Arc<dyn FileSystem>,
     git_dir: PathBuf,
+    common_dir: PathBuf,
     work_tree: Option<PathBuf>,
     pub(crate) pack_indexes: Arc<RwLock<BTreeMap<PathBuf, Arc<crate::PackIndex>>>>,
     pub(crate) pack_data: Arc<RwLock<BTreeMap<PathBuf, Arc<Vec<u8>>>>>,
 }
 
 impl Repository {
+    pub(crate) fn from_linked_parts(
+        fs: Arc<dyn FileSystem>,
+        git_dir: PathBuf,
+        common_dir: PathBuf,
+        work_tree: PathBuf,
+    ) -> Self {
+        Self {
+            fs,
+            git_dir,
+            common_dir,
+            work_tree: Some(work_tree),
+            pack_indexes: Arc::new(RwLock::new(BTreeMap::new())),
+            pack_data: Arc::new(RwLock::new(BTreeMap::new())),
+        }
+    }
+
+    pub(crate) fn shared_filesystem(&self) -> Arc<dyn FileSystem> {
+        Arc::clone(&self.fs)
+    }
+
     /// Open an existing bare or non-bare repository.
     ///
     /// A path containing `.git/HEAD` is treated as a working tree. Otherwise,
@@ -48,10 +69,25 @@ impl Repository {
     pub fn open_shared(fs: Arc<dyn FileSystem>, path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let non_bare = path.join(".git");
-        let (git_dir, work_tree) = if fs.exists(&non_bare.join("HEAD"))? {
-            (non_bare, Some(path.to_path_buf()))
+        let (git_dir, common_dir, work_tree) = if fs.exists(&non_bare.join("HEAD"))? {
+            (non_bare.clone(), non_bare, Some(path.to_path_buf()))
+        } else if fs.metadata(&non_bare).is_ok_and(crate::Metadata::is_file) {
+            let pointer = parse_gitdir_file(&fs.read(&non_bare)?)?;
+            let git_dir = resolve_indirection(path, &pointer)?;
+            if !fs.exists(&git_dir.join("HEAD"))? {
+                return Err(crate::Error::InvalidRepository(format!(
+                    "{} points to a Git directory without HEAD",
+                    non_bare.display()
+                )));
+            }
+            let common_dir = match fs.read(&git_dir.join("commondir")) {
+                Ok(contents) => resolve_indirection(&git_dir, &parse_path_line(&contents)?)?,
+                Err(crate::Error::NotFound(_)) => git_dir.clone(),
+                Err(error) => return Err(error),
+            };
+            (git_dir, common_dir, Some(path.to_path_buf()))
         } else if fs.exists(&path.join("HEAD"))? {
-            (path.to_path_buf(), None)
+            (path.to_path_buf(), path.to_path_buf(), None)
         } else {
             return Err(crate::Error::InvalidRepository(format!(
                 "{} has no Git HEAD",
@@ -61,6 +97,7 @@ impl Repository {
         let repository = Self {
             fs,
             git_dir,
+            common_dir,
             work_tree,
             pack_indexes: Arc::new(RwLock::new(BTreeMap::new())),
             pack_data: Arc::new(RwLock::new(BTreeMap::new())),
@@ -112,6 +149,7 @@ impl Repository {
 
         let repository = Self {
             fs,
+            common_dir: git_dir.clone(),
             git_dir,
             work_tree,
             pack_indexes: Arc::new(RwLock::new(BTreeMap::new())),
@@ -134,6 +172,13 @@ impl Repository {
         &self.git_dir
     }
 
+    /// Directory containing objects, refs, configuration, and other state
+    /// shared by every linked worktree.
+    #[must_use]
+    pub fn common_dir(&self) -> &Path {
+        &self.common_dir
+    }
+
     #[must_use]
     pub fn work_tree(&self) -> Option<&Path> {
         self.work_tree.as_deref()
@@ -146,7 +191,12 @@ impl Repository {
 
     #[must_use]
     pub(crate) fn git_path(&self, path: impl AsRef<Path>) -> PathBuf {
-        self.git_dir.join(path)
+        let path = path.as_ref();
+        if self.git_dir != self.common_dir && is_common_path(path) {
+            self.common_dir.join(path)
+        } else {
+            self.git_dir.join(path)
+        }
     }
 
     /// Read a file relative to the repository's Git directory.
@@ -154,7 +204,7 @@ impl Repository {
     /// # Errors
     /// Returns an error when the file cannot be read from storage.
     pub fn read_git_file(&self, path: impl AsRef<Path>) -> Result<Vec<u8>> {
-        self.fs.read(&self.git_dir.join(path))
+        self.fs.read(&self.git_path(path))
     }
 
     /// Publish a complete file using Git's lock-file-and-rename discipline.
@@ -162,7 +212,7 @@ impl Repository {
     /// # Errors
     /// Returns an error if the temporary file cannot be written or published.
     pub fn write_atomic(&self, path: &Path, contents: &[u8]) -> Result<()> {
-        let destination = self.git_dir.join(path);
+        let destination = self.git_path(path);
         if let Some(parent) = destination.parent() {
             self.fs.create_dir_all(parent)?;
         }
@@ -174,6 +224,73 @@ impl Repository {
         }
         Ok(())
     }
+}
+
+fn is_common_path(path: &Path) -> bool {
+    let Some(first) = path.components().next() else {
+        return false;
+    };
+    match first.as_os_str().to_str() {
+        Some(
+            "objects" | "refs" | "packed-refs" | "config" | "config.worktree" | "hooks" | "info"
+            | "branches",
+        ) => true,
+        Some("logs") => path != Path::new("logs/HEAD"),
+        _ => false,
+    }
+}
+
+fn parse_gitdir_file(contents: &[u8]) -> Result<PathBuf> {
+    let line = contents
+        .strip_prefix(b"gitdir: ")
+        .ok_or_else(|| crate::Error::InvalidRepository("invalid .git indirection".into()))?;
+    parse_path_line(line)
+}
+
+fn parse_path_line(contents: &[u8]) -> Result<PathBuf> {
+    let contents = contents.strip_suffix(b"\n").unwrap_or(contents);
+    if contents.is_empty() || contents.contains(&0) || contents.contains(&b'\n') {
+        return Err(crate::Error::InvalidRepository(
+            "invalid Git directory path".into(),
+        ));
+    }
+    let value = std::str::from_utf8(contents)
+        .map_err(|_| crate::Error::InvalidRepository("non-UTF-8 Git directory path".into()))?;
+    Ok(PathBuf::from(value))
+}
+
+fn resolve_indirection(base: &Path, value: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+
+    if value.is_absolute() {
+        return Err(crate::Error::InvalidRepository(
+            "absolute Git directory paths are outside abstract storage".into(),
+        ));
+    }
+    let mut components = base
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_os_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for component in value.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => components.push(value.to_os_string()),
+            Component::ParentDir => {
+                components.pop().ok_or_else(|| {
+                    crate::Error::InvalidRepository("Git directory path escapes storage".into())
+                })?;
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(crate::Error::InvalidRepository(
+                    "invalid Git directory path".into(),
+                ));
+            }
+        }
+    }
+    Ok(components.into_iter().collect())
 }
 
 fn config(bare: bool) -> String {

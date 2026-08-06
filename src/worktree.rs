@@ -336,7 +336,9 @@ impl Repository {
         if metadata.is_dir() {
             for child in self.filesystem().read_dir(&path)? {
                 let child_relative = relative.join(child);
-                if work_tree.join(&child_relative) == self.git_dir() {
+                if child_relative == Path::new(".git")
+                    || work_tree.join(&child_relative) == self.git_dir()
+                {
                     continue;
                 }
                 self.collect_entries(work_tree, &child_relative, output)?;
