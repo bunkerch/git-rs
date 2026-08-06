@@ -1,6 +1,7 @@
 //! Populate and trivially merge the index from tree-ish objects.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use crate::{Error, Index, IndexEntry, ObjectId, ObjectKind, Repository, Result, StatData};
 
@@ -12,6 +13,8 @@ pub struct ReadTreeOptions {
     pub reset: bool,
     pub dry_run: bool,
     pub aggressive: bool,
+    /// Update affected worktree paths after a successful merge.
+    pub update_worktree: bool,
     pub prefix: Option<Vec<u8>>,
     pub max_entries: usize,
     pub max_object_size: usize,
@@ -25,6 +28,7 @@ impl Default for ReadTreeOptions {
             reset: false,
             dry_run: false,
             aggressive: false,
+            update_worktree: false,
             prefix: None,
             max_entries: 10_000_000,
             max_object_size: 1024 * 1024 * 1024,
@@ -91,10 +95,202 @@ impl Repository {
             entries: entries.len(),
             conflicts,
         };
+        let mut entries = entries;
+        if options.update_worktree {
+            self.update_read_tree_worktree(
+                &current,
+                &mut entries,
+                &result.conflicts,
+                options.reset,
+                options.dry_run,
+                options.max_object_size,
+            )?;
+        }
         if !options.dry_run {
             self.write_index(&current.with_entries(entries)?)?;
         }
         Ok(result)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn update_read_tree_worktree(
+        &self,
+        current: &Index,
+        desired: &mut [IndexEntry],
+        conflicts: &[Vec<u8>],
+        force: bool,
+        dry_run: bool,
+        max_object_size: usize,
+    ) -> Result<()> {
+        use crate::worktree::{index_stat, remove_worktree_tree, worktree_path};
+
+        struct Write {
+            path: Vec<u8>,
+            full: PathBuf,
+            mode: u32,
+            id: ObjectId,
+            data: Vec<u8>,
+        }
+
+        let root = self.work_tree().ok_or_else(|| {
+            Error::InvalidRepository("read-tree -u requires a non-bare repository".into())
+        })?;
+        let old = current
+            .entries()
+            .iter()
+            .filter(|entry| entry.stage() == 0)
+            .map(|entry| (entry.path().to_vec(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let next = desired
+            .iter()
+            .filter(|entry| entry.stage() == 0)
+            .map(|entry| (entry.path().to_vec(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let conflicted = conflicts.iter().cloned().collect::<BTreeSet<_>>();
+        let changing = next
+            .iter()
+            .filter(|(path, entry)| {
+                old.get(*path)
+                    .is_none_or(|old| old.id() != entry.id() || old.mode() != entry.mode())
+            })
+            .map(|(path, _)| path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut removals = old
+            .keys()
+            .filter(|path| !next.contains_key(*path) && !conflicted.contains(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut rejected = Vec::new();
+        if !force {
+            for path in changing.iter().chain(removals.iter()) {
+                if let Some(entry) = old.get(path) {
+                    let full = root.join(worktree_path(path)?);
+                    match self.filesystem().metadata(&full) {
+                        Ok(_) if !self.worktree_matches(entry, &full)? => {
+                            rejected.push(String::from_utf8_lossy(path).into_owned());
+                        }
+                        Ok(_) | Err(Error::NotFound(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        }
+
+        let mut writes = Vec::with_capacity(changing.len());
+        let mut obstructing_parents = BTreeSet::new();
+        for path in &changing {
+            let entry = next[path];
+            let relative = worktree_path(path)?;
+            let full = root.join(&relative);
+            if !force && !old.contains_key(path) && self.filesystem().exists(&full)? {
+                rejected.push(String::from_utf8_lossy(path).into_owned());
+            }
+            for slash in path
+                .iter()
+                .enumerate()
+                .filter_map(|(offset, byte)| (*byte == b'/').then_some(offset))
+            {
+                let parent_path = &path[..slash];
+                let parent = root.join(worktree_path(parent_path)?);
+                match self.filesystem().metadata(&parent) {
+                    Ok(metadata) => {
+                        let tracked_parent_will_be_removed = old.contains_key(parent_path)
+                            && removals.iter().any(|path| path == parent_path);
+                        if !metadata.is_dir() && !tracked_parent_will_be_removed && !force {
+                            rejected.push(String::from_utf8_lossy(parent_path).into_owned());
+                        } else if !metadata.is_dir() && !tracked_parent_will_be_removed {
+                            obstructing_parents.insert(parent);
+                        }
+                    }
+                    Err(Error::NotFound(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let data = if entry.mode() == 0o160_000 {
+                Vec::new()
+            } else {
+                let object = self.read_object(entry.id(), max_object_size)?;
+                if object.kind() != ObjectKind::Blob {
+                    return Err(Error::InvalidTree(format!(
+                        "entry `{}` points to the wrong object type",
+                        String::from_utf8_lossy(path)
+                    )));
+                }
+                object.data().to_vec()
+            };
+            writes.push(Write {
+                path: path.clone(),
+                full,
+                mode: entry.mode(),
+                id: entry.id(),
+                data,
+            });
+        }
+        rejected.sort_unstable();
+        rejected.dedup();
+        if !rejected.is_empty() {
+            return Err(Error::CheckoutConflict(rejected));
+        }
+        if dry_run {
+            return Ok(());
+        }
+
+        removals.sort_unstable_by_key(|path| std::cmp::Reverse(path.len()));
+        for path in removals {
+            let relative = worktree_path(&path)?;
+            let full = root.join(&relative);
+            match self.filesystem().metadata(&full) {
+                Ok(metadata) if metadata.is_dir() => remove_worktree_tree(self, &full, force)?,
+                Ok(_) => self.filesystem().remove_file(&full)?,
+                Err(Error::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+            self.prune_empty_parents(root, relative.parent())?;
+        }
+        for path in obstructing_parents {
+            self.filesystem().remove_file(&path)?;
+        }
+        for write in writes {
+            match self.filesystem().metadata(&write.full) {
+                Ok(metadata) if metadata.is_dir() => {
+                    remove_worktree_tree(self, &write.full, force)?;
+                }
+                Ok(_) => self.filesystem().remove_file(&write.full)?,
+                Err(Error::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+            if write.mode == 0o160_000 {
+                self.filesystem().create_dir_all(&write.full)?;
+            } else {
+                if let Some(parent) = write.full.parent() {
+                    self.filesystem().create_dir_all(parent)?;
+                }
+                match write.mode {
+                    0o120_000 => self.filesystem().create_symlink(&write.full, &write.data)?,
+                    0o100_644 | 0o100_755 => {
+                        self.filesystem().write(&write.full, &write.data)?;
+                        self.filesystem()
+                            .set_executable(&write.full, write.mode == 0o100_755)?;
+                    }
+                    mode => return Err(Error::InvalidTree(format!("unsupported mode {mode:o}"))),
+                }
+            }
+            let metadata = self.filesystem().metadata(&write.full)?;
+            let replacement = IndexEntry::new(
+                write.path.clone(),
+                write.mode,
+                write.id,
+                index_stat(metadata.stat(), metadata.len()),
+            )?;
+            if let Some(slot) = desired
+                .iter_mut()
+                .find(|entry| entry.stage() == 0 && entry.path() == write.path)
+            {
+                *slot = replacement;
+            }
+        }
+        Ok(())
     }
 
     fn read_tree_entries(
@@ -163,6 +359,9 @@ fn validate(trees: &[ObjectId], options: &ReadTreeOptions) -> Result<()> {
     }
     if options.prefix.is_some() && trees.len() != 1 {
         return read_error("prefix mode requires one tree");
+    }
+    if options.update_worktree && !(options.merge || options.reset || options.prefix.is_some()) {
+        return read_error("worktree update requires merge, reset, or prefix mode");
     }
     if let Some(prefix) = &options.prefix
         && (prefix.is_empty()
@@ -388,7 +587,7 @@ mod tests {
                 .unwrap()
                 .entries()
                 .iter()
-                .map(|entry| entry.path())
+                .map(IndexEntry::path)
                 .collect::<Vec<_>>(),
             [b"a".as_slice(), b"sub/b".as_slice()]
         );
@@ -478,7 +677,7 @@ mod tests {
                 .entries()
                 .iter()
                 .filter(|entry| entry.path() == b"a")
-                .map(|entry| entry.stage())
+                .map(IndexEntry::stage)
                 .collect::<Vec<_>>(),
             [1, 2, 3]
         );
@@ -491,6 +690,154 @@ mod tests {
         assert_eq!(resolved.id(), changed);
     }
 
+    #[test]
+    fn worktree_update_protects_data_but_reset_overwrites_and_dry_run_does_not() {
+        let repository = worktree_repository();
+        let old = blob(&repository, b"old");
+        let new = blob(&repository, b"new");
+        let final_blob = blob(&repository, b"final");
+        let head = tree(&repository, &[("a", old)]);
+        let target = tree(&repository, &[("a", new), ("b", new)]);
+        let final_tree = tree(&repository, &[("a", final_blob)]);
+        let nested_tree = tree(&repository, &[("dir/file", final_blob)]);
+        repository
+            .read_tree_into_index(&[head], &ReadTreeOptions::default())
+            .unwrap();
+        repository.filesystem().write("a".as_ref(), b"old").unwrap();
+        repository
+            .filesystem()
+            .write("b".as_ref(), b"untracked")
+            .unwrap();
+
+        let protected = ReadTreeOptions {
+            merge: true,
+            update_worktree: true,
+            ..ReadTreeOptions::default()
+        };
+        assert!(
+            repository
+                .read_tree_into_index(&[head, target], &protected)
+                .is_err()
+        );
+        assert_eq!(repository.filesystem().read("a".as_ref()).unwrap(), b"old");
+        assert_eq!(
+            repository.filesystem().read("b".as_ref()).unwrap(),
+            b"untracked"
+        );
+        assert_eq!(repository.read_index().unwrap().entries().len(), 1);
+
+        repository
+            .read_tree_into_index(
+                &[target],
+                &ReadTreeOptions {
+                    reset: true,
+                    update_worktree: true,
+                    ..ReadTreeOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(repository.filesystem().read("a".as_ref()).unwrap(), b"new");
+        assert_eq!(repository.filesystem().read("b".as_ref()).unwrap(), b"new");
+
+        repository
+            .filesystem()
+            .write("a".as_ref(), b"local")
+            .unwrap();
+        assert!(
+            repository
+                .read_tree_into_index(
+                    &[target, final_tree],
+                    &ReadTreeOptions {
+                        merge: true,
+                        update_worktree: true,
+                        ..ReadTreeOptions::default()
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(
+            repository.filesystem().read("a".as_ref()).unwrap(),
+            b"local"
+        );
+        assert_eq!(repository.read_index().unwrap().entries()[0].id(), new);
+
+        repository
+            .read_tree_into_index(
+                &[final_tree],
+                &ReadTreeOptions {
+                    reset: true,
+                    update_worktree: true,
+                    dry_run: true,
+                    ..ReadTreeOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            repository.filesystem().read("a".as_ref()).unwrap(),
+            b"local"
+        );
+        assert_eq!(repository.read_index().unwrap().entries()[0].id(), new);
+
+        repository
+            .filesystem()
+            .write("dir".as_ref(), b"untracked obstruction")
+            .unwrap();
+        repository
+            .read_tree_into_index(
+                &[nested_tree],
+                &ReadTreeOptions {
+                    reset: true,
+                    update_worktree: true,
+                    ..ReadTreeOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            repository.filesystem().read("dir/file".as_ref()).unwrap(),
+            b"final"
+        );
+    }
+
+    #[test]
+    fn unresolved_merge_keeps_worktree_file_and_publishes_stages() {
+        let repository = worktree_repository();
+        let base = blob(&repository, b"base");
+        let ours = blob(&repository, b"ours");
+        let theirs = blob(&repository, b"theirs");
+        let base_tree = tree(&repository, &[("a", base)]);
+        let ours_tree = tree(&repository, &[("a", ours)]);
+        let theirs_tree = tree(&repository, &[("a", theirs)]);
+        repository
+            .read_tree_into_index(&[ours_tree], &ReadTreeOptions::default())
+            .unwrap();
+        repository
+            .filesystem()
+            .write("a".as_ref(), b"ours")
+            .unwrap();
+        let result = repository
+            .read_tree_into_index(
+                &[base_tree, ours_tree, theirs_tree],
+                &ReadTreeOptions {
+                    merge: true,
+                    update_worktree: true,
+                    ..ReadTreeOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(result.conflicts, [b"a".to_vec()]);
+        assert_eq!(repository.filesystem().read("a".as_ref()).unwrap(), b"ours");
+        assert_eq!(
+            repository
+                .read_index()
+                .unwrap()
+                .entries()
+                .iter()
+                .map(IndexEntry::stage)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+    }
+
     fn repository() -> Repository {
         Repository::init(
             MemoryFileSystem::new(),
@@ -501,6 +848,10 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn worktree_repository() -> Repository {
+        Repository::init(MemoryFileSystem::new(), ".", &InitOptions::default()).unwrap()
     }
 
     fn blob(repository: &Repository, data: &[u8]) -> crate::ObjectId {

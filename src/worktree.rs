@@ -920,7 +920,7 @@ fn normalize_relative(path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-fn index_stat(stat: FileStat, len: u64) -> StatData {
+pub(crate) fn index_stat(stat: FileStat, len: u64) -> StatData {
     StatData {
         ctime_seconds: stat.ctime_seconds,
         ctime_nanoseconds: stat.ctime_nanoseconds,
@@ -1018,7 +1018,11 @@ fn rollback_worktree_move(
     }
 }
 
-fn remove_worktree_tree(repository: &Repository, path: &Path, force: bool) -> Result<()> {
+pub(crate) fn remove_worktree_tree(
+    repository: &Repository,
+    path: &Path,
+    force: bool,
+) -> Result<()> {
     let children = repository.filesystem().read_dir(path)?;
     if !force && !children.is_empty() {
         return Err(Error::DirectoryNotEmpty(path.to_path_buf()));

@@ -5,9 +5,9 @@ use git_rs::{HostFileSystem, ObjectId, ReadTreeOptions, Repository};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = env::args().skip(1);
-    let repository_path = arguments
-        .next()
-        .ok_or("usage: read_tree REPOSITORY [--empty|--merge|--reset|--prefix=VALUE] TREE...")?;
+    let repository_path = arguments.next().ok_or(
+        "usage: read_tree REPOSITORY [--empty|--merge|--reset|--prefix=VALUE] [-u] TREE...",
+    )?;
     let mut options = ReadTreeOptions::default();
     let mut trees = Vec::new();
     for argument in arguments {
@@ -17,6 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--reset" => options.reset = true,
             "--dry-run" => options.dry_run = true,
             "--aggressive" => options.aggressive = true,
+            "-u" | "--update-worktree" => options.update_worktree = true,
             _ if argument.starts_with("--prefix=") => {
                 options.prefix = Some(argument.as_bytes()["--prefix=".len()..].to_vec());
             }

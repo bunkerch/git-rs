@@ -4,7 +4,7 @@ Repository::read_tree_into_index populates or trivially merges the repository
 index from typed object IDs. All object and index access uses the FileSystem
 adapter and the resulting index is published atomically.
 
-The current API implements the index-only forms of upstream read-tree:
+The API implements the common index and worktree forms of upstream read-tree:
 
 - emptying the index;
 - replacing it from one tree-ish;
@@ -12,7 +12,9 @@ The current API implements the index-only forms of upstream read-tree:
 - one-tree merge with cached stat preservation;
 - two-tree fast-forward merge with compatible cached changes carried forward;
 - three-tree trivial merge with unresolved paths stored at stages 1, 2, and 3;
-- reset, aggressive trivial resolution, and dry-run validation.
+- reset, aggressive trivial resolution, and dry-run validation;
+- protected worktree synchronization with `update_worktree`, corresponding to
+  `-u` for merge, reset, and prefix modes.
 
 Tree-ish inputs may be trees, commits, or annotated tags resolving to either.
 Blobs and invalid tag targets are rejected.
@@ -47,6 +49,14 @@ Options bound tree traversal, object reads, and final index entries. Prefixes
 must be relative directory byte strings ending in a slash. Existing index
 extensions and the selected index version are preserved.
 
+Worktree synchronization uses the configured filesystem adapter. It preloads
+every changed object and checks affected tracked paths and untracked
+destinations before mutation. Unchanged target paths retain local edits,
+unresolved paths retain their worktree content, and a rejected update leaves
+both index and worktree unchanged. Reset is the explicit destructive form: it
+replaces modified tracked paths and colliding untracked files or directories.
+Dry-run performs the complete preflight without publishing either layer.
+
 The implementation follows builtin/read-tree.c, unpack-trees.c, and
 Documentation/git-read-tree.adoc from upstream Git. Tests cover replacement,
 emptying, binding, cached-change carry-forward, atomic failure, trivial
@@ -55,4 +65,5 @@ git-rs index stage listings.
 
 ~~~text
 cargo run --example read_tree -- REPOSITORY --merge BASE OURS THEIRS
+cargo run --example read_tree -- REPOSITORY --merge -u HEAD TARGET
 ~~~
