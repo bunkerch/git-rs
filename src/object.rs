@@ -248,8 +248,8 @@ fn object_path(id: ObjectId) -> PathBuf {
     PathBuf::from("objects").join(directory).join(file)
 }
 
-mod sha1 {
-    pub(super) fn digest(input: &[u8]) -> [u8; 20] {
+pub(crate) mod sha1 {
+    pub(crate) fn digest(input: &[u8]) -> [u8; 20] {
         let bit_length = (input.len() as u64).wrapping_mul(8);
         let blocks = (input.len() + 9).div_ceil(64);
         let mut padded = Vec::with_capacity(blocks * 64);

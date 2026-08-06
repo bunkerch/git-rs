@@ -24,6 +24,7 @@ Reference and branch APIs are covered in
 Loose objects are documented in [`docs/objects.md`](docs/objects.md).
 Typed trees and commits are documented in
 [`docs/trees-and-commits.md`](docs/trees-and-commits.md).
+Index versions 2–4 are documented in [`docs/index.md`](docs/index.md).
 
 To create a host-backed repository with the included example:
 
