@@ -1871,6 +1871,121 @@ mod tests {
         index
     }
 
+    #[test]
+    fn rejects_pack_with_bad_trailer_checksum() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let id = repository
+            .write_object(ObjectKind::Blob, b"valid")
+            .unwrap();
+        let source = repository.build_pack(&[id], &PackOptions::default()).unwrap();
+        let mut corrupt = source.pack().to_vec();
+        let len = corrupt.len();
+        corrupt[len - 1] ^= 1;
+        assert!(
+            repository
+                .validate_incoming_pack(
+                    &corrupt,
+                    &IncomingPackOptions {
+                        max_pack_size: 4096,
+                        max_object_size: 4096,
+                        max_total_inflated_size: 4096,
+                        use_deltas: false,
+                    },
+                )
+                .is_err(),
+            "bad checksum should be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_pack_with_truncated_trailer() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let id = repository
+            .write_object(ObjectKind::Blob, b"truncated")
+            .unwrap();
+        let source = repository.build_pack(&[id], &PackOptions::default()).unwrap();
+        let truncated = &source.pack()[..source.pack().len() - super::HASH_SIZE - 1];
+        assert!(
+            repository
+                .validate_incoming_pack(
+                    truncated,
+                    &IncomingPackOptions {
+                        max_pack_size: 4096,
+                        max_object_size: 4096,
+                        max_total_inflated_size: 4096,
+                        use_deltas: false,
+                    },
+                )
+                .is_err(),
+            "truncated pack should be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_pack_object_with_bad_crc32() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let contents = b"crc check";
+        let id = ObjectId::compute(ObjectKind::Blob, contents);
+        let size = u8::try_from(contents.len()).unwrap();
+        let mut entry = vec![0xb0 | (size & 15), size >> 4];
+        entry.extend(miniz_oxide::deflate::compress_to_vec_zlib(contents, 6));
+        let mut pack = b"PACK\0\0\0\x02\0\0\0\x01".to_vec();
+        pack.extend_from_slice(&entry);
+        let pack_checksum = sha1::digest(&pack);
+        pack.extend_from_slice(&pack_checksum);
+        let index = one_object_index(id, crc32(&entry) ^ 1, 12, pack_checksum);
+        fs.write(Path::new("repo/.git/objects/pack/badcrc.pack"), &pack)
+            .unwrap();
+        fs.write(Path::new("repo/.git/objects/pack/badcrc.idx"), &index)
+            .unwrap();
+
+        let reopened = Repository::open(fs, "repo").unwrap();
+        assert!(reopened.read_object(id, 1024).is_err());
+    }
+
+    #[test]
+    fn rejects_thin_ref_delta_when_base_is_missing() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let base = ObjectId::compute(ObjectKind::Blob, b"missing base");
+        let delta = [11, 10, 0x90, 6, 4, b'r', b'u', b's', b't'];
+        let mut entry = super::encode_object_header(7, delta.len() as u64);
+        entry.extend_from_slice(base.as_bytes());
+        entry.extend(miniz_oxide::deflate::compress_to_vec_zlib(&delta, 6));
+        let mut pack = b"PACK\0\0\0\x02\0\0\0\x01".to_vec();
+        pack.extend(entry);
+        pack.extend_from_slice(&sha1::digest(&pack));
+
+        assert!(
+            repository
+                .validate_incoming_pack(
+                    &pack,
+                    &IncomingPackOptions {
+                        max_pack_size: 1024,
+                        max_object_size: 1024,
+                        max_total_inflated_size: 1024,
+                        use_deltas: true,
+                    },
+                )
+                .is_err(),
+            "thin pack without base should be rejected"
+        );
+    }
+
+    #[test]
+    fn ofs_distance_encodes_and_decodes_large_offsets() {
+        for distance in [1, 127, 128, 16383, 16384, 1_000_000, 10_000_000, 1_000_000_000] {
+            let encoded = super::encode_ofs_distance(distance);
+            let mut cursor = 0;
+            let decoded = super::parse_ofs_distance(&encoded, &mut cursor).unwrap();
+            assert_eq!(decoded, distance, "OFS_DELTA round-trip failed for {distance}");
+            assert_eq!(cursor, encoded.len(), "OFS_DELTA consumed all bytes for {distance}");
+        }
+    }
+
     fn remove_loose(fs: &MemoryFileSystem, id: ObjectId) {
         let hex = id.to_string();
         let path = Path::new("repo/.git/objects")

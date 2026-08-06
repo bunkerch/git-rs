@@ -748,6 +748,27 @@ mod tests {
     }
 
     #[test]
+    fn generation_number_bounds_are_saturated_at_upper_limit() {
+        let repo =
+            Repository::init(MemoryFileSystem::new(), "repo", &InitOptions::default()).unwrap();
+        let mut parent = commit(&repo, &[], 1);
+        for i in 2..=260 {
+            parent = commit(&repo, &[parent], i);
+        }
+        repo.write_commit_graph(&[parent], &CommitGraphOptions::default())
+            .unwrap();
+        let graph = repo.read_commit_graph(1 << 20, 4096).unwrap();
+        for entry in graph.entries() {
+            assert!(
+                entry.generation() <= crate::commit_graph::MAX_GENERATION,
+                "generation {} exceeds MAX_GENERATION {}",
+                entry.generation(),
+                crate::commit_graph::MAX_GENERATION
+            );
+        }
+    }
+
+    #[test]
     fn ancestry_acceleration_is_disabled_by_replacement_refs() {
         let repo =
             Repository::init(MemoryFileSystem::new(), "repo", &InitOptions::default()).unwrap();

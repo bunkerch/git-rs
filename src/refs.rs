@@ -2517,6 +2517,45 @@ mod tests {
     }
 
     #[test]
+    fn expire_reflog_removes_old_entries() {
+        let (repository, _) = repository();
+        let name = ReferenceName::branch("main").unwrap();
+        let first = ObjectId::from_str(FIRST).unwrap();
+        let second = ObjectId::from_str(SECOND).unwrap();
+
+        repository
+            .update_reference_with_reflog(
+                &name,
+                first,
+                PreviousValue::MustNotExist,
+                &Signature::new("A", "a@example.com", 100, 0).unwrap(),
+                b"first",
+            )
+            .unwrap();
+        repository
+            .update_reference_with_reflog(
+                &name,
+                second,
+                PreviousValue::Any,
+                &Signature::new("B", "b@example.com", 200, 0).unwrap(),
+                b"second",
+            )
+            .unwrap();
+
+        let outcome = repository
+            .expire_reflog_before(
+                name.as_str(),
+                150,
+                &ReflogRewriteOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(outcome.removed, 1, "expected 1 entry expired (timestamp=100 < 150)");
+        let entries = repository.read_reflog(name.as_str()).unwrap();
+        assert_eq!(entries.len(), 1, "expected 1 entry remaining");
+        assert_eq!(entries[0].new_id(), second, "remaining entry should be the newer one");
+    }
+
+    #[test]
     fn mixed_transaction_updates_direct_and_symbolic_refs_atomically() {
         let (repository, fs) = repository();
         let first = ObjectId::from_str(FIRST).unwrap();

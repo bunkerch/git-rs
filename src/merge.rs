@@ -1329,7 +1329,8 @@ mod tests {
     };
     use crate::{
         CheckoutOptions, CommitBuilder, EntryMode, FileSystem, InitOptions, MemoryFileSystem,
-        ObjectKind, PreviousValue, ReferenceName, Repository, Signature, Tree, TreeEntry,
+        ObjectKind, PreviousValue, ReferenceName, ReferenceTarget, Repository, Signature, Tree,
+        TreeEntry,
     };
 
     #[test]
@@ -1957,6 +1958,143 @@ mod tests {
                 .entries()
                 .iter()
                 .all(|entry| entry.stage() == 0)
+        );
+    }
+
+    #[test]
+    fn ff_only_rejects_divergent_history() {
+        let (repository, _, signature) = repository();
+        let base = commit(&repository, &[], &[(&b"f"[..], b"base\n")], 1);
+        set_main(&repository, base);
+        checkout(&repository, base);
+
+        let ours = commit(&repository, &[base], &[(&b"f"[..], b"ours\n")], 2);
+        set_main(&repository, ours);
+        checkout(&repository, ours);
+        let theirs = commit(&repository, &[base], &[(&b"f"[..], b"theirs\n")], 3);
+
+        let result = repository.merge(
+            theirs,
+            &MergeOptions {
+                fast_forward: FastForwardMode::Only,
+                ..MergeOptions::default()
+            },
+            &signature,
+        );
+        assert!(result.is_err(), "ff-only should reject divergent history");
+    }
+
+    #[test]
+    fn modify_delete_conflict_is_detected() {
+        let (repository, _, signature) = repository();
+        let base = commit(&repository, &[], &[(&b"shared"[..], b"base\n")], 1);
+        set_main(&repository, base);
+        checkout(&repository, base);
+
+        let ours = commit(&repository, &[base], &[(&b"shared"[..], b"ours\n")], 2);
+        // theirs deletes "shared"
+        let theirs = commit(&repository, &[base], &[], 3);
+
+        let result = repository.merge_tree(
+            ours,
+            theirs,
+            &MergeTreeOptions {
+                merge_base: Some(base),
+                ..MergeTreeOptions::default()
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "modify/delete merge should produce conflicts: {result:?}"
+        );
+    }
+
+    #[test]
+    fn file_directory_conflict_is_detected() {
+        let (repository, _, signature) = repository();
+        let base = commit(&repository, &[], &[], 1);
+        set_main(&repository, base);
+        checkout(&repository, base);
+
+        // ours creates a file "path"
+        let ours = commit(&repository, &[base], &[(&b"path"[..], b"file content\n")], 2);
+        // theirs creates a directory with "path/file"
+        let theirs_blob = repository.write_object(ObjectKind::Blob, b"nested\n").unwrap();
+        let sub_tree = repository
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Blob, b"file".to_vec(), theirs_blob).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let identity = Signature::new("Merge", "merge@example.com", 3, 0).unwrap();
+        let theirs_tree = repository
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Tree, b"path".to_vec(), sub_tree).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let theirs = repository
+            .write_commit(
+                &CommitBuilder::new(theirs_tree, identity.clone(), identity)
+                    .parent(base)
+                    .message(b"theirs\n".to_vec())
+                    .build(),
+            )
+            .unwrap();
+
+        let result = repository.merge_tree(
+            ours,
+            theirs,
+            &MergeTreeOptions {
+                merge_base: Some(base),
+                ..MergeTreeOptions::default()
+            },
+        );
+        assert!(
+            result.is_err(),
+            "file/directory merge should be detected as error: {result:?}"
+        );
+    }
+
+    #[test]
+    fn unborn_merge_creates_first_commit() {
+        let (repository, _, signature) = repository();
+        // Repository has no commits yet (unborn)
+        let head_ref = repository.read_reference("HEAD").unwrap();
+        assert!(
+            matches!(head_ref.target(), ReferenceTarget::Symbolic(_)),
+            "fresh repo should have symbolic HEAD"
+        );
+
+        // Create a commit that would be the merge target
+        let blob_id = repository.write_object(ObjectKind::Blob, b"first\n").unwrap();
+        let tree = repository
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let first = repository
+            .write_commit(
+                &CommitBuilder::new(tree, signature.clone(), signature)
+                    .message(b"first\n".to_vec())
+                    .build(),
+            )
+            .unwrap();
+
+        // Set the branch target so HEAD resolves
+        set_main(&repository, first);
+
+        assert_eq!(
+            repository.resolve_reference("HEAD").unwrap(),
+            first,
+            "unborn repo should resolve HEAD after setting branch"
         );
     }
 
