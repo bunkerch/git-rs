@@ -27,6 +27,7 @@ pub struct Repository {
     work_tree: Option<PathBuf>,
     pub(crate) pack_indexes: Arc<RwLock<BTreeMap<PathBuf, Arc<crate::PackIndex>>>>,
     pub(crate) pack_data: Arc<RwLock<BTreeMap<PathBuf, Arc<Vec<u8>>>>>,
+    pub(crate) multi_pack_index: Arc<RwLock<Option<Arc<crate::MultiPackIndex>>>>,
     pub(crate) replacements: Arc<RwLock<Option<BTreeMap<crate::ObjectId, crate::ObjectId>>>>,
 }
 
@@ -44,6 +45,7 @@ impl Repository {
             work_tree: Some(work_tree),
             pack_indexes: Arc::new(RwLock::new(BTreeMap::new())),
             pack_data: Arc::new(RwLock::new(BTreeMap::new())),
+            multi_pack_index: Arc::new(RwLock::new(None)),
             replacements: Arc::new(RwLock::new(None)),
         }
     }
@@ -103,6 +105,7 @@ impl Repository {
             work_tree,
             pack_indexes: Arc::new(RwLock::new(BTreeMap::new())),
             pack_data: Arc::new(RwLock::new(BTreeMap::new())),
+            multi_pack_index: Arc::new(RwLock::new(None)),
             replacements: Arc::new(RwLock::new(None)),
         };
         repository.read_reference("HEAD")?;
@@ -157,6 +160,7 @@ impl Repository {
             work_tree,
             pack_indexes: Arc::new(RwLock::new(BTreeMap::new())),
             pack_data: Arc::new(RwLock::new(BTreeMap::new())),
+            multi_pack_index: Arc::new(RwLock::new(None)),
             replacements: Arc::new(RwLock::new(None)),
         };
         repository.write_atomic(

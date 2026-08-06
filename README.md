@@ -37,6 +37,8 @@ Repository-wide lock-scoped garbage collection is documented in
 [`docs/gc.md`](docs/gc.md).
 Git-compatible, storage-agnostic commit-graph generation and validation is
 documented in [`docs/commit-graph.md`](docs/commit-graph.md).
+Cached, Git-compatible multi-pack indexing is documented in
+[`docs/multi-pack-index.md`](docs/multi-pack-index.md).
 Full object and connectivity verification is documented in
 [`docs/fsck.md`](docs/fsck.md).
 Bounded loose, packed, duplicate, size, and garbage inventory is documented in

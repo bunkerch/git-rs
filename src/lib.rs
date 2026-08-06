@@ -30,6 +30,7 @@ pub mod log;
 pub mod ls_files;
 pub mod ls_tree;
 pub mod merge;
+pub mod multi_pack_index;
 pub mod notes;
 pub mod object;
 pub mod operations;
@@ -101,6 +102,9 @@ pub use ls_files::{LsFilesEntry, LsFilesKind, LsFilesOptions};
 pub use ls_tree::{LsTreeEntry, LsTreeOptions};
 pub use merge::{
     FastForwardMode, MergeOptions, MergeResult, ReplayKind, ReplayOptions, ReplayResult,
+};
+pub use multi_pack_index::{
+    MultiPackIndex, MultiPackIndexEntry, MultiPackIndexOptions, MultiPackIndexReport,
 };
 pub use notes::{DEFAULT_NOTES_REF, Note, NotesOptions};
 pub use object::{Object, ObjectId, ObjectKind};

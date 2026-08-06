@@ -361,6 +361,13 @@ impl Repository {
     }
 
     pub(crate) fn read_packed_object(&self, id: ObjectId, max_size: usize) -> Result<Object> {
+        if let Some((index_path, expected_offset)) = self.midx_object_location(id)? {
+            match self.read_indexed_object_at(&index_path, id, expected_offset, max_size) {
+                Ok(object) => return Ok(object),
+                Err(Error::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
         let directory = self.git_path("objects/pack");
         let paths = match self.filesystem().read_dir(&directory) {
             Ok(paths) => paths,
@@ -378,15 +385,36 @@ impl Repository {
             if index.find(id).is_none() {
                 continue;
             }
-            let pack_path = index_path.with_extension("pack");
-            let pack = self.cached_pack_data(&pack_path, &index)?;
-            let (kind, data) = resolve(&pack, &index, id, max_size, 0)?;
-            if ObjectId::compute(kind, &data) != id {
-                return invalid("resolved packed object hash mismatch");
-            }
-            return Ok(Object::from_parts(kind, data));
+            return self.read_indexed_object_at(
+                &index_path,
+                id,
+                index.find(id).expect("checked presence").offset,
+                max_size,
+            );
         }
         Err(Error::NotFound(self.git_path(object_label(id))))
+    }
+
+    fn read_indexed_object_at(
+        &self,
+        index_path: &Path,
+        id: ObjectId,
+        expected_offset: u64,
+        max_size: usize,
+    ) -> Result<Object> {
+        let index = self.cached_pack_index(index_path)?;
+        let entry = index
+            .find(id)
+            .ok_or_else(|| Error::NotFound(index_path.to_path_buf()))?;
+        if entry.offset != expected_offset {
+            return invalid("multi-pack-index offset disagrees with pack index");
+        }
+        let pack = self.cached_pack_data(&index_path.with_extension("pack"), &index)?;
+        let (kind, data) = resolve(&pack, &index, id, max_size, 0)?;
+        if ObjectId::compute(kind, &data) != id {
+            return invalid("resolved packed object hash mismatch");
+        }
+        Ok(Object::from_parts(kind, data))
     }
 
     pub(crate) fn validate_indexed_pack(
