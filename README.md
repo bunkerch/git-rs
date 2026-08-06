@@ -51,6 +51,8 @@ Ordered recursive and literal path-filtered tree inspection is documented in
 [`docs/ls-tree.md`](docs/ls-tree.md).
 Index and worktree inventory compatible with common `git ls-files` modes is
 documented in [`docs/ls-files.md`](docs/ls-files.md).
+Bounded fixed-string search across tracked worktree, index, and tree content is
+documented in [`docs/grep.md`](docs/grep.md).
 Deterministic TAR and ZIP export of stored trees is documented in
 [`docs/archive.md`](docs/archive.md).
 Committing the index, including unborn, amend, merge, and detached behavior, is

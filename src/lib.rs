@@ -14,6 +14,7 @@ pub mod error;
 pub mod fetch;
 pub mod fs;
 pub mod fsck;
+pub mod grep;
 pub mod ignore;
 pub mod index;
 pub mod linked_worktree;
@@ -68,6 +69,7 @@ pub use fetch::{
 };
 pub use fs::{FileStat, FileSystem, HostFileSystem, MemoryFileSystem, Metadata};
 pub use fsck::{FsckOptions, FsckReport};
+pub use grep::{GrepBinaryMode, GrepMatch, GrepOptions, GrepTarget};
 pub use ignore::{IgnoreMatcher, IgnoreRule};
 pub use index::{Index, IndexEntry, IndexExtension, IndexVersion, StatData};
 pub use linked_worktree::{AddWorktreeOptions, LinkedWorktreeInfo, WorktreeTarget};
