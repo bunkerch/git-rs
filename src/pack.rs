@@ -38,6 +38,48 @@ pub struct IncomingPackOptions {
     pub use_deltas: bool,
 }
 
+/// Resource limits for verifying an indexed pack.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifyPackOptions {
+    pub max_pack_size: usize,
+    pub max_object_size: usize,
+    pub max_total_inflated_size: usize,
+    pub max_objects: usize,
+    pub max_delta_depth: usize,
+}
+
+impl Default for VerifyPackOptions {
+    fn default() -> Self {
+        Self {
+            max_pack_size: 1024 * 1024 * 1024,
+            max_object_size: 1024 * 1024 * 1024,
+            max_total_inflated_size: 2 * 1024 * 1024 * 1024,
+            max_objects: 10_000_000,
+            max_delta_depth: MAX_DELTA_DEPTH,
+        }
+    }
+}
+
+/// One object row from Git's verbose `verify-pack` report.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedPackObject {
+    pub id: ObjectId,
+    pub kind: ObjectKind,
+    pub size: usize,
+    pub packed_size: usize,
+    pub offset: u64,
+    pub delta_depth: usize,
+    pub base: Option<ObjectId>,
+}
+
+/// Integrity result and delta-chain statistics for one pack/index pair.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifyPackReport {
+    pub objects: Vec<VerifiedPackObject>,
+    pub delta_histogram: std::collections::BTreeMap<usize, usize>,
+    pub pack_size: usize,
+}
+
 impl Default for IncomingPackOptions {
     fn default() -> Self {
         Self {
@@ -252,6 +294,81 @@ impl PackIndex {
 }
 
 impl Repository {
+    /// Verify an index and its sibling pack and return verbose object metadata.
+    ///
+    /// `index_path` is relative to the configured filesystem root, as are paths
+    /// returned by [`Repository::write_pack`]. No host filesystem access occurs.
+    ///
+    /// # Errors
+    /// Returns an error for unsafe paths, missing/corrupt index or pack data,
+    /// checksum/CRC/object-ID disagreement, malformed deltas, or exceeded limits.
+    pub fn verify_pack(
+        &self,
+        index_path: impl AsRef<Path>,
+        options: &VerifyPackOptions,
+    ) -> Result<VerifyPackReport> {
+        let index_path = crate::fs::normalize_path(index_path.as_ref())?;
+        if index_path.extension().and_then(|value| value.to_str()) != Some("idx") {
+            return invalid("verify-pack requires an .idx path");
+        }
+        let index = self.cached_pack_index(&index_path)?;
+        if index.entries().len() > options.max_objects {
+            return invalid("pack object count exceeds verification limit");
+        }
+        let pack_path = index_path.with_extension("pack");
+        let declared_pack_size = self.filesystem().metadata(&pack_path)?.len();
+        if declared_pack_size > options.max_pack_size as u64 {
+            return Err(Error::ObjectTooLarge {
+                declared: declared_pack_size,
+                limit: options.max_pack_size,
+            });
+        }
+        let pack = self.cached_pack_data(&pack_path, &index)?;
+        let mut objects = Vec::with_capacity(index.entries().len());
+        let mut delta_histogram = std::collections::BTreeMap::new();
+        let mut total = 0_usize;
+        for entry in index.entries() {
+            let (kind, data) = resolve(&pack, &index, entry.id, options.max_object_size, 0)?;
+            if ObjectId::compute(kind, &data) != entry.id {
+                return invalid("resolved packed object hash mismatch");
+            }
+            total = total.checked_add(data.len()).ok_or(Error::ObjectTooLarge {
+                declared: u64::MAX,
+                limit: options.max_total_inflated_size,
+            })?;
+            if total > options.max_total_inflated_size {
+                return Err(Error::ObjectTooLarge {
+                    declared: total as u64,
+                    limit: options.max_total_inflated_size,
+                });
+            }
+            let (delta_depth, base) =
+                delta_metadata(&pack, &index, *entry, options.max_delta_depth)?;
+            if delta_depth > 0 {
+                *delta_histogram.entry(delta_depth).or_insert(0) += 1;
+            }
+            let end = index.object_end(entry.offset, pack.len() - HASH_SIZE)?;
+            let start = usize::try_from(entry.offset).map_err(|_| pack_error("offset overflow"))?;
+            objects.push(VerifiedPackObject {
+                id: entry.id,
+                kind,
+                size: data.len(),
+                packed_size: end
+                    .checked_sub(start)
+                    .ok_or_else(|| pack_error("invalid object bounds"))?,
+                offset: entry.offset,
+                delta_depth,
+                base,
+            });
+        }
+        objects.sort_unstable_by_key(|object| object.offset);
+        Ok(VerifyPackReport {
+            objects,
+            delta_histogram,
+            pack_size: pack.len(),
+        })
+    }
+
     /// Build a deterministic pack containing the requested objects.
     ///
     /// Duplicate IDs are emitted once. Source objects may be loose or packed,
@@ -499,6 +616,65 @@ impl Repository {
             .or_insert_with(|| Arc::clone(&bytes))
             .clone())
     }
+}
+
+fn delta_metadata(
+    pack: &[u8],
+    index: &PackIndex,
+    entry: PackIndexEntry,
+    max_depth: usize,
+) -> Result<(usize, Option<ObjectId>)> {
+    let mut current = entry;
+    let mut first_base = None;
+    let mut depth = 0_usize;
+    let mut seen = std::collections::BTreeSet::new();
+    while seen.insert(current.id) {
+        let start = usize::try_from(current.offset).map_err(|_| pack_error("offset overflow"))?;
+        let end = index.object_end(current.offset, pack.len() - HASH_SIZE)?;
+        let encoded = pack
+            .get(start..end)
+            .ok_or_else(|| pack_error("object bounds outside pack"))?;
+        let (object_type, _, mut cursor) = parse_object_header(encoded)?;
+        let base = match object_type {
+            1..=4 => return Ok((depth, first_base)),
+            6 => {
+                let distance = parse_ofs_distance(encoded, &mut cursor)?;
+                let base_offset = current
+                    .offset
+                    .checked_sub(distance)
+                    .ok_or_else(|| pack_error("invalid OFS_DELTA base"))?;
+                index
+                    .entries()
+                    .iter()
+                    .find(|candidate| candidate.offset == base_offset)
+                    .copied()
+                    .ok_or_else(|| pack_error("OFS_DELTA base is absent"))?
+            }
+            7 => {
+                let bytes = encoded
+                    .get(cursor..cursor + HASH_SIZE)
+                    .ok_or_else(|| pack_error("truncated REF_DELTA"))?;
+                let id = ObjectId::from_bytes(
+                    bytes
+                        .try_into()
+                        .map_err(|_| pack_error("invalid REF_DELTA base length"))?,
+                );
+                index
+                    .find(id)
+                    .ok_or_else(|| pack_error("REF_DELTA base is absent"))?
+            }
+            _ => return invalid("reserved packed object type"),
+        };
+        first_base.get_or_insert(base.id);
+        depth = depth
+            .checked_add(1)
+            .ok_or_else(|| pack_error("delta depth overflow"))?;
+        if depth > max_depth {
+            return invalid("delta chain exceeds verification limit");
+        }
+        current = base;
+    }
+    invalid("delta cycle")
 }
 
 struct PackSource {
@@ -1354,8 +1530,8 @@ mod tests {
     use super::{PackIndex, apply_delta, crc32};
     use crate::object::sha1;
     use crate::{
-        FileSystem, IncomingPackOptions, InitOptions, MemoryFileSystem, ObjectId, ObjectKind,
-        PackOptions, Repository,
+        Error, FileSystem, IncomingPackOptions, InitOptions, MemoryFileSystem, ObjectId,
+        ObjectKind, PackOptions, Repository,
     };
 
     #[test]
@@ -1444,6 +1620,87 @@ mod tests {
         let object = repository.read_object(target, 8192).unwrap();
         assert_eq!(object.kind(), ObjectKind::Blob);
         assert_eq!(object.data(), target_data);
+    }
+
+    #[test]
+    fn verifies_pack_objects_and_delta_histogram() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs, "repo", &InitOptions::default()).unwrap();
+        let base_data = vec![b'a'; 4096];
+        let mut target_data = base_data.clone();
+        target_data[2048..2052].copy_from_slice(b"rust");
+        let base = repository
+            .write_object(ObjectKind::Blob, &base_data)
+            .unwrap();
+        let target = repository
+            .write_object(ObjectKind::Blob, &target_data)
+            .unwrap();
+        let written = repository
+            .write_pack(&[base, target], &PackOptions::default())
+            .unwrap();
+
+        let report = repository
+            .verify_pack(&written.index_path, &super::VerifyPackOptions::default())
+            .unwrap();
+        assert_eq!(report.objects.len(), 2);
+        let base_row = report.objects.iter().find(|row| row.id == base).unwrap();
+        assert_eq!(
+            (
+                base_row.kind,
+                base_row.size,
+                base_row.delta_depth,
+                base_row.base
+            ),
+            (ObjectKind::Blob, 4096, 0, None)
+        );
+        let target_row = report.objects.iter().find(|row| row.id == target).unwrap();
+        assert_eq!(
+            (
+                target_row.kind,
+                target_row.size,
+                target_row.delta_depth,
+                target_row.base
+            ),
+            (ObjectKind::Blob, 4096, 1, Some(base))
+        );
+        assert_eq!(report.delta_histogram.get(&1), Some(&1));
+        assert!(report.objects.iter().all(|row| row.packed_size > 0));
+        assert!(
+            report
+                .objects
+                .windows(2)
+                .all(|rows| rows[0].offset < rows[1].offset)
+        );
+    }
+
+    #[test]
+    fn verify_pack_rejects_corruption_and_resource_exhaustion() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let id = repository
+            .write_object(ObjectKind::Blob, &[b'x'; 128])
+            .unwrap();
+        let written = repository
+            .write_pack(&[id], &PackOptions::default())
+            .unwrap();
+        let limited = super::VerifyPackOptions {
+            max_object_size: 64,
+            ..super::VerifyPackOptions::default()
+        };
+        assert!(matches!(
+            repository.verify_pack(&written.index_path, &limited),
+            Err(Error::ObjectTooLarge { .. })
+        ));
+
+        let mut pack = fs.read(&written.pack_path).unwrap();
+        pack[12] ^= 1;
+        fs.write(&written.pack_path, &pack).unwrap();
+        let reopened = Repository::open(fs, "repo").unwrap();
+        assert!(
+            reopened
+                .verify_pack(&written.index_path, &super::VerifyPackOptions::default())
+                .is_err()
+        );
     }
 
     #[test]

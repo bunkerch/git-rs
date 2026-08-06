@@ -159,7 +159,7 @@ pub use object::{Object, ObjectId, ObjectKind};
 pub use operations::{ResetMode, ResetOptions, SwitchOptions};
 pub use pack::{
     IncomingPackOptions, PackBundle, PackIndex, PackIndexEntry, PackOptions, ValidatedPack,
-    WrittenPack,
+    VerifiedPackObject, VerifyPackOptions, VerifyPackReport, WrittenPack,
 };
 pub use pack_refs::{PackRefsOptions, PackRefsResult};
 pub use protocol::{Capability, PktLine, PktLineDecoder, Sideband};
