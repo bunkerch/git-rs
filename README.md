@@ -40,6 +40,8 @@ documented in [`docs/commit.md`](docs/commit.md).
 Index versions 2–4 are documented in [`docs/index.md`](docs/index.md).
 Worktree staging and index-to-tree writing are documented in
 [`docs/worktree.md`](docs/worktree.md).
+Path-level index/worktree restoration is documented in
+[`docs/restore.md`](docs/restore.md).
 Staged, unstaged, unmerged, and untracked reporting is documented in
 [`docs/status.md`](docs/status.md).
 Ref-moving operations and their logs are documented in

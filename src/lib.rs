@@ -23,6 +23,7 @@ pub mod refs;
 pub mod refspec;
 pub mod remote;
 pub mod repository;
+pub mod restore;
 pub mod revision;
 pub mod revparse;
 pub mod stash;
@@ -70,6 +71,7 @@ pub use refs::{
 pub use refspec::{RefSpec, RefSpecKind};
 pub use remote::{Remote, RemoveRemoteResult};
 pub use repository::{InitOptions, Repository};
+pub use restore::{RestoreOptions, RestoreTarget};
 pub use revision::{GraphOptions, Revision, RevisionWalkOptions};
 pub use revparse::{ResolvedObject, RevisionOptions};
 pub use stash::{StashApplyOptions, StashApplyResult, StashEntry, StashPushOptions};
