@@ -585,21 +585,44 @@ pub(crate) fn merge_text(
     max_lines: usize,
     max_trace_cells: usize,
 ) -> Result<(Vec<u8>, bool)> {
+    let (data, conflicts) = merge_text_configured(
+        base_data,
+        ours_data,
+        theirs_data,
+        &crate::MergeFileOptions {
+            current_label: ours_label.to_vec(),
+            other_label: theirs_label.to_vec(),
+            max_lines,
+            max_trace_cells,
+            ..crate::MergeFileOptions::default()
+        },
+    )?;
+    Ok((data, conflicts != 0))
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn merge_text_configured(
+    base_data: &[u8],
+    ours_data: &[u8],
+    theirs_data: &[u8],
+    options: &crate::MergeFileOptions,
+) -> Result<(Vec<u8>, usize)> {
     let base = split_lines(base_data);
     let ours = split_lines(ours_data);
     let theirs = split_lines(theirs_data);
-    if base.len().max(ours.len()).max(theirs.len()) > max_lines {
+    if base.len().max(ours.len()).max(theirs.len()) > options.max_lines {
         return Err(Error::InvalidRepository(format!(
-            "text merge exceeds {max_lines} lines"
+            "text merge exceeds {} lines",
+            options.max_lines
         )));
     }
-    let ours_changes = line_changes(&base, &ours, max_trace_cells)?;
-    let theirs_changes = line_changes(&base, &theirs, max_trace_cells)?;
+    let ours_changes = line_changes(&base, &ours, options.max_trace_cells)?;
+    let theirs_changes = line_changes(&base, &theirs, options.max_trace_cells)?;
     let mut output = Vec::new();
     let mut base_position = 0usize;
     let mut ours_position = 0usize;
     let mut theirs_position = 0usize;
-    let mut conflicted = false;
+    let mut conflicts = 0usize;
     while ours_position < ours_changes.len() || theirs_position < theirs_changes.len() {
         let ours_change = ours_changes.get(ours_position);
         let theirs_change = theirs_changes.get(theirs_position);
@@ -644,16 +667,63 @@ pub(crate) fn merge_text(
                 if ours_region == theirs_region {
                     output.extend_from_slice(&ours_region);
                 } else {
-                    conflicted = true;
-                    output.extend_from_slice(b"<<<<<<< ");
-                    output.extend_from_slice(ours_label);
-                    output.push(b'\n');
-                    append_with_terminal_newline(&mut output, &ours_region);
-                    output.extend_from_slice(b"=======\n");
-                    append_with_terminal_newline(&mut output, &theirs_region);
-                    output.extend_from_slice(b">>>>>>> ");
-                    output.extend_from_slice(theirs_label);
-                    output.push(b'\n');
+                    let (prefix, ours_region, theirs_region, suffix) =
+                        if options.style == crate::MergeFileStyle::Diff3 {
+                            (Vec::new(), ours_region, theirs_region, Vec::new())
+                        } else {
+                            trim_common_conflict_lines(&ours_region, &theirs_region)
+                        };
+                    output.extend_from_slice(&prefix);
+                    let base_region = base[start..end]
+                        .iter()
+                        .copied()
+                        .flatten()
+                        .copied()
+                        .collect::<Vec<_>>();
+                    let marker_eol =
+                        conflict_marker_eol(&ours_region, &base_region, &theirs_region);
+                    match options.favor {
+                        crate::MergeFileFavor::Ours => output.extend_from_slice(&ours_region),
+                        crate::MergeFileFavor::Theirs => output.extend_from_slice(&theirs_region),
+                        crate::MergeFileFavor::Union => {
+                            output.extend_from_slice(&ours_region);
+                            output.extend_from_slice(&theirs_region);
+                        }
+                        crate::MergeFileFavor::Normal => {
+                            conflicts = conflicts.saturating_add(1);
+                            append_marker(
+                                &mut output,
+                                b'<',
+                                options.marker_size,
+                                &options.current_label,
+                                marker_eol,
+                            );
+                            append_with_terminal_newline(&mut output, &ours_region, marker_eol);
+                            if matches!(
+                                options.style,
+                                crate::MergeFileStyle::Diff3 | crate::MergeFileStyle::ZDiff3
+                            ) {
+                                append_marker(
+                                    &mut output,
+                                    b'|',
+                                    options.marker_size,
+                                    &options.base_label,
+                                    marker_eol,
+                                );
+                                append_with_terminal_newline(&mut output, &base_region, marker_eol);
+                            }
+                            append_marker(&mut output, b'=', options.marker_size, b"", marker_eol);
+                            append_with_terminal_newline(&mut output, &theirs_region, marker_eol);
+                            append_marker(
+                                &mut output,
+                                b'>',
+                                options.marker_size,
+                                &options.other_label,
+                                marker_eol,
+                            );
+                        }
+                    }
+                    output.extend_from_slice(&suffix);
                 }
                 base_position = end;
                 ours_position = ours_end;
@@ -671,7 +741,62 @@ pub(crate) fn merge_text(
         }
     }
     output.extend(base[base_position..].iter().copied().flatten());
-    Ok((output, conflicted))
+    if output.len() > options.max_output_size {
+        return Err(Error::InvalidRepository(
+            "merge-file output exceeds size limit".into(),
+        ));
+    }
+    Ok((output, conflicts))
+}
+
+fn append_marker(output: &mut Vec<u8>, marker: u8, size: usize, label: &[u8], eol: &[u8]) {
+    output.extend(std::iter::repeat_n(marker, size));
+    if !label.is_empty() {
+        output.push(b' ');
+        output.extend_from_slice(label);
+    }
+    output.extend_from_slice(eol);
+}
+
+fn conflict_marker_eol(ours: &[u8], base: &[u8], theirs: &[u8]) -> &'static [u8] {
+    if [ours, base, theirs].iter().any(|data| {
+        data.windows(2).any(|window| window == b"\r\n")
+            && !data.iter().enumerate().any(|(index, byte)| {
+                *byte == b'\n' && index.checked_sub(1).and_then(|i| data.get(i)) != Some(&b'\r')
+            })
+    }) {
+        b"\r\n"
+    } else {
+        b"\n"
+    }
+}
+
+fn trim_common_conflict_lines(ours: &[u8], theirs: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let ours_lines = split_lines(ours);
+    let theirs_lines = split_lines(theirs);
+    let prefix = ours_lines
+        .iter()
+        .zip(&theirs_lines)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let remaining = ours_lines
+        .len()
+        .min(theirs_lines.len())
+        .saturating_sub(prefix);
+    let suffix = ours_lines[prefix..]
+        .iter()
+        .rev()
+        .zip(theirs_lines[prefix..].iter().rev())
+        .take(remaining)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let flatten = |lines: &[&[u8]]| lines.iter().copied().flatten().copied().collect::<Vec<_>>();
+    (
+        flatten(&ours_lines[..prefix]),
+        flatten(&ours_lines[prefix..ours_lines.len() - suffix]),
+        flatten(&theirs_lines[prefix..theirs_lines.len() - suffix]),
+        flatten(&ours_lines[ours_lines.len() - suffix..]),
+    )
 }
 
 fn line_changes<'a>(
@@ -765,10 +890,10 @@ fn append_change(
     *base_position = change.end;
 }
 
-fn append_with_terminal_newline(output: &mut Vec<u8>, value: &[u8]) {
+fn append_with_terminal_newline(output: &mut Vec<u8>, value: &[u8], eol: &[u8]) {
     output.extend_from_slice(value);
     if !value.ends_with(b"\n") {
-        output.push(b'\n');
+        output.extend_from_slice(eol);
     }
 }
 

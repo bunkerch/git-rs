@@ -35,6 +35,7 @@ pub mod ls_tree;
 pub mod mailmap;
 pub mod maintenance;
 pub mod merge;
+pub mod merge_file;
 pub mod multi_pack_index;
 pub mod name_rev;
 pub mod notes;
@@ -120,6 +121,9 @@ pub use maintenance::{MaintenanceOptions, MaintenanceOutcome, MaintenanceReport,
 pub use merge::{
     FastForwardMode, MergeOptions, MergeResult, MergeTreeConflict, MergeTreeOptions,
     MergeTreeResult, MergeTreeStage, ReplayKind, ReplayOptions, ReplayResult,
+};
+pub use merge_file::{
+    MergeFileFavor, MergeFileOptions, MergeFileResult, MergeFileStyle, merge_file,
 };
 pub use multi_pack_index::{
     MultiPackIndex, MultiPackIndexEntry, MultiPackIndexOptions, MultiPackIndexReport,
