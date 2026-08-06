@@ -219,23 +219,20 @@ impl Repository {
     }
 
     fn enable_relative_worktrees(&self) -> Result<()> {
-        let bytes = self.filesystem().read(&self.common_dir().join("config"))?;
-        let mut config = String::from_utf8(bytes)
-            .map_err(|_| Error::InvalidRepository("config is not UTF-8".into()))?;
-        if config.contains("relativeWorktrees = true")
-            || config.contains("relativeworktrees = true")
+        let mut config = self.read_config()?;
+        if config.get("extensions.relativeworktrees")?.is_some()
+            && config.get_bool("extensions.relativeworktrees")?
         {
             return Ok(());
         }
-        let version = "\trepositoryformatversion = 0\n";
-        if !config.contains(version) {
+        if config.get_i64("core.repositoryformatversion")? != 0 {
             return Err(Error::InvalidRepository(
                 "cannot enable relative worktrees for unknown repository format".into(),
             ));
         }
-        config = config.replacen(version, "\trepositoryformatversion = 1\n", 1);
-        config.push_str("[extensions]\n\trelativeWorktrees = true\n");
-        self.write_atomic(Path::new("config"), config.as_bytes())
+        config.set("core.repositoryformatversion", b"1")?;
+        config.set("extensions.relativeworktrees", b"true")?;
+        self.write_config(&config)
     }
 }
 
@@ -450,9 +447,9 @@ mod tests {
         );
         repository.remove_worktree("detached-work", false).unwrap();
 
-        let config = String::from_utf8(repository.read_git_file("config").unwrap()).unwrap();
-        assert!(config.contains("repositoryformatversion = 1"));
-        assert!(config.contains("relativeWorktrees = true"));
+        let config = repository.read_config().unwrap();
+        assert_eq!(config.get_i64("core.repositoryformatversion").unwrap(), 1);
+        assert!(config.get_bool("extensions.relativeworktrees").unwrap());
 
         filesystem
             .write(Path::new("topic-work/file"), b"dirty\n")

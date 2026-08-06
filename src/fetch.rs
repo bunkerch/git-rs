@@ -1,7 +1,6 @@
 //! Transport-neutral fetch and clone orchestration.
 
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -429,30 +428,31 @@ impl Repository {
     }
 
     fn write_clone_config(&self, options: &CloneOptions, branch: &str) -> Result<()> {
-        let mut config = self.read_git_file("config")?;
+        let mut config = self.read_config()?;
         let fetch_destination = if options.bare {
             "refs/heads/*".to_owned()
         } else {
             format!("refs/remotes/{}/*", options.remote_name)
         };
-        let mut remote = format!(
-            "[remote \"{}\"]\n\turl = {}\n\tfetch = +refs/heads/*:{}\n",
-            config_subsection(&options.remote_name)?,
-            config_value(&options.remote_url)?,
-            fetch_destination,
-        );
+        config.set(
+            &format!("remote.{}.url", options.remote_name),
+            options.remote_url.as_bytes(),
+        )?;
+        config.set(
+            &format!("remote.{}.fetch", options.remote_name),
+            format!("+refs/heads/*:{fetch_destination}"),
+        )?;
         if !options.bare {
-            write!(
-                remote,
-                "[branch \"{}\"]\n\tremote = {}\n\tmerge = refs/heads/{}\n",
-                config_subsection(branch)?,
-                options.remote_name,
-                branch,
-            )
-            .expect("writing to a String cannot fail");
+            config.set(
+                &format!("branch.{branch}.remote"),
+                options.remote_name.as_bytes(),
+            )?;
+            config.set(
+                &format!("branch.{branch}.merge"),
+                format!("refs/heads/{branch}"),
+            )?;
         }
-        config.extend_from_slice(remote.as_bytes());
-        self.write_atomic(Path::new("config"), &config)
+        self.write_config(&config)
     }
 }
 
@@ -547,23 +547,6 @@ fn validate_remote_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn config_value(value: &str) -> Result<String> {
-    if value.contains(['\0', '\n', '\r']) {
-        return Err(Error::InvalidRepository("unsafe config value".into()));
-    }
-    Ok(format!(
-        "\"{}\"",
-        value.replace('\\', "\\\\").replace('"', "\\\"")
-    ))
-}
-
-fn config_subsection(value: &str) -> Result<String> {
-    if value.contains(['\0', '\n', '\r']) {
-        return Err(Error::InvalidRepository("unsafe config subsection".into()));
-    }
-    Ok(value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
 fn append_packet(output: &mut Vec<u8>, data: &[u8]) -> Result<()> {
     output.extend(PktLine::Data(data.to_vec()).encode()?);
     Ok(())
@@ -617,9 +600,15 @@ mod tests {
             fs.read(Path::new("clone/file.txt")).unwrap(),
             b"hello from clone\n"
         );
-        let config = String::from_utf8(clone.read_git_file("config").unwrap()).unwrap();
-        assert!(config.contains("url = \"memory://remote\""));
-        assert!(config.contains("fetch = +refs/heads/*:refs/remotes/origin/*"));
+        let config = clone.read_config().unwrap();
+        assert_eq!(
+            config.get("remote.origin.url").unwrap().unwrap().value(),
+            Some(b"memory://remote".as_slice())
+        );
+        assert_eq!(
+            config.get("remote.origin.fetch").unwrap().unwrap().value(),
+            Some(b"+refs/heads/*:refs/remotes/origin/*".as_slice())
+        );
         assert!(result.received_objects >= 3);
     }
 
@@ -706,9 +695,12 @@ mod tests {
             topic_tip
         );
         assert!(clone.resolve_reference("refs/remotes/origin/main").is_err());
-        let config = String::from_utf8(clone.read_git_file("config").unwrap()).unwrap();
-        assert!(config.contains("fetch = +refs/heads/*:refs/heads/*"));
-        assert!(!config.contains("[branch \"main\"]"));
+        let config = clone.read_config().unwrap();
+        assert_eq!(
+            config.get("remote.origin.fetch").unwrap().unwrap().value(),
+            Some(b"+refs/heads/*:refs/heads/*".as_slice())
+        );
+        assert!(config.get("branch.main.remote").unwrap().is_none());
     }
 
     #[test]

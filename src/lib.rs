@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 pub mod commit;
+pub mod config;
 pub mod diff;
 pub mod error;
 pub mod fetch;
@@ -24,6 +25,7 @@ pub mod upload_pack;
 pub mod worktree;
 
 pub use commit::{Commit, CommitBuilder, ExtraHeader, Signature};
+pub use config::{Config, ConfigEntry};
 pub use diff::{DiffEntry, DiffKind, DiffOptions};
 pub use error::{Error, Result};
 pub use fetch::{
