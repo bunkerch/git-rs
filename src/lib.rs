@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 pub mod archive;
+pub mod bisect;
 pub mod branch;
 pub mod bundle;
 pub mod clean;
@@ -45,6 +46,7 @@ pub mod upload_pack;
 pub mod worktree;
 
 pub use archive::{ArchiveFormat, ArchiveOptions};
+pub use bisect::{BisectMark, BisectOptions, BisectOutcome, BisectState};
 pub use branch::{DeleteBranchOptions, RenameBranchOptions};
 pub use bundle::{
     BundleCreateOptions, BundleParseOptions, BundlePrerequisite, BundleReference, BundleVersion,
