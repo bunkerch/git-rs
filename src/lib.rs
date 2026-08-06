@@ -8,6 +8,7 @@ pub mod bisect;
 pub mod blame;
 pub mod branch;
 pub mod bundle;
+pub mod checkout_index;
 pub mod cherry;
 pub mod clean;
 pub mod commit;
@@ -88,6 +89,9 @@ pub use branch::{DeleteBranchOptions, RenameBranchOptions};
 pub use bundle::{
     BundleCreateOptions, BundleParseOptions, BundlePrerequisite, BundleReference, BundleVersion,
     GitBundle,
+};
+pub use checkout_index::{
+    CheckoutIndexEntry, CheckoutIndexOptions, CheckoutIndexResult, CheckoutIndexStage,
 };
 pub use cherry::{CherryCommit, CherryOptions};
 pub use clean::{CleanEntry, CleanIgnoredMode, CleanOptions};
