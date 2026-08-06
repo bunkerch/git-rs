@@ -47,6 +47,8 @@ Transport-neutral push orchestration is documented in
 [`docs/push.md`](docs/push.md).
 Typed trees and commits are documented in
 [`docs/trees-and-commits.md`](docs/trees-and-commits.md).
+Ordered recursive and literal path-filtered tree inspection is documented in
+[`docs/ls-tree.md`](docs/ls-tree.md).
 Deterministic TAR and ZIP export of stored trees is documented in
 [`docs/archive.md`](docs/archive.md).
 Committing the index, including unborn, amend, merge, and detached behavior, is

@@ -16,6 +16,7 @@ pub mod fsck;
 pub mod ignore;
 pub mod index;
 pub mod linked_worktree;
+pub mod ls_tree;
 pub mod merge;
 pub mod notes;
 pub mod object;
@@ -67,6 +68,7 @@ pub use fsck::{FsckOptions, FsckReport};
 pub use ignore::{IgnoreMatcher, IgnoreRule};
 pub use index::{Index, IndexEntry, IndexExtension, IndexVersion, StatData};
 pub use linked_worktree::{AddWorktreeOptions, LinkedWorktreeInfo, WorktreeTarget};
+pub use ls_tree::{LsTreeEntry, LsTreeOptions};
 pub use merge::{
     FastForwardMode, MergeOptions, MergeResult, ReplayKind, ReplayOptions, ReplayResult,
 };
