@@ -19,6 +19,7 @@ pub mod describe;
 pub mod diff;
 pub mod error;
 pub mod fetch;
+pub mod for_each_ref;
 pub mod format_patch;
 pub mod fs;
 pub mod fsck;
@@ -96,6 +97,7 @@ pub use fetch::{
     CloneOptions, FetchOptions, FetchResult, RemoteAdvertisement, RemoteRef, RepositoryTransport,
     RepositoryV2Transport, UploadPackTransport, UploadPackV2Transport,
 };
+pub use for_each_ref::{ForEachRefEntry, ForEachRefOptions, RefSortField, RefSortKey};
 pub use format_patch::{FormatPatch, FormatPatchNumbering, FormatPatchOptions};
 pub use fs::{FileStat, FileSystem, HostFileSystem, MemoryFileSystem, Metadata};
 pub use fsck::{FsckOptions, FsckReport};
