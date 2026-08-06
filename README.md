@@ -48,6 +48,8 @@ Fast-forward, three-way, conflict, continue, and abort behavior is documented
 in [`docs/merge.md`](docs/merge.md).
 Cherry-pick and revert behavior is documented in
 [`docs/replay.md`](docs/replay.md).
+Typed tree/index differences and unified patches are documented in
+[`docs/diff.md`](docs/diff.md).
 
 To create a host-backed repository with the included example:
 
