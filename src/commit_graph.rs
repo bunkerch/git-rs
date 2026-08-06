@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use crate::object::sha1;
-use crate::{Commit, Error, ObjectId, ObjectKind, Repository, Result};
+use crate::{
+    AnnotatedTag, Commit, Error, ObjectId, ObjectKind, ReferenceTarget, Repository, Result,
+};
 
 const PATH: &str = "objects/info/commit-graph";
 const NO_PARENT: u32 = 0x7000_0000;
@@ -18,6 +20,9 @@ pub struct CommitGraphOptions {
     pub max_commits: usize,
     pub max_object_size: usize,
     pub max_file_size: usize,
+    pub max_references: usize,
+    pub max_reference_depth: usize,
+    pub max_tag_depth: usize,
     pub force: bool,
     pub dry_run: bool,
 }
@@ -28,6 +33,9 @@ impl Default for CommitGraphOptions {
             max_commits: 10_000_000,
             max_object_size: 1024 * 1024 * 1024,
             max_file_size: 4 * 1024 * 1024 * 1024usize,
+            max_references: 1_000_000,
+            max_reference_depth: 4096,
+            max_tag_depth: 64,
             force: false,
             dry_run: false,
         }
@@ -360,11 +368,7 @@ impl Repository {
                 ))
             })
             .collect::<Result<HashMap<_, _>>>()?;
-        let mut generations = HashMap::new();
-        let mut visiting = HashSet::new();
-        for id in &ids {
-            generation(*id, &commits, &mut generations, &mut visiting)?;
-        }
+        let generations = compute_generations(&commits)?;
         let (bytes, extra_edges) = encode(&ids, &positions, &commits, &generations)?;
         if bytes.len() > options.max_file_size {
             return Err(Error::ObjectTooLarge {
@@ -387,6 +391,80 @@ impl Repository {
             bytes: bytes.len(),
             changed,
         })
+    }
+
+    /// Discover referenced commits and write their complete reachable graph.
+    ///
+    /// Direct and symbolic refs below `refs/`, plus `HEAD`, are inspected.
+    /// Annotated tags are peeled with declared-type validation; refs ending at
+    /// blobs or trees do not contribute roots.
+    ///
+    /// # Errors
+    /// Returns an error for malformed/broken refs or objects, tag cycles and
+    /// type mismatches, exceeded limits, lock contention, or storage failures.
+    pub fn write_commit_graph_reachable(
+        &self,
+        options: &CommitGraphOptions,
+    ) -> Result<CommitGraphReport> {
+        let mut candidates = self
+            .references_with_prefix_bounded(
+                "refs/",
+                options.max_references,
+                options.max_reference_depth,
+            )?
+            .into_iter()
+            .map(|reference| match reference.target() {
+                ReferenceTarget::Direct(id) => Ok(*id),
+                ReferenceTarget::Symbolic(_) => self.resolve_reference(reference.name()),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        match self.resolve_reference("HEAD") {
+            Ok(id) => candidates.push(id),
+            Err(Error::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        let mut tips = Vec::new();
+        for candidate in candidates {
+            if let Some(id) = self.peel_raw_commit(candidate, options)? {
+                tips.push(id);
+            }
+        }
+        tips.sort_unstable();
+        tips.dedup();
+        self.write_commit_graph(&tips, options)
+    }
+
+    fn peel_raw_commit(
+        &self,
+        id: ObjectId,
+        options: &CommitGraphOptions,
+    ) -> Result<Option<ObjectId>> {
+        let mut current = id;
+        let mut seen = HashSet::new();
+        for depth in 0..=options.max_tag_depth {
+            if !seen.insert(current) {
+                return invalid("annotated tag cycle");
+            }
+            let object = self.read_object_raw(current, options.max_object_size)?;
+            if object.kind() == ObjectKind::Commit {
+                return Ok(Some(current));
+            }
+            if object.kind() != ObjectKind::Tag {
+                return Ok(None);
+            }
+            if depth == options.max_tag_depth {
+                break;
+            }
+            let tag = AnnotatedTag::parse(object.data())?;
+            let target = self.read_object_raw(tag.target(), options.max_object_size)?;
+            if target.kind() != tag.target_kind() {
+                return invalid("annotated tag target type mismatch");
+            }
+            current = tag.target();
+        }
+        invalid("annotated tag depth exceeds limit")
     }
 }
 
@@ -486,29 +564,44 @@ fn encode(
     Ok((out, extra_edges))
 }
 
-fn generation(
-    id: ObjectId,
-    commits: &HashMap<ObjectId, Commit>,
-    done: &mut HashMap<ObjectId, u32>,
-    visiting: &mut HashSet<ObjectId>,
-) -> Result<u32> {
-    if let Some(value) = done.get(&id) {
-        return Ok(*value);
+fn compute_generations(commits: &HashMap<ObjectId, Commit>) -> Result<HashMap<ObjectId, u32>> {
+    let mut remaining = HashMap::with_capacity(commits.len());
+    let mut children = HashMap::<ObjectId, Vec<ObjectId>>::new();
+    let mut generations = HashMap::<ObjectId, u32>::with_capacity(commits.len());
+    let mut ready = Vec::new();
+    for (id, commit) in commits {
+        remaining.insert(*id, commit.parents().len());
+        if commit.parents().is_empty() {
+            generations.insert(*id, 1);
+            ready.push(*id);
+        }
+        for parent in commit.parents() {
+            children.entry(*parent).or_default().push(*id);
+        }
     }
-    if !visiting.insert(id) {
+    let mut completed = 0usize;
+    while let Some(parent) = ready.pop() {
+        completed += 1;
+        let parent_generation = generations[&parent];
+        for child in children.get(&parent).into_iter().flatten() {
+            let candidate = parent_generation.saturating_add(1).min(MAX_GENERATION);
+            generations
+                .entry(*child)
+                .and_modify(|value| *value = (*value).max(candidate))
+                .or_insert(candidate);
+            let count = remaining
+                .get_mut(child)
+                .ok_or_else(|| graph_error("parent refers outside closure"))?;
+            *count -= 1;
+            if *count == 0 {
+                ready.push(*child);
+            }
+        }
+    }
+    if completed != commits.len() {
         return invalid("commit graph contains a cycle");
     }
-    let mut value = 1;
-    for parent in commits[&id].parents() {
-        value = value.max(
-            generation(*parent, commits, done, visiting)?
-                .saturating_add(1)
-                .min(MAX_GENERATION),
-        );
-    }
-    visiting.remove(&id);
-    done.insert(id, value);
-    Ok(value)
+    Ok(generations)
 }
 
 fn validate_parent(value: u32, count: usize, self_position: usize) -> Result<usize> {
@@ -546,6 +639,7 @@ mod tests {
     use super::{CommitGraph, CommitGraphOptions};
     use crate::{
         CommitBuilder, InitOptions, MemoryFileSystem, ObjectId, ObjectKind, Repository, Signature,
+        TagBuilder,
     };
 
     fn commit(repo: &Repository, parents: &[ObjectId], timestamp: i64) -> ObjectId {
@@ -599,5 +693,80 @@ mod tests {
         assert!(CommitGraph::parse(&bytes, 10).is_err());
         let valid = repo.read_git_file("objects/info/commit-graph").unwrap();
         assert!(CommitGraph::parse(&valid, 0).is_err());
+    }
+
+    #[test]
+    fn reachable_writer_discovers_head_and_peels_annotated_tags() {
+        let repo =
+            Repository::init(MemoryFileSystem::new(), "repo", &InitOptions::default()).unwrap();
+        let main_root = commit(&repo, &[], 1);
+        let main_tip = commit(&repo, &[main_root], 2);
+        repo.create_branch("main", main_tip, false).unwrap();
+        let tagged = commit(&repo, &[], 3);
+        let signature = Signature::new("A", "a@example.com", 4, 0).unwrap();
+        let tag = TagBuilder::new(tagged, ObjectKind::Commit, "other", signature)
+            .unwrap()
+            .build();
+        repo.create_annotated_tag("other", &tag, false, 4096)
+            .unwrap();
+        let blob = repo
+            .write_object(ObjectKind::Blob, b"not a commit")
+            .unwrap();
+        repo.create_lightweight_tag("blob", blob, false, 4096)
+            .unwrap();
+
+        let report = repo
+            .write_commit_graph_reachable(&CommitGraphOptions::default())
+            .unwrap();
+        assert_eq!(report.commits, 3);
+        let graph = repo.read_commit_graph(1 << 20, 10).unwrap();
+        assert!(graph.get(main_tip).is_some());
+        assert!(graph.get(tagged).is_some());
+        assert!(graph.get(blob).is_none());
+    }
+
+    #[test]
+    fn generation_computation_handles_deep_history_without_recursion() {
+        let repo =
+            Repository::init(MemoryFileSystem::new(), "repo", &InitOptions::default()).unwrap();
+        let mut tip = commit(&repo, &[], 1);
+        for timestamp in 2..=4096 {
+            tip = commit(&repo, &[tip], timestamp);
+        }
+        let report = repo
+            .write_commit_graph(
+                &[tip],
+                &CommitGraphOptions {
+                    max_commits: 4096,
+                    ..CommitGraphOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(report.commits, 4096);
+        let graph = repo.read_commit_graph(1 << 20, 4096).unwrap();
+        assert_eq!(graph.get(tip).unwrap().generation(), 4096);
+    }
+
+    #[test]
+    fn ancestry_acceleration_is_disabled_by_replacement_refs() {
+        let repo =
+            Repository::init(MemoryFileSystem::new(), "repo", &InitOptions::default()).unwrap();
+        let root = commit(&repo, &[], 1);
+        let tip = commit(&repo, &[root], 2);
+        repo.write_commit_graph(&[tip], &CommitGraphOptions::default())
+            .unwrap();
+        assert!(
+            repo.is_ancestor(root, tip, &crate::GraphOptions::default())
+                .unwrap()
+        );
+
+        let unrelated = commit(&repo, &[], 3);
+        repo.create_replacement(tip, unrelated, false, 4096)
+            .unwrap();
+        assert!(
+            !repo
+                .is_ancestor(root, tip, &crate::GraphOptions::default())
+                .unwrap()
+        );
     }
 }

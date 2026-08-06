@@ -23,6 +23,12 @@ It publishes with the normal lock-and-rename path and avoids rewriting identical
 bytes unless `force` is set. `dry_run` performs all object reads and encoding but
 does not publish.
 
+For normal maintenance, `write_commit_graph_reachable` discovers `HEAD` and all
+loose or packed refs through bounded abstract-filesystem enumeration. It peels
+annotated tags using raw object reads and ignores refs ending at blobs or trees.
+The lower-level `write_commit_graph` remains available when an application has
+an explicit set of commit tips.
+
 The parser verifies the SHA-1 trailer before trusting chunk contents. It also
 checks the header, chunk table and offsets, required chunk sizes, monotonic
 fanout, strict OID ordering, parent positions, terminated extra-edge lists,
@@ -41,6 +47,8 @@ On a host repository, index the commit reachable from `HEAD` with:
 cargo run --example commit_graph -- /path/to/repository
 git -C /path/to/repository commit-graph verify
 ```
+
+Use `--read` to validate and inventory an existing graph without rewriting it.
 
 The second command is an interoperability check only; the library and example
 do not invoke Git.
