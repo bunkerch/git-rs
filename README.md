@@ -39,6 +39,8 @@ Git-compatible, storage-agnostic commit-graph generation and validation is
 documented in [`docs/commit-graph.md`](docs/commit-graph.md).
 Cached, Git-compatible multi-pack indexing is documented in
 [`docs/multi-pack-index.md`](docs/multi-pack-index.md).
+Ordered repository-wide performance maintenance is documented in
+[`docs/maintenance.md`](docs/maintenance.md).
 Full object and connectivity verification is documented in
 [`docs/fsck.md`](docs/fsck.md).
 Bounded loose, packed, duplicate, size, and garbage inventory is documented in

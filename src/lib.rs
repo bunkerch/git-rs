@@ -29,6 +29,7 @@ pub mod linked_worktree;
 pub mod log;
 pub mod ls_files;
 pub mod ls_tree;
+pub mod maintenance;
 pub mod merge;
 pub mod multi_pack_index;
 pub mod notes;
@@ -100,6 +101,7 @@ pub use linked_worktree::{
 pub use log::{LogEntry, LogOptions, LogParentDiff};
 pub use ls_files::{LsFilesEntry, LsFilesKind, LsFilesOptions};
 pub use ls_tree::{LsTreeEntry, LsTreeOptions};
+pub use maintenance::{MaintenanceOptions, MaintenanceOutcome, MaintenanceReport, MaintenanceTask};
 pub use merge::{
     FastForwardMode, MergeOptions, MergeResult, ReplayKind, ReplayOptions, ReplayResult,
 };
