@@ -49,6 +49,8 @@ Typed trees and commits are documented in
 [`docs/trees-and-commits.md`](docs/trees-and-commits.md).
 Ordered recursive and literal path-filtered tree inspection is documented in
 [`docs/ls-tree.md`](docs/ls-tree.md).
+Index and worktree inventory compatible with common `git ls-files` modes is
+documented in [`docs/ls-files.md`](docs/ls-files.md).
 Deterministic TAR and ZIP export of stored trees is documented in
 [`docs/archive.md`](docs/archive.md).
 Committing the index, including unborn, amend, merge, and detached behavior, is

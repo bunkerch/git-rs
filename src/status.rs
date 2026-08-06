@@ -238,7 +238,7 @@ impl Repository {
     }
 }
 
-fn worktree_change(
+pub(crate) fn worktree_change(
     repository: &Repository,
     entry: &IndexEntry,
     path: &Path,
@@ -295,7 +295,7 @@ fn index_path(path: &Path) -> Result<Vec<u8>> {
 
 #[cfg(unix)]
 #[allow(clippy::unnecessary_wraps)]
-fn worktree_path(path: &[u8]) -> Result<PathBuf> {
+pub(crate) fn worktree_path(path: &[u8]) -> Result<PathBuf> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
     Ok(path
@@ -305,7 +305,7 @@ fn worktree_path(path: &[u8]) -> Result<PathBuf> {
 }
 
 #[cfg(not(unix))]
-fn worktree_path(path: &[u8]) -> Result<PathBuf> {
+pub(crate) fn worktree_path(path: &[u8]) -> Result<PathBuf> {
     std::str::from_utf8(path)
         .map(|value| value.split('/').collect())
         .map_err(|_| Error::InvalidPath(PathBuf::from("non-UTF-8 index path")))
