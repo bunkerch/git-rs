@@ -16,6 +16,7 @@ pub enum Error {
     InvalidObject(String),
     ObjectTooLarge { declared: u64, limit: usize },
     Compression(String),
+    Protocol(String),
     InvalidTree(String),
     InvalidCommit(String),
     InvalidReferenceName(String),
@@ -47,6 +48,7 @@ impl fmt::Display for Error {
                 )
             }
             Self::Compression(message) => write!(f, "zlib error: {message}"),
+            Self::Protocol(message) => write!(f, "Git protocol error: {message}"),
             Self::InvalidTree(message) => write!(f, "invalid tree: {message}"),
             Self::InvalidCommit(message) => write!(f, "invalid commit: {message}"),
             Self::InvalidReferenceName(name) => write!(f, "invalid reference name: {name}"),
