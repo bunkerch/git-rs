@@ -346,7 +346,11 @@ impl Repository {
             let _ = self.filesystem().remove_file(&loose_lock);
             let _ = self.filesystem().remove_file(&packed_lock);
         }
-        result
+        result?;
+        if name.as_str().starts_with("refs/replace/") {
+            self.invalidate_replacements()?;
+        }
+        Ok(())
     }
 
     /// Apply several direct ref updates/deletions as one prepared transaction.
@@ -435,6 +439,9 @@ impl Repository {
                 self.filesystem().remove_file(&packed_lock)?;
             }
         }
+        let touches_replacements = prepared
+            .iter()
+            .any(|item| item.edit.name.as_str().starts_with("refs/replace/"));
         for item in &prepared {
             if item.edit.new.is_some() {
                 self.filesystem().rename(&item.lock, &item.destination)?;
@@ -450,6 +457,9 @@ impl Repository {
                     Err(error) => return Err(error),
                 }
             }
+        }
+        if touches_replacements {
+            self.invalidate_replacements()?;
         }
         Ok(())
     }
@@ -610,7 +620,11 @@ impl Repository {
                 let _ = self.filesystem().remove_file(&log_lock);
             }
         }
-        result
+        result?;
+        if name.as_str().starts_with("refs/replace/") {
+            self.invalidate_replacements()?;
+        }
+        Ok(())
     }
 
     /// Read a reference log from oldest to newest.

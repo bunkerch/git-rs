@@ -619,7 +619,7 @@ fn validate_incoming_pack(
             let IncomingRepresentation::RefDelta { base_id, .. } = &entry.representation else {
                 continue;
             };
-            let base = match repository.read_object(*base_id, options.max_object_size) {
+            let base = match repository.read_object_raw(*base_id, options.max_object_size) {
                 Ok(base) => base,
                 Err(Error::NotFound(_)) => continue,
                 Err(error) => return Err(error),

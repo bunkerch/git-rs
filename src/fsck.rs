@@ -85,7 +85,7 @@ impl Repository {
         let mut kinds = BTreeMap::<ObjectId, ObjectKind>::new();
         let mut counts = [0_usize; 4];
         for id in &ids {
-            let object = self.read_object(*id, options.max_object_size)?;
+            let object = self.read_object_raw(*id, options.max_object_size)?;
             let kind = object.kind();
             counts[kind_slot(kind)] += 1;
             let targets = match kind {

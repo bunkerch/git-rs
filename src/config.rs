@@ -366,7 +366,8 @@ impl Repository {
     /// # Errors
     /// Returns an error for lock contention or storage failure.
     pub fn write_config(&self, config: &Config) -> Result<()> {
-        self.write_atomic(Path::new("config"), &config.encode())
+        self.write_atomic(Path::new("config"), &config.encode())?;
+        self.invalidate_replacements()
     }
 }
 

@@ -177,12 +177,25 @@ impl Repository {
         }
     }
 
-    /// Read and verify a loose object, refusing output larger than `max_size`.
+    /// Read and verify an object, transparently following enabled replace refs.
     ///
     /// # Errors
     /// Returns an error for missing, malformed, oversized, corrupt, or
     /// non-loose objects and for storage failures.
     pub fn read_object(&self, id: ObjectId, max_size: usize) -> Result<Object> {
+        let resolved = self.resolve_replacement(id)?;
+        self.read_object_raw(resolved, max_size)
+    }
+
+    /// Read an object by its actual ID without consulting replace refs.
+    ///
+    /// This is intended for integrity checking and replace-ref administration.
+    /// Most callers should use [`Repository::read_object`].
+    ///
+    /// # Errors
+    /// Returns an error for missing, malformed, oversized, corrupt, or
+    /// unsupported object storage, or for filesystem failures.
+    pub fn read_object_raw(&self, id: ObjectId, max_size: usize) -> Result<Object> {
         let compressed = match self.filesystem().read(&self.git_path(object_path(id))) {
             Ok(compressed) => compressed,
             Err(Error::NotFound(_)) => return self.read_packed_object(id, max_size),
