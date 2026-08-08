@@ -1135,7 +1135,7 @@ fn parse_modules(data: &[u8], options: &SubmoduleOptions) -> Result<Vec<Submodul
 ///
 /// Delegates to the crate's shared [`crate::fs::path::validate_path`], which
 /// rejects absolute paths, NUL bytes, Windows backslash separators, empty/`.`
-//// `..` components, and `.git`-sensitive components (including the
+/// `..` components, and `.git`-sensitive components (including the
 /// Windows-normalized aliases detected by `is_ntfs_dotgit`), so crafted values
 /// such as `foo/../..` or `foo\..\..` cannot escape the `.git/modules`
 /// administration directory. Unlike git, which warns and skips suspicious
