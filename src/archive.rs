@@ -168,6 +168,9 @@ impl Repository {
                 path.push(b'/');
             }
             path.extend_from_slice(item.name());
+            if has_unsafe_path_component(&path) {
+                return Err(Error::InvalidPath(bytes_path(&path)));
+            }
             let selected =
                 selections.is_empty() || selections.iter().any(|value| path_selected(&path, value));
             let descendant_selected = selections.iter().any(|value| is_path_prefix(&path, value));
@@ -551,6 +554,11 @@ fn normalize_archive_path(value: &[u8]) -> Result<Vec<u8>> {
         return Err(Error::InvalidPath(bytes_path(value)));
     }
     Ok(components.join(&b'/'))
+}
+
+fn has_unsafe_path_component(path: &[u8]) -> bool {
+    path.split(|byte| *byte == b'/')
+        .any(|component| matches!(component, b"." | b".."))
 }
 
 fn bytes_path(value: &[u8]) -> std::path::PathBuf {
@@ -1194,6 +1202,100 @@ mod tests {
             )
             .unwrap();
         assert!(!tar_headers(&live).iter().any(|entry| entry.0 == b"version"));
+    }
+
+    #[test]
+    fn archive_rejects_dotdot_tree_entries() {
+        let (repository, _commit) = fixture();
+        let blob = repository.write_object(ObjectKind::Blob, b"owned\n").unwrap();
+
+        let top_level = crate::Tree::new(vec![
+            crate::TreeEntry::new(EntryMode::Blob, b"..".to_vec(), blob).unwrap(),
+        ])
+        .unwrap();
+        let top_level = repository.write_tree(&top_level).unwrap();
+        for format in [ArchiveFormat::Tar, ArchiveFormat::Zip] {
+            assert!(
+                repository
+                    .archive(
+                        &top_level.to_string(),
+                        &ArchiveOptions {
+                            format,
+                            ..ArchiveOptions::default()
+                        },
+                    )
+                    .is_err()
+            );
+        }
+
+        let nested_blob = repository
+            .write_object(ObjectKind::Blob, b"nested\n")
+            .unwrap();
+        let inner = crate::Tree::new(vec![
+            crate::TreeEntry::new(EntryMode::Blob, b"..".to_vec(), nested_blob).unwrap(),
+        ])
+        .unwrap();
+        let inner = repository.write_tree(&inner).unwrap();
+        let outer = crate::Tree::new(vec![
+            crate::TreeEntry::new(EntryMode::Tree, b"dir".to_vec(), inner).unwrap(),
+        ])
+        .unwrap();
+        let outer = repository.write_tree(&outer).unwrap();
+        for format in [ArchiveFormat::Tar, ArchiveFormat::Zip] {
+            assert!(
+                repository
+                    .archive(
+                        &outer.to_string(),
+                        &ArchiveOptions {
+                            format,
+                            ..ArchiveOptions::default()
+                        },
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn archive_rejects_single_dot_tree_entries() {
+        let (repository, _commit) = fixture();
+        let blob = repository.write_object(ObjectKind::Blob, b"owned\n").unwrap();
+        let tree = crate::Tree::new(vec![
+            crate::TreeEntry::new(EntryMode::Blob, b".".to_vec(), blob).unwrap(),
+        ])
+        .unwrap();
+        let tree = repository.write_tree(&tree).unwrap();
+        for format in [ArchiveFormat::Tar, ArchiveFormat::Zip] {
+            assert!(
+                repository
+                    .archive(
+                        &tree.to_string(),
+                        &ArchiveOptions {
+                            format,
+                            ..ArchiveOptions::default()
+                        },
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn archive_accepts_normal_tree_without_dotdot() {
+        let (repository, commit) = fixture();
+        for format in [ArchiveFormat::Tar, ArchiveFormat::Zip] {
+            let archive = repository
+                .archive(
+                    &commit.to_string(),
+                    &ArchiveOptions {
+                        format,
+                        ..ArchiveOptions::default()
+                    },
+                )
+                .unwrap();
+            assert!(!archive.windows(2).any(|value| value == b".."));
+            assert!(archive.windows(5).any(|value| value == b"plain"));
+        }
     }
 
     fn tar_headers(archive: &[u8]) -> Vec<TarHeader> {
