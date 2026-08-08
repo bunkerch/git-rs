@@ -3,9 +3,10 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
+use crate::fs::path::{reject_backslash, validate_path};
 use crate::{
-    index::validate_path, EntryMode, Error, FileStat, IgnoreMatcher, Index, IndexEntry, ObjectId,
-    ObjectKind, Repository, Result, StatData, Tree, TreeEntry,
+    EntryMode, Error, FileStat, IgnoreMatcher, Index, IndexEntry, ObjectId, ObjectKind, Repository,
+    Result, StatData, Tree, TreeEntry,
 };
 
 #[derive(Clone, Debug)]
@@ -1329,11 +1330,11 @@ fn index_path(path: &Path) -> Result<Vec<u8>> {
 }
 
 #[cfg(unix)]
-#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn worktree_path(path: &[u8]) -> Result<PathBuf> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
+    reject_backslash(path)?;
     let mut output = PathBuf::new();
     for component in path.split(|byte| *byte == b'/') {
         output.push(OsStr::from_bytes(component));
@@ -1343,9 +1344,7 @@ pub(crate) fn worktree_path(path: &[u8]) -> Result<PathBuf> {
 
 #[cfg(not(unix))]
 pub(crate) fn worktree_path(path: &[u8]) -> Result<PathBuf> {
-    if path.contains(&b'\\') {
-        return Err(Error::InvalidPath(PathBuf::from("backslash in index path")));
-    }
+    reject_backslash(path)?;
     let text = std::str::from_utf8(path)
         .map_err(|_| Error::InvalidPath(PathBuf::from("non-UTF-8 index path")))?;
     Ok(text.split('/').collect())
@@ -1794,12 +1793,13 @@ mod tests {
         assert!(!fs.exists(Path::new("pwned")).unwrap());
     }
 
-    #[cfg(not(unix))]
     #[test]
-    fn non_unix_worktree_path_rejects_backslashes() {
+    fn worktree_path_rejects_backslashes_on_all_platforms() {
         assert!(worktree_path(b"..\\pwned").is_err());
         assert!(worktree_path(b"foo\\bar").is_err());
+        assert!(worktree_path(b"a\\b\\c").is_err());
         assert!(worktree_path(b"deps/lib").is_ok());
+        assert!(worktree_path(b"plain").is_ok());
     }
 
     fn removal_fixture() -> (Repository, MemoryFileSystem) {

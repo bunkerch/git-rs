@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::fs::path::validate_path;
 use crate::worktree::worktree_path;
 use crate::{
     CheckoutOptions, CloneOptions, Config, Error, FetchOptions, IndexEntry, ObjectId, Repository,
@@ -335,9 +336,9 @@ impl Repository {
         transport: &mut T,
         options: &SubmoduleAddOptions,
     ) -> Result<SubmoduleAddReport> {
-        validate_submodule_path(path)?;
+        validate_path(path)?;
         let name = options.name.as_deref().unwrap_or(path);
-        validate_submodule_path(name)?;
+        validate_path(name)?;
         if url.is_empty() || url.contains(&0) {
             return Err(Error::InvalidRepository("invalid submodule URL".into()));
         }
@@ -439,7 +440,7 @@ impl Repository {
         path: &[u8],
         options: &SubmoduleDeinitOptions,
     ) -> Result<SubmoduleDeinitReport> {
-        validate_submodule_path(path)?;
+        validate_path(path)?;
         let selection = SubmoduleOptions {
             paths: vec![path.to_vec()],
             max_modules: options.max_modules,
@@ -1099,7 +1100,7 @@ fn parse_modules(data: &[u8], options: &SubmoduleOptions) -> Result<Vec<Submodul
                 String::from_utf8_lossy(&name)
             ))
         })?;
-        validate_submodule_path(&path)?;
+        validate_path(&path)?;
         let url = builder.url.ok_or_else(|| {
             Error::InvalidRepository(format!(
                 "submodule `{}` has no URL",
@@ -1126,21 +1127,6 @@ fn parse_modules(data: &[u8], options: &SubmoduleOptions) -> Result<Vec<Submodul
     }
     output.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     Ok(output)
-}
-
-fn validate_submodule_path(path: &[u8]) -> Result<()> {
-    if path.is_empty()
-        || path.contains(&0)
-        || path.contains(&b'\\')
-        || path.starts_with(b"/")
-        || path.ends_with(b"/")
-        || path.split(|byte| *byte == b'/' || *byte == b'\\').any(|part| {
-            part.is_empty() || part == b"." || part == b".." || part.eq_ignore_ascii_case(b".git")
-        })
-    {
-        return Err(Error::InvalidRepository("unsafe submodule path".into()));
-    }
-    Ok(())
 }
 
 fn subsection_value<'a>(config: &'a Config, subsection: &[u8], name: &str) -> Option<&'a [u8]> {
@@ -1615,11 +1601,11 @@ mod tests {
     fn rejects_windows_backslash_submodule_paths() {
         for path in [&b"..\\pwned"[..], &b"foo\\bar"[..], &b"..\\pwned\\x"[..]] {
             assert!(
-                validate_submodule_path(path).is_err(),
+                validate_path(path).is_err(),
                 "expected {path:?} to be rejected"
             );
         }
-        assert!(validate_submodule_path(b"deps/lib").is_ok());
+        assert!(validate_path(b"deps/lib").is_ok());
     }
 
     #[test]

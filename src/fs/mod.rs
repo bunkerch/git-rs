@@ -2,7 +2,7 @@
 
 mod host;
 mod memory;
-mod path;
+pub(crate) mod path;
 
 use std::path::{Path, PathBuf};
 

@@ -1,7 +1,7 @@
 //! Repository status from HEAD, index, and worktree state.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 use crate::{Error, IgnoreMatcher, IndexEntry, ObjectId, ObjectKind, Repository, Result};
 
@@ -293,23 +293,7 @@ fn index_path(path: &Path) -> Result<Vec<u8>> {
         .ok_or_else(|| Error::InvalidPath(path.to_path_buf()))
 }
 
-#[cfg(unix)]
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn worktree_path(path: &[u8]) -> Result<PathBuf> {
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt;
-    Ok(path
-        .split(|byte| *byte == b'/')
-        .map(OsStr::from_bytes)
-        .collect())
-}
-
-#[cfg(not(unix))]
-pub(crate) fn worktree_path(path: &[u8]) -> Result<PathBuf> {
-    std::str::from_utf8(path)
-        .map(|value| value.split('/').collect())
-        .map_err(|_| Error::InvalidPath(PathBuf::from("non-UTF-8 index path")))
-}
+pub(crate) use crate::worktree::worktree_path;
 
 #[cfg(test)]
 mod tests {
@@ -491,5 +475,12 @@ mod tests {
                 .index_change(),
             Some(ChangeKind::Unmerged)
         );
+    }
+
+    #[test]
+    fn worktree_path_consistently_rejects_backslashes() {
+        assert!(worktree_path(b"..\\pwned").is_err());
+        assert!(worktree_path(b"foo\\bar").is_err());
+        assert!(worktree_path(b"deps/lib").is_ok());
     }
 }
