@@ -27,6 +27,7 @@ pub enum Error {
     ReferenceConflict(String),
     CheckoutConflict(Vec<String>),
     IgnoredPath(PathBuf),
+    BeyondSymbolicLink(PathBuf),
     SymbolicReferenceLoop(String),
     InvalidRepository(String),
 }
@@ -71,6 +72,9 @@ impl fmt::Display for Error {
                 )
             }
             Self::IgnoredPath(path) => write!(f, "path is ignored: {}", path.display()),
+            Self::BeyondSymbolicLink(path) => {
+                write!(f, "path is beyond a symbolic link: {}", path.display())
+            }
             Self::SymbolicReferenceLoop(name) => {
                 write!(
                     f,
