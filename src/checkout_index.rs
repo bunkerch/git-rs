@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::index::validate_path;
 use crate::worktree::worktree_path;
 use crate::{Error, FileStat, IndexEntry, ObjectKind, Repository, Result, StatData};
 
@@ -231,6 +232,7 @@ impl Repository {
         } else {
             let mut value = options.prefix.clone();
             value.extend_from_slice(entry.path());
+            validate_path(&value)?;
             Some(root.join(worktree_path(&value)?))
         };
         output.push(Selected {
@@ -700,6 +702,45 @@ mod tests {
                 .is_file()
         );
         assert!(!fs.exists(Path::new("repo/conflict")).unwrap());
+    }
+
+    #[test]
+    fn rejects_prefix_that_aliases_git_at_checkout_destination() {
+        let (repository, _fs) = repository();
+        let id = repository.write_object(ObjectKind::Blob, b"x").unwrap();
+        repository
+            .write_index(
+                &Index::new(
+                    IndexVersion::V2,
+                    vec![IndexEntry::new(
+                        b"hooks/pre-commit".to_vec(),
+                        0o100_644,
+                        id,
+                        StatData::default(),
+                    )
+                    .unwrap()],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        for prefix in [
+            b"sub/.git./".as_slice(),
+            b".git::$INDEX_ALLOCATION/".as_slice(),
+        ] {
+            assert!(
+                repository
+                    .checkout_index(
+                        &[],
+                        &CheckoutIndexOptions {
+                            all: true,
+                            prefix: prefix.to_vec(),
+                            ..CheckoutIndexOptions::default()
+                        },
+                    )
+                    .is_err(),
+                "expected prefix {prefix:?} to be rejected at the destination"
+            );
+        }
     }
 
     fn repository() -> (Repository, MemoryFileSystem) {

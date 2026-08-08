@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::path::Path;
 
+use crate::fs::is_ntfs_dotgit;
 use crate::object::sha1;
 use crate::{Error, ObjectId, Repository, Result};
 
@@ -590,14 +591,16 @@ fn encode_entry(
     Ok(())
 }
 
-fn validate_path(path: &[u8]) -> Result<()> {
+pub(crate) fn validate_path(path: &[u8]) -> Result<()> {
     if path.is_empty()
         || path[0] == b'/'
         || path.contains(&0)
         || path.contains(&b'\\')
-        || path.split(|byte| *byte == b'/').any(|part| {
-            part.is_empty() || matches!(part, b"." | b"..") || part.eq_ignore_ascii_case(b".git")
-        })
+        || path
+            .split(|byte| *byte == b'/' || *byte == b'\\')
+            .any(|part| {
+                part.is_empty() || matches!(part, b"." | b"..") || is_ntfs_dotgit(part)
+            })
     {
         return Err(Error::InvalidRepository("unsafe index path".into()));
     }
@@ -732,5 +735,98 @@ mod tests {
             encode_varint(value, &mut encoded);
             assert_eq!(decode_varint(&encoded).unwrap(), (value, encoded.len()));
         }
+    }
+
+    #[test]
+    fn rejects_win32_normalized_git_aliases() {
+        let oid = ObjectId::from_str("1111111111111111111111111111111111111111").unwrap();
+        let stat = StatData {
+            size: 42,
+            ..StatData::default()
+        };
+        for path in [
+            b".git.".as_slice(),
+            b".git ".as_slice(),
+            b".Git.".as_slice(),
+            b"git~1".as_slice(),
+            b".git::$INDEX_ALLOCATION".as_slice(),
+            b".git:$DATA".as_slice(),
+            b".git:stream".as_slice(),
+            b"dir/.git.".as_slice(),
+            b"dir\\.git".as_slice(),
+        ] {
+            assert!(
+                IndexEntry::with_stage(path.to_vec(), 0o100_644, oid, stat, 0).is_err(),
+                "expected {path:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_unrelated_dotfiles_and_incomplete_short_names() {
+        let oid = ObjectId::from_str("1111111111111111111111111111111111111111").unwrap();
+        let stat = StatData {
+            size: 42,
+            ..StatData::default()
+        };
+        for path in [
+            b".gitignore".as_slice(),
+            b".gitmodules".as_slice(),
+            b".gitattributes".as_slice(),
+            b"foo.git".as_slice(),
+            b"..git".as_slice(),
+            b"git~1x".as_slice(),
+            b"git~2".as_slice(),
+            b"git~12".as_slice(),
+            b"subdir/.git_config".as_slice(),
+        ] {
+            assert!(
+                IndexEntry::with_stage(path.to_vec(), 0o100_644, oid, stat, 0).is_ok(),
+                "expected {path:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_crafted_v2_index_with_win32_git_aliases() {
+        for path in [
+            b".git./hooks/pre-commit".as_slice(),
+            b".git /hooks/pre-commit".as_slice(),
+            b"git~1/hooks/pre-commit".as_slice(),
+            b".git::$INDEX_ALLOCATION".as_slice(),
+        ] {
+            assert!(
+                Index::parse(&crafted_v2_index(path)).is_err(),
+                "expected crafted index with {path:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_accepts_crafted_v2_index_with_benign_dotfiles() {
+        let index = Index::parse(&crafted_v2_index(b".gitignore")).unwrap();
+        assert_eq!(index.entries[0].path, b".gitignore");
+    }
+
+    fn crafted_v2_index(path: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"DIRC");
+        body.extend_from_slice(&2u32.to_be_bytes());
+        body.extend_from_slice(&1u32.to_be_bytes());
+        let mut entry = Vec::new();
+        for value in [0u32, 0, 0, 0, 0, 0, 0o100_644, 0, 0, 19] {
+            entry.extend_from_slice(&value.to_be_bytes());
+        }
+        entry.extend_from_slice(&[0x11; 20]);
+        entry.extend_from_slice(
+            &u16::try_from(path.len()).expect("test path fits in u16").to_be_bytes(),
+        );
+        entry.extend_from_slice(path);
+        entry.push(0);
+        entry.resize(entry.len().div_ceil(8) * 8, 0);
+        body.extend_from_slice(&entry);
+        let mut data = body.clone();
+        data.extend_from_slice(&sha1::digest(&body));
+        data
     }
 }

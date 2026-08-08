@@ -1326,13 +1326,17 @@ fn index_path(path: &Path) -> Result<Vec<u8>> {
 }
 
 #[cfg(unix)]
-#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn worktree_path(path: &[u8]) -> Result<PathBuf> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
     let mut output = PathBuf::new();
     for component in path.split(|byte| *byte == b'/') {
+        if crate::fs::is_ntfs_dotgit(component) {
+            return Err(Error::InvalidPath(PathBuf::from(
+                String::from_utf8_lossy(component).into_owned(),
+            )));
+        }
         output.push(OsStr::from_bytes(component));
     }
     Ok(output)
@@ -1342,6 +1346,11 @@ pub(crate) fn worktree_path(path: &[u8]) -> Result<PathBuf> {
 pub(crate) fn worktree_path(path: &[u8]) -> Result<PathBuf> {
     let text = std::str::from_utf8(path)
         .map_err(|_| Error::InvalidPath(PathBuf::from("non-UTF-8 index path")))?;
+    for component in text.split('/') {
+        if crate::fs::is_ntfs_dotgit(component.as_bytes()) {
+            return Err(Error::InvalidPath(PathBuf::from(component)));
+        }
+    }
     Ok(text.split('/').collect())
 }
 
@@ -2181,5 +2190,30 @@ mod tests {
             .clone();
         assert!(renamed.skip_worktree());
         assert!(!fs.exists(Path::new("repo/renamed")).unwrap());
+    }
+
+    #[test]
+    fn worktree_path_rejects_git_aliases_components() {
+        for path in [
+            b".git./hooks/pre-commit".as_slice(),
+            b"dir/.git /x".as_slice(),
+            b".git::$INDEX_ALLOCATION".as_slice(),
+        ] {
+            assert!(
+                worktree_path(path).is_err(),
+                "expected {path:?} to be rejected"
+            );
+        }
+        for path in [
+            b".gitignore".as_slice(),
+            b".gitmodules".as_slice(),
+            b"git~1x".as_slice(),
+            b"sub/.git_config".as_slice(),
+        ] {
+            assert!(
+                worktree_path(path).is_ok(),
+                "expected {path:?} to be accepted"
+            );
+        }
     }
 }
