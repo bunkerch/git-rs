@@ -60,7 +60,10 @@ impl Repository {
     ///
     /// # Errors
     /// Returns an error for a non-treeish revision, unsafe prefix/path, unmatched
-    /// selection, corrupt object graph, or configured size/entry limit.
+    /// selection, corrupt object graph, or configured size/entry limit. Trees that
+    /// contain `.` or `..` entry names (or such components in nested paths) are
+    /// rejected wholesale, even when the offending entry would be excluded by
+    /// `paths` selection or `export-ignore`.
     pub fn archive(&self, revision: &str, options: &ArchiveOptions) -> Result<Vec<u8>> {
         let mut resolved = self.resolve_revision(
             revision,
@@ -562,7 +565,10 @@ fn normalize_archive_path(value: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn has_unsafe_path_component(path: &[u8]) -> bool {
-    path.split(|byte| *byte == b'/')
+    // Treat `\` as a separator too: TAR/ZIP consumers on Windows resolve
+    // `..\evil` relative to the parent directory, so a backslash-delimited
+    // traversal component must be blocked just like `/`.
+    path.split(|byte| matches!(byte, b'/' | b'\\'))
         .any(|component| matches!(component, b"." | b".."))
 }
 
@@ -1309,21 +1315,151 @@ mod tests {
     }
 
     #[test]
+    fn archive_rejects_backslash_dotdot_tree_entries() {
+        let (repository, _commit) = fixture();
+        let blob = repository.write_object(ObjectKind::Blob, b"owned\n").unwrap();
+        let empty = repository
+            .write_tree(&crate::Tree::new(Vec::new()).unwrap())
+            .unwrap();
+
+        assert_rejected(
+            &repository,
+            &crate::Tree::new(vec![
+                crate::TreeEntry::new(EntryMode::Blob, b"..\\evil".to_vec(), blob).unwrap(),
+            ])
+            .unwrap(),
+        );
+
+        let inner = crate::Tree::new(vec![
+            crate::TreeEntry::new(EntryMode::Blob, b"..\\evil".to_vec(), blob).unwrap(),
+        ])
+        .unwrap();
+        let inner = repository.write_tree(&inner).unwrap();
+        assert_rejected(
+            &repository,
+            &crate::Tree::new(vec![
+                crate::TreeEntry::new(EntryMode::Tree, b"dir".to_vec(), inner).unwrap(),
+            ])
+            .unwrap(),
+        );
+
+        assert_rejected(
+            &repository,
+            &crate::Tree::new(vec![
+                crate::TreeEntry::new(EntryMode::Tree, b"dir\\..".to_vec(), empty).unwrap(),
+            ])
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    fn encoders_reject_unsafe_member_paths() {
+        for path in [b"..".as_slice(), b"..\\evil", b"dir/..\\evil", b"dir\\.."] {
+            assert!(
+                matches!(
+                    encode_tar(
+                        &[ArchiveEntry {
+                            path: path.to_vec(),
+                            mode: EntryMode::Blob,
+                            data: b"x".to_vec(),
+                        }],
+                        0,
+                        None,
+                        usize::MAX,
+                    ),
+                    Err(Error::InvalidRepository(message)) if message.contains("traversal")
+                ),
+                "encode_tar must reject {path:?}"
+            );
+            assert!(
+                matches!(
+                    encode_zip(
+                        &[ArchiveEntry {
+                            path: path.to_vec(),
+                            mode: EntryMode::Blob,
+                            data: b"x".to_vec(),
+                        }],
+                        0,
+                        None,
+                        usize::MAX,
+                    ),
+                    Err(Error::InvalidRepository(message)) if message.contains("traversal")
+                ),
+                "encode_zip must reject {path:?}"
+            );
+        }
+        let safe = ArchiveEntry {
+            path: b"dir/file".to_vec(),
+            mode: EntryMode::Blob,
+            data: b"x".to_vec(),
+        };
+        assert!(encode_tar(&[safe], 0, None, usize::MAX).is_ok());
+    }
+
+    #[test]
     fn archive_accepts_normal_tree_without_dotdot() {
         let (repository, commit) = fixture();
-        for format in [ArchiveFormat::Tar, ArchiveFormat::Zip] {
-            let archive = repository
-                .archive(
-                    &commit.to_string(),
-                    &ArchiveOptions {
-                        format,
-                        ..ArchiveOptions::default()
-                    },
-                )
-                .unwrap();
-            assert!(!archive.windows(2).any(|value| value == b".."));
-            assert!(archive.windows(5).any(|value| value == b"plain"));
+        let expected: &[&[u8]] = &[b"plain", b"run", b"link", b"dir/", b"dir/nested"];
+
+        let tar = repository
+            .archive(&commit.to_string(), &ArchiveOptions::default())
+            .unwrap();
+        let tar_names: Vec<Vec<u8>> = tar_headers(&tar).into_iter().map(|entry| entry.0).collect();
+        for name in &tar_names {
+            assert!(
+                !has_unsafe_path_component(name),
+                "unexpected traversal member {name:?}"
+            );
         }
+        for name in expected {
+            assert!(
+                tar_names.iter().any(|entry| entry == name),
+                "missing {name:?} in {tar_names:?}"
+            );
+        }
+
+        let zip = repository
+            .archive(
+                &commit.to_string(),
+                &ArchiveOptions {
+                    format: ArchiveFormat::Zip,
+                    ..ArchiveOptions::default()
+                },
+            )
+            .unwrap();
+        let zip_names = zip_member_names(&zip);
+        for name in &zip_names {
+            assert!(
+                !has_unsafe_path_component(name),
+                "unexpected traversal member {name:?}"
+            );
+        }
+        for name in expected {
+            assert!(
+                zip_names.iter().any(|entry| entry == name),
+                "missing {name:?} in {zip_names:?}"
+            );
+        }
+    }
+
+    fn zip_member_names(archive: &[u8]) -> Vec<Vec<u8>> {
+        let mut names = Vec::new();
+        let mut offset = 0;
+        while offset + 30 <= archive.len() {
+            if &archive[offset..offset + 4] != b"PK\x03\x04" {
+                break;
+            }
+            let name_len =
+                usize::from(u16::from_le_bytes([archive[offset + 26], archive[offset + 27]]));
+            let extra_len =
+                usize::from(u16::from_le_bytes([archive[offset + 28], archive[offset + 29]]));
+            let data_len =
+                usize::try_from(u32::from_le_bytes(archive[offset + 18..offset + 22].try_into().unwrap()))
+                    .unwrap();
+            names.push(archive[offset + 30..offset + 30 + name_len].to_vec());
+            offset += 30 + name_len + extra_len + data_len;
+        }
+        names
     }
 
     #[test]
@@ -1338,6 +1474,12 @@ mod tests {
             b"a/../b",
             b"a/./b",
             b"a/b/..",
+            b"..\\evil",
+            b"dir\\..",
+            b"dir/..\\evil",
+            b"a\\..\\b",
+            b".\\a",
+            b"dir\\../",
         ];
         for path in unsafe_paths {
             assert!(has_unsafe_path_component(path), "{path:?} should be unsafe");
@@ -1352,6 +1494,9 @@ mod tests {
             b"..a",
             b"a..",
             b"...",
+            b"a\\b",
+            b"a\\",
+            b"\\",
         ];
         for path in safe_paths {
             assert!(
