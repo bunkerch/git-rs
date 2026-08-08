@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::worktree::worktree_path;
+use crate::worktree::{has_symlink_leading_path, worktree_path};
 use crate::{
     CheckoutOptions, CloneOptions, Config, Error, FetchOptions, IndexEntry, ObjectId, Repository,
     Result, StatData, UploadPackTransport,
@@ -363,7 +363,11 @@ impl Repository {
         let worktree = self
             .work_tree()
             .ok_or_else(|| Error::InvalidRepository("submodules require a worktree".into()))?;
-        let nested_path = worktree.join(worktree_path(path)?);
+        let relative = worktree_path(path)?;
+        if has_symlink_leading_path(self.filesystem(), worktree, &relative)? {
+            return Err(Error::BeyondSymbolicLink(relative));
+        }
+        let nested_path = worktree.join(relative);
         let transfer = add_transfer_options(options);
         let (nested, _, fetched_objects) =
             self.clone_submodule(&nested_path, name, url, transport, &transfer, false)?;
@@ -454,7 +458,11 @@ impl Repository {
         let worktree = self
             .work_tree()
             .ok_or_else(|| Error::InvalidRepository("submodules require a worktree".into()))?;
-        let nested_path = worktree.join(worktree_path(module.path())?);
+        let relative = worktree_path(module.path())?;
+        if has_symlink_leading_path(self.filesystem(), worktree, &relative)? {
+            return Err(Error::BeyondSymbolicLink(relative));
+        }
+        let nested_path = worktree.join(relative);
         let populated = self.filesystem().exists(&nested_path.join(".git"))?;
         if populated {
             let nested = Repository::open_shared(self.shared_filesystem(), &nested_path)?;
@@ -1607,5 +1615,47 @@ mod tests {
         );
 
         assert_deinit_and_restore(&superproject, &filesystem, &mut transport);
+    }
+
+    #[test]
+    fn refuses_adding_submodule_through_a_symlinked_directory() {
+        let filesystem = MemoryFileSystem::new();
+        let (remote, _) = remote_fixture(&filesystem);
+        let superproject =
+            Repository::init(filesystem.clone(), "super", &InitOptions::default()).unwrap();
+        let mut transport = RepositoryTransport::new(&remote, UploadPackOptions::default());
+        filesystem
+            .create_symlink(Path::new("super/link"), b"outside")
+            .unwrap();
+        assert!(matches!(
+            superproject.add_submodule(
+                b"link/nested",
+                b"memory://remote",
+                &mut transport,
+                &SubmoduleAddOptions::default(),
+            ),
+            Err(Error::BeyondSymbolicLink(_))
+        ));
+        assert!(!filesystem.exists(Path::new("super/link/nested")).unwrap());
+    }
+
+    #[test]
+    fn refuses_deinitializing_submodule_through_a_symlinked_directory() {
+        let filesystem = MemoryFileSystem::new();
+        let superproject =
+            Repository::init(filesystem.clone(), "super", &InitOptions::default()).unwrap();
+        filesystem
+            .write(
+                Path::new("super/.gitmodules"),
+                b"[submodule \"lib\"]\n\tpath = link/lib\n\turl = memory://lib\n",
+            )
+            .unwrap();
+        filesystem
+            .create_symlink(Path::new("super/link"), b"outside")
+            .unwrap();
+        assert!(matches!(
+            superproject.deinit_submodule(b"link/lib", &SubmoduleDeinitOptions::default()),
+            Err(Error::BeyondSymbolicLink(_))
+        ));
     }
 }

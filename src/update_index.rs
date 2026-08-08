@@ -204,6 +204,9 @@ impl Repository {
             Error::InvalidRepository("cannot update paths in a bare repository".into())
         })?;
         let relative = crate::worktree::worktree_path(path)?;
+        if crate::worktree::has_symlink_leading_path(self.filesystem(), root, &relative)? {
+            return Err(Error::BeyondSymbolicLink(relative));
+        }
         let full = root.join(relative);
         let exact = entries
             .iter()
@@ -379,8 +382,8 @@ fn stage_zero(entries: &[IndexEntry], path: &[u8]) -> Result<usize> {
 mod tests {
     use super::*;
     use crate::{
-        FileSystem, Index, InitOptions, MemoryFileSystem, ObjectId, PreviousValue, ReferenceName,
-        StatData,
+        FileSystem, HostFileSystem, Index, InitOptions, MemoryFileSystem, ObjectId,
+        PreviousValue, ReferenceName, StatData,
     };
     use std::path::Path;
 
@@ -652,5 +655,31 @@ mod tests {
         let index = repository.read_index().unwrap();
         assert_eq!(index.entries()[0].mode(), 0o160_000);
         assert_eq!(index.entries()[0].id(), tip);
+    }
+
+    #[test]
+    fn refuses_worktree_update_through_a_symlinked_directory() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"top-secret\n").unwrap();
+        let fs = HostFileSystem::new(base.path()).unwrap();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.create_symlink(Path::new("repo/link"), outside.to_str().unwrap().as_bytes())
+            .unwrap();
+        assert!(matches!(
+            repository.update_index(
+                &[UpdateIndexCommand::Worktree {
+                    path: b"link/secret.txt".to_vec(),
+                }],
+                &UpdateIndexOptions {
+                    allow_add: true,
+                    ..UpdateIndexOptions::default()
+                }
+            ),
+            Err(Error::BeyondSymbolicLink(_))
+        ));
+        assert!(repository.read_index().unwrap().entries().is_empty());
+        assert!(outside.join("secret.txt").exists());
     }
 }

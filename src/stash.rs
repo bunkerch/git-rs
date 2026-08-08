@@ -387,7 +387,12 @@ impl Repository {
                 entries.push(entry.clone());
                 continue;
             }
-            let full = work_tree.join(worktree_path(entry.path())?);
+            let relative = worktree_path(entry.path())?;
+            if crate::worktree::has_symlink_leading_path(self.filesystem(), work_tree, &relative)?
+            {
+                return Err(Error::BeyondSymbolicLink(relative));
+            }
+            let full = work_tree.join(relative);
             let metadata = match self.filesystem().metadata(&full) {
                 Ok(metadata) => metadata,
                 Err(Error::NotFound(_)) => continue,
@@ -404,7 +409,12 @@ impl Repository {
             .ok_or_else(|| Error::InvalidRepository("stash requires a working tree".into()))?;
         let mut entries = Vec::with_capacity(paths.len());
         for path in paths {
-            let full = work_tree.join(worktree_path(path)?);
+            let relative = worktree_path(path)?;
+            if crate::worktree::has_symlink_leading_path(self.filesystem(), work_tree, &relative)?
+            {
+                return Err(Error::BeyondSymbolicLink(relative));
+            }
+            let full = work_tree.join(relative);
             let metadata = self.filesystem().metadata(&full)?;
             entries.push(self.snapshot_file(path, &full, metadata)?);
         }
@@ -671,7 +681,7 @@ fn worktree_path(path: &[u8]) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ChangeKind, FileSystem, InitOptions, MemoryFileSystem};
+    use crate::{ChangeKind, FileSystem, HostFileSystem, InitOptions, MemoryFileSystem};
 
     fn fixture() -> (Repository, MemoryFileSystem, Signature, ObjectId) {
         let filesystem = MemoryFileSystem::new();
@@ -915,6 +925,48 @@ mod tests {
         assert_eq!(
             filesystem.read(Path::new("repo/saved.txt")).unwrap(),
             b"collision\n"
+        );
+    }
+
+    #[test]
+    fn refuses_stash_through_a_symlinked_directory_before_snapshotting() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"top-secret\n").unwrap();
+        let fs = HostFileSystem::new(base.path()).unwrap();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let signature = Signature::new("Stasher", "stash@example.com", 100, 0).unwrap();
+        fs.write(Path::new("repo/base.txt"), b"base\n").unwrap();
+        repository.add("base.txt").unwrap();
+        repository
+            .commit_index(
+                b"base\n",
+                &signature,
+                &signature,
+                &crate::CommitOptions::default(),
+            )
+            .unwrap();
+        fs.create_symlink(Path::new("repo/link"), outside.to_str().unwrap().as_bytes())
+            .unwrap();
+        let index = repository.read_index().unwrap();
+        let secret = ObjectId::compute(ObjectKind::Blob, b"top-secret\n");
+        let mut entries = index.entries().to_vec();
+        entries.push(
+            IndexEntry::new("link/secret.txt", 0o100_644, secret, StatData::default()).unwrap(),
+        );
+        repository
+            .write_index(&Index::new(index.version(), entries).unwrap())
+            .unwrap();
+
+        assert!(matches!(
+            repository.stash_push(&StashPushOptions::default(), &signature),
+            Err(Error::BeyondSymbolicLink(_))
+        ));
+        assert!(outside.join("secret.txt").exists());
+        assert!(
+            repository.resolve_reference("refs/stash").is_err(),
+            "no stash commit may be created from through-link content"
         );
     }
 }

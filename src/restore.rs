@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
+use crate::worktree::has_symlink_leading_path;
 use crate::{Error, Index, IndexEntry, ObjectId, ObjectKind, Repository, Result, StatData};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -127,6 +128,18 @@ impl Repository {
             let root = work_tree.ok_or_else(|| {
                 Error::InvalidRepository("worktree restore requires a non-bare repository".into())
             })?;
+            for path in &requested {
+                let relative = restore_worktree_path(path)?;
+                if has_symlink_leading_path(self.filesystem(), root, &relative)? {
+                    return Err(Error::BeyondSymbolicLink(relative));
+                }
+            }
+            for path in &selected {
+                let relative = restore_worktree_path(path)?;
+                if has_symlink_leading_path(self.filesystem(), root, &relative)? {
+                    return Err(Error::BeyondSymbolicLink(relative));
+                }
+            }
             self.preflight_restore_worktree(root, &current, &selected, &desired, options.force)?;
         }
         let restored = selected.iter().cloned().collect::<Vec<_>>();
@@ -405,8 +418,8 @@ fn restore_worktree_path(path: &[u8]) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::{
-        CommitOptions, FileSystem, IndexVersion, InitOptions, MemoryFileSystem, Signature,
-        StatusOptions,
+        CommitOptions, FileSystem, HostFileSystem, IndexVersion, InitOptions, MemoryFileSystem,
+        Signature, StatusOptions,
     };
 
     fn fixture() -> (Repository, MemoryFileSystem, Signature, ObjectId) {
@@ -626,5 +639,41 @@ mod tests {
         );
         assert_eq!(repository.read_index().unwrap(), before);
         assert_eq!(filesystem.read(Path::new("repo/file")).unwrap(), b"local");
+    }
+
+    #[test]
+    fn rejects_restore_through_a_symlinked_directory_before_deleting() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"top-secret\n").unwrap();
+        let fs = HostFileSystem::new(base.path()).unwrap();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.create_symlink(Path::new("repo/link"), outside.to_str().unwrap().as_bytes())
+            .unwrap();
+        let index = repository.read_index().unwrap();
+        let secret = ObjectId::compute(ObjectKind::Blob, b"top-secret\n");
+        let mut entries = index.entries().to_vec();
+        entries.push(
+            IndexEntry::new("link/secret.txt", 0o100_644, secret, StatData::default()).unwrap(),
+        );
+        repository
+            .write_index(&Index::new(index.version(), entries).unwrap())
+            .unwrap();
+
+        assert!(matches!(
+            repository.restore_paths(
+                &["link/secret.txt"],
+                &RestoreOptions {
+                    force: true,
+                    ..RestoreOptions::default()
+                }
+            ),
+            Err(Error::BeyondSymbolicLink(_))
+        ));
+        assert!(
+            outside.join("secret.txt").exists(),
+            "external file must not be deleted"
+        );
     }
 }
