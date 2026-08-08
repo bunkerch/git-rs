@@ -177,11 +177,32 @@ impl Repository {
                 preserved = true;
                 continue;
             }
-            let metadata = self
-                .filesystem()
-                .metadata(&context.root.join(&child_relative))?;
             let selected = clean_selected(&path, context.requested);
             let ancestor = clean_selection_below(&path, context.requested);
+            let metadata = match self.filesystem().metadata(&context.root.join(&child_relative)) {
+                Ok(metadata) => metadata,
+                Err(Error::NotFound(_)) => continue,
+                Err(_) => {
+                    // A special file (FIFO/socket) cannot be stat'd; treat it
+                    // as a removable non-directory rather than aborting the
+                    // traversal.
+                    if selected && !context.tracked.contains(&path) {
+                        let repository_ignored = ignores.is_ignored(&path, false);
+                        let manual = context.manual.is_ignored(&path, false);
+                        if clean_mode_matches(context.options.ignored, repository_ignored, manual) {
+                            output.push(CleanEntry {
+                                path,
+                                directory: false,
+                            });
+                        } else {
+                            preserved = true;
+                        }
+                    } else {
+                        preserved = true;
+                    }
+                    continue;
+                }
+            };
             if metadata.is_dir() {
                 let tracked_below = clean_tracked_below(context.tracked, &path);
                 if tracked_below {
@@ -293,12 +314,15 @@ fn nested_repository(repository: &Repository, root: &Path, relative: &Path) -> b
 
 /// True when `entry` (a path named `.git`) is a real repository, matching
 /// git's `is_nonbare_repository_dir` (setup.c): a git directory with a valid
-/// `HEAD` **and** `objects` **and** `refs`, a symlink whose target is such a
-/// directory, or a `gitdir: <path>` gitfile whose target is such a directory.
-/// Plain or HEAD-only directories and garbage files named `.git` are not
-/// repositories and are cleaned, exactly as git cleans them. Probing errors
-/// (e.g. a FIFO or socket named `.git`) are treated as not-a-repository so the
-/// traversal is not aborted.
+/// `HEAD` **and** `objects` **and** `refs` (directly or via a `commondir`
+/// linked worktree), a symlink whose target is such a directory, or a
+/// `gitdir: <path>` gitfile whose target is such a directory. Plain or
+/// HEAD-only directories and garbage files named `.git` are not repositories
+/// and are cleaned, exactly as git cleans them. Probing errors (e.g. a FIFO or
+/// socket named `.git`) are treated as not-a-repository so the traversal is
+/// not aborted; an unreadable `.git` file is conservatively preserved, as git
+/// does on open/read failure. Symlink and gitfile targets are followed up to
+/// 16 hops.
 fn clean_git_repository(repository: &Repository, entry: &Path) -> bool {
     clean_git_repository_depth(repository, entry, 16).unwrap_or(false)
 }
@@ -315,9 +339,7 @@ fn clean_git_repository_depth(
         return Ok(false);
     };
     if metadata.is_dir() {
-        return Ok(clean_valid_head(repository, &entry.join("HEAD"))
-            && repository.filesystem().exists(&entry.join("objects"))?
-            && repository.filesystem().exists(&entry.join("refs"))?);
+        return clean_git_directory(repository, entry, depth - 1);
     }
     if metadata.is_symlink() {
         // A symlinked `.git` pointing at a repository is a nested repository;
@@ -333,7 +355,9 @@ fn clean_git_repository_depth(
         };
     }
     let Ok(contents) = repository.filesystem().read(entry) else {
-        return Ok(false);
+        // An unreadable `.git` file (e.g. mode 000) is conservatively
+        // preserved, matching git's READ_GITFILE_ERR_OPEN/READ_FAILED.
+        return Ok(true);
     };
     let Ok(text) = std::str::from_utf8(&contents) else {
         return Ok(false);
@@ -348,21 +372,59 @@ fn clean_git_repository_depth(
         return Ok(false);
     };
     match clean_resolve_target(entry, target.as_bytes())? {
-        Some(resolved) => {
-            // git resolves a gitfile one level: the target must itself be a git
-            // directory; a gitfile pointing at another gitfile is not a repo.
-            let Ok(metadata) = repository.filesystem().metadata(&resolved) else {
-                return Ok(false);
-            };
-            if !metadata.is_dir() {
-                return Ok(false);
-            }
-            Ok(clean_valid_head(repository, &resolved.join("HEAD"))
-                && repository.filesystem().exists(&resolved.join("objects"))?
-                && repository.filesystem().exists(&resolved.join("refs"))?)
-        }
+        // git resolves a gitfile one level: the target must itself be a git
+        // directory (following symlinks); a gitfile pointing at another
+        // gitfile is not a repository.
+        Some(resolved) => clean_git_directory(repository, &resolved, depth - 1),
         None => Ok(true),
     }
+}
+
+/// True when `path` (following symlinks) is a git directory: a valid `HEAD`
+/// and `objects`/`refs`, either directly or resolved via a `commondir` file
+/// (a linked worktree), mirroring git's `is_git_directory` + `get_common_dir`.
+fn clean_git_directory(repository: &Repository, path: &Path, depth: u8) -> Result<bool> {
+    if depth == 0 {
+        return Ok(false);
+    }
+    let Ok(metadata) = repository.filesystem().metadata(path) else {
+        return Ok(false);
+    };
+    if metadata.is_symlink() {
+        let Ok(target) = repository.filesystem().read_link(path) else {
+            return Ok(false);
+        };
+        return match clean_resolve_target(path, &target)? {
+            Some(resolved) => clean_git_directory(repository, &resolved, depth - 1),
+            None => Ok(true),
+        };
+    }
+    if !metadata.is_dir() || !clean_valid_head(repository, &path.join("HEAD")) {
+        return Ok(false);
+    }
+    match clean_common_dir(repository, path)? {
+        Some(common) => Ok(repository.filesystem().exists(&common.join("objects"))?
+            && repository.filesystem().exists(&common.join("refs"))?),
+        None => Ok(true),
+    }
+}
+
+/// Resolve a linked worktree's `commondir` file to the common git directory,
+/// or `None` when the common directory escapes the repository root and cannot
+/// be verified through the repository-scoped filesystem.
+fn clean_common_dir(repository: &Repository, git_dir: &Path) -> Result<Option<PathBuf>> {
+    let commondir = git_dir.join("commondir");
+    if repository.filesystem().exists(&commondir)? {
+        if let Ok(contents) = repository.filesystem().read(&commondir) {
+            if let Ok(text) = std::str::from_utf8(&contents) {
+                let target = text.lines().next().map_or("", str::trim);
+                if !target.is_empty() {
+                    return clean_resolve_target(&commondir, target.as_bytes());
+                }
+            }
+        }
+    }
+    Ok(Some(git_dir.to_path_buf()))
 }
 
 /// Resolve a symlink or `gitdir:` target relative to the directory containing
@@ -1531,6 +1593,225 @@ mod tests {
             .unwrap();
         assert!(paths(&removed).contains(&b"foo".to_vec()));
         assert!(!root.join("repo/foo").exists());
+    }
+
+    #[test]
+    fn untracked_subtree_preserves_linked_worktree_git_repository() {
+        let (repository, filesystem) = fixture();
+        filesystem
+            .create_dir_all(Path::new("repo/foo/link-to-worktree"))
+            .unwrap();
+        filesystem
+            .create_dir_all(Path::new("repo/foo/worktree-git"))
+            .unwrap();
+        filesystem
+            .create_dir_all(Path::new("repo/foo/common-git/objects"))
+            .unwrap();
+        filesystem
+            .create_dir_all(Path::new("repo/foo/common-git/refs"))
+            .unwrap();
+        filesystem
+            .write(
+                Path::new("repo/foo/worktree-git/HEAD"),
+                b"ref: refs/heads/main\n",
+            )
+            .unwrap();
+        filesystem
+            .write(
+                Path::new("repo/foo/worktree-git/commondir"),
+                b"../common-git\n",
+            )
+            .unwrap();
+        filesystem
+            .write(
+                Path::new("repo/foo/link-to-worktree/.git"),
+                b"gitdir: ../worktree-git\n",
+            )
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/foo/link-to-worktree/victim.txt"), b"victim")
+            .unwrap();
+        repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    force: true,
+                    dry_run: false,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            filesystem
+                .exists(Path::new("repo/foo/link-to-worktree/.git"))
+                .unwrap()
+        );
+        assert!(
+            filesystem
+                .exists(Path::new("repo/foo/link-to-worktree/victim.txt"))
+                .unwrap()
+        );
+        assert!(filesystem.exists(Path::new("repo/foo")).unwrap());
+    }
+
+    #[test]
+    fn untracked_subtree_preserves_gitfile_to_symlinked_gitdir() {
+        let (repository, filesystem) = fixture();
+        filesystem
+            .create_dir_all(Path::new("repo/foo/link-to-gitdir"))
+            .unwrap();
+        create_git_dir(&filesystem, Path::new("repo/foo/gitreal"));
+        filesystem
+            .create_symlink(
+                Path::new("repo/foo/link-to-gitdir/gitlink"),
+                b"../gitreal",
+            )
+            .unwrap();
+        filesystem
+            .write(
+                Path::new("repo/foo/link-to-gitdir/.git"),
+                b"gitdir: gitlink\n",
+            )
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/foo/link-to-gitdir/victim.txt"), b"victim")
+            .unwrap();
+        repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    force: true,
+                    dry_run: false,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            filesystem
+                .exists(Path::new("repo/foo/link-to-gitdir/.git"))
+                .unwrap()
+        );
+        assert!(
+            filesystem
+                .exists(Path::new("repo/foo/link-to-gitdir/victim.txt"))
+                .unwrap()
+        );
+        assert!(filesystem.exists(Path::new("repo/foo")).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_untracked_subtree_preserves_linked_worktree() {
+        let root = host_fixture_root();
+        let repository =
+            Repository::init(HostFileSystem::new(&root).unwrap(), "repo", &InitOptions::default())
+                .unwrap();
+        std::fs::write(root.join("repo/base.txt"), b"base").unwrap();
+        repository.add("base.txt").unwrap();
+        std::fs::create_dir_all(root.join("repo/foo/link-to-worktree")).unwrap();
+        std::fs::create_dir_all(root.join("repo/foo/worktree-git")).unwrap();
+        std::fs::create_dir_all(root.join("repo/foo/common-git/objects")).unwrap();
+        std::fs::create_dir_all(root.join("repo/foo/common-git/refs")).unwrap();
+        std::fs::write(root.join("repo/foo/worktree-git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::fs::write(root.join("repo/foo/worktree-git/commondir"), b"../common-git\n").unwrap();
+        std::os::unix::fs::symlink(
+            "../worktree-git",
+            root.join("repo/foo/link-to-worktree/.git"),
+        )
+        .unwrap();
+        std::fs::write(root.join("repo/foo/link-to-worktree/victim.txt"), b"victim").unwrap();
+        repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    force: true,
+                    dry_run: false,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        // The nested repo directory survives; the `.git` symlink itself
+        // remains even though the in-worktree gitdir content (`worktree-git`,
+        // `common-git`) is cleaned like git does, leaving the link dangling.
+        assert!(
+            std::fs::symlink_metadata(root.join("repo/foo/link-to-worktree/.git"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(root.join("repo/foo/link-to-worktree/victim.txt").exists());
+        assert!(root.join("repo/foo").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_untracked_subtree_preserves_gitfile_to_symlinked_gitdir() {
+        let root = host_fixture_root();
+        let repository =
+            Repository::init(HostFileSystem::new(&root).unwrap(), "repo", &InitOptions::default())
+                .unwrap();
+        std::fs::write(root.join("repo/base.txt"), b"base").unwrap();
+        repository.add("base.txt").unwrap();
+        std::fs::create_dir_all(root.join("repo/foo/link-to-gitdir")).unwrap();
+        std::fs::create_dir_all(root.join("repo/foo/gitreal/objects")).unwrap();
+        std::fs::create_dir_all(root.join("repo/foo/gitreal/refs")).unwrap();
+        std::fs::write(root.join("repo/foo/gitreal/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::os::unix::fs::symlink(
+            "../gitreal",
+            root.join("repo/foo/link-to-gitdir/gitlink"),
+        )
+        .unwrap();
+        std::fs::write(root.join("repo/foo/link-to-gitdir/.git"), b"gitdir: gitlink\n").unwrap();
+        std::fs::write(root.join("repo/foo/link-to-gitdir/victim.txt"), b"victim").unwrap();
+        repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    force: true,
+                    dry_run: false,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(root.join("repo/foo/link-to-gitdir/.git").exists());
+        assert!(root.join("repo/foo/link-to-gitdir/victim.txt").exists());
+        assert!(root.join("repo/foo").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_unreadable_git_file_is_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = host_fixture_root();
+        let repository =
+            Repository::init(HostFileSystem::new(&root).unwrap(), "repo", &InitOptions::default())
+                .unwrap();
+        std::fs::write(root.join("repo/base.txt"), b"base").unwrap();
+        repository.add("base.txt").unwrap();
+        std::fs::create_dir_all(root.join("repo/foo")).unwrap();
+        let gitfile = root.join("repo/foo/.git");
+        std::fs::write(&gitfile, b"gitdir: /somewhere/real\n").unwrap();
+        std::fs::set_permissions(&gitfile, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::write(root.join("repo/foo/victim.txt"), b"victim").unwrap();
+        repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    force: true,
+                    dry_run: false,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(root.join("repo/foo/.git").exists());
+        assert!(root.join("repo/foo/victim.txt").exists());
+        assert!(root.join("repo/foo").exists());
     }
 
     fn host_fixture_root() -> std::path::PathBuf {
