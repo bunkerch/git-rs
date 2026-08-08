@@ -1,4 +1,5 @@
 use std::env;
+use std::fmt::Write;
 
 use git_rs::{HostFileSystem, Result};
 use git_rs::{LsTreeOptions, ObjectKind, Repository};
@@ -33,25 +34,46 @@ fn main() -> Result<()> {
             ObjectKind::Commit => "commit",
             ObjectKind::Tag => "tag",
         };
+        let path = quote_c_style(entry.path());
         if options.include_object_size {
             let size = entry
                 .object_size()
                 .map_or_else(|| "-".into(), |size| size.to_string());
             println!(
-                "{:06o} {kind} {} {:>7}\t{}",
+                "{:06o} {kind} {} {:>7}\t{path}",
                 entry.mode_number(),
                 entry.id(),
                 size,
-                String::from_utf8_lossy(entry.path())
             );
         } else {
             println!(
-                "{:06o} {kind} {}\t{}",
+                "{:06o} {kind} {}\t{path}",
                 entry.mode_number(),
                 entry.id(),
-                String::from_utf8_lossy(entry.path())
             );
         }
     }
     Ok(())
+}
+
+fn quote_c_style(path: &[u8]) -> String {
+    let mut escaped = String::new();
+    for c in String::from_utf8_lossy(path).chars() {
+        match c {
+            '\x07' => escaped.push_str(r"\a"),
+            '\x08' => escaped.push_str(r"\b"),
+            '\t' => escaped.push_str(r"\t"),
+            '\n' => escaped.push_str(r"\n"),
+            '\x0b' => escaped.push_str(r"\v"),
+            '\x0c' => escaped.push_str(r"\f"),
+            '\r' => escaped.push_str(r"\r"),
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str(r"\\"),
+            c @ ('\u{0}'..='\u{1f}' | '\x7f') => {
+                let _ = write!(escaped, "\\{:03o}", c as u32);
+            }
+            c => escaped.push(c),
+        }
+    }
+    escaped
 }
