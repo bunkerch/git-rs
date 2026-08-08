@@ -31,9 +31,15 @@ pub enum Error {
     InvalidRepository(String),
 }
 
-/// Replace control characters (0x00-0x1f and 0x7f, matching git's `iscntrl`
-/// neutralization in `vfreportf`) with `?` so attacker-controlled bytes in
-/// path or message strings never reach terminal or log output verbatim.
+/// Replace control characters with `?` so attacker-controlled bytes in path or
+/// message strings never reach terminal or log output verbatim.
+///
+/// The covered range is `0x00-0x1f` plus `0x7f` (DEL), and additionally the C1
+/// control range `0x80-0x9f`, via `char::is_control`. Unlike git's `vfreportf`
+/// sanitizer, which exempts `\t` and `\n`, this intentionally also replaces
+/// `\t`, `\r`, and `\n`: checkout-conflict paths are rendered comma-joined on a
+/// single line, so an embedded newline could otherwise be used to forge log
+/// lines or hide surrounding text on a terminal.
 fn sanitize_control_bytes(value: &str) -> String {
     value
         .chars()
@@ -48,7 +54,11 @@ fn sanitize_path(path: &Path) -> String {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(error) => write!(f, "I/O error: {error}"),
+            Self::Io(error) => write!(
+                f,
+                "I/O error: {}",
+                sanitize_control_bytes(&error.to_string())
+            ),
             Self::InvalidPath(path) => {
                 write!(f, "invalid repository path: {}", sanitize_path(path))
             }
@@ -142,6 +152,9 @@ impl From<std::io::Error> for Error {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::path::PathBuf;
+
     use super::Error;
 
     #[test]
@@ -186,5 +199,66 @@ mod tests {
         assert_eq!(error.to_string(), "invalid repository: repo?[31mname");
         let error = Error::InvalidTree("path\x07name".to_string());
         assert_eq!(error.to_string(), "invalid tree: path?name");
+    }
+
+    #[test]
+    fn path_variants_also_neutralize_control_bytes() {
+        let evil = PathBuf::from("evil\x1b[31mname.txt");
+        let cases: &[(&str, Error)] = &[
+            (
+                "invalid repository path: evil?[31mname.txt",
+                Error::InvalidPath(evil.clone()),
+            ),
+            (
+                "path already exists: evil?[31mname.txt",
+                Error::AlreadyExists(evil.clone()),
+            ),
+            (
+                "path not found: evil?[31mname.txt",
+                Error::NotFound(evil.clone()),
+            ),
+            (
+                "not a directory: evil?[31mname.txt",
+                Error::NotDirectory(evil.clone()),
+            ),
+            (
+                "directory is not empty: evil?[31mname.txt",
+                Error::DirectoryNotEmpty(evil.clone()),
+            ),
+            (
+                "is a directory: evil?[31mname.txt",
+                Error::IsDirectory(evil.clone()),
+            ),
+            (
+                "path is ignored: evil?[31mname.txt",
+                Error::IgnoredPath(evil.clone()),
+            ),
+        ];
+        for (expected, error) in cases {
+            assert_eq!(error.to_string(), *expected);
+        }
+    }
+
+    #[test]
+    fn io_variant_also_neutralizes_control_bytes() {
+        let inner = io::Error::other("evil\x1b[31mmessage");
+        assert_eq!(Error::Io(inner).to_string(), "I/O error: evil?[31mmessage");
+    }
+
+    #[test]
+    fn checkout_conflict_never_emits_raw_control_bytes() {
+        for byte in 0x00..=0x1f_u8 {
+            let c = char::from(byte);
+            let rendered = Error::CheckoutConflict(vec![format!("a{c}b")]).to_string();
+            assert!(
+                !rendered.contains(c),
+                "byte {byte:#x} leaked raw into {rendered:?}"
+            );
+            assert!(rendered.contains('?'), "byte {byte:#x} not replaced: {rendered:?}");
+        }
+        let c = '\x7f';
+        let rendered = Error::CheckoutConflict(vec![format!("a{c}b")]).to_string();
+        assert!(!rendered.contains(c), "byte 0x7f leaked raw into {rendered:?}");
+        assert!(rendered.contains('?'), "byte 0x7f not replaced: {rendered:?}");
     }
 }
