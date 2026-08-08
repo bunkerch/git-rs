@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::path::Path;
 
+use crate::fs::is_ntfs_dotgit;
 use crate::object::sha1;
 use crate::{Error, ObjectId, Repository, Result};
 
@@ -590,44 +591,20 @@ fn encode_entry(
     Ok(())
 }
 
-fn validate_path(path: &[u8]) -> Result<()> {
+pub(crate) fn validate_path(path: &[u8]) -> Result<()> {
     if path.is_empty()
         || path[0] == b'/'
         || path.contains(&0)
         || path.contains(&b'\\')
         || path
             .split(|byte| *byte == b'/' || *byte == b'\\')
-            .any(|part| part.is_empty() || matches!(part, b"." | b"..") || is_ntfs_dotgit(part))
+            .any(|part| {
+                part.is_empty() || matches!(part, b"." | b"..") || is_ntfs_dotgit(part)
+            })
     {
         return Err(Error::InvalidRepository("unsafe index path".into()));
     }
     Ok(())
-}
-
-/// Detect components that Windows would normalize to `.git`.
-///
-/// This mirrors git's `is_ntfs_dotgit()` (path.c): Win32 strips trailing dots
-/// and spaces from path components and resolves names case-insensitively, so
-/// `.git.`, `.git `, `.Git.`, and the NTFS short name `git~1` all refer to the
-/// real `.git` directory. Treating `\` as a separator keeps the check robust
-/// across platforms.
-fn is_ntfs_dotgit(component: &[u8]) -> bool {
-    let lower = component.to_ascii_lowercase();
-    let after = if let Some(rest) = lower.strip_prefix(b".git") {
-        rest
-    } else if let Some(rest) = lower.strip_prefix(b"git~") {
-        let digits = rest
-            .iter()
-            .take_while(|byte| byte.is_ascii_digit())
-            .count();
-        if digits == 0 {
-            return false;
-        }
-        &rest[digits..]
-    } else {
-        return false;
-    };
-    after.iter().all(|byte| *byte == b'.' || *byte == b' ')
 }
 
 fn compare_entries(left: &IndexEntry, right: &IndexEntry) -> Ordering {
@@ -772,6 +749,9 @@ mod tests {
             b".git ".as_slice(),
             b".Git.".as_slice(),
             b"git~1".as_slice(),
+            b".git::$INDEX_ALLOCATION".as_slice(),
+            b".git:$DATA".as_slice(),
+            b".git:stream".as_slice(),
             b"dir/.git.".as_slice(),
             b"dir\\.git".as_slice(),
         ] {
@@ -792,7 +772,12 @@ mod tests {
         for path in [
             b".gitignore".as_slice(),
             b".gitmodules".as_slice(),
+            b".gitattributes".as_slice(),
+            b"foo.git".as_slice(),
+            b"..git".as_slice(),
             b"git~1x".as_slice(),
+            b"git~2".as_slice(),
+            b"git~12".as_slice(),
             b"subdir/.git_config".as_slice(),
         ] {
             assert!(
@@ -808,6 +793,7 @@ mod tests {
             b".git./hooks/pre-commit".as_slice(),
             b".git /hooks/pre-commit".as_slice(),
             b"git~1/hooks/pre-commit".as_slice(),
+            b".git::$INDEX_ALLOCATION".as_slice(),
         ] {
             assert!(
                 Index::parse(&crafted_v2_index(path)).is_err(),
