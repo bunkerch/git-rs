@@ -633,7 +633,9 @@ impl Repository {
     /// # Errors
     /// Returns an error for duplicate or case-conflicting edits, invalid null
     /// updates, stale values, symbolic refs, lock contention, directory/file
-    /// conflicts, malformed packed refs, or storage failures.
+    /// conflicts, malformed packed refs, or storage failures. Case-conflicting
+    /// names (e.g. `foo` and `Foo` in one transaction) are rejected only when
+    /// `core.ignorecase` is set, matching Git's case-conflict detection.
     pub fn apply_reference_transaction(&self, edits: &[ReferenceEdit]) -> Result<()> {
         if edits.is_empty() {
             return Ok(());
@@ -645,7 +647,9 @@ impl Repository {
                 "duplicate ref in transaction".into(),
             ));
         }
-        if has_case_conflicting_updates(edits.iter().map(|edit| edit.name.as_str())) {
+        if self.case_insensitive_refnames()?
+            && has_case_conflicting_updates(edits.iter().map(|edit| edit.name.as_str()))
+        {
             return Err(Error::InvalidReference(
                 "case-conflicting refs in transaction".into(),
             ));
@@ -749,7 +753,8 @@ impl Repository {
     /// # Errors
     /// Returns an error for invalid, duplicate, or case-conflicting names,
     /// null direct targets, stale target preconditions, absent deletes, lock
-    /// contention, malformed packed refs, or storage failure.
+    /// contention, malformed packed refs, or storage failure. Case-conflicting
+    /// names are rejected only when `core.ignorecase` is set.
     #[allow(clippy::too_many_lines)]
     pub fn apply_mixed_reference_transaction(
         &self,
@@ -765,7 +770,9 @@ impl Repository {
                 "duplicate ref in transaction".into(),
             ));
         }
-        if has_case_conflicting_updates(edits.iter().map(|edit| edit.name.as_str())) {
+        if self.case_insensitive_refnames()?
+            && has_case_conflicting_updates(edits.iter().map(|edit| edit.name.as_str()))
+        {
             return Err(Error::InvalidReference(
                 "case-conflicting refs in transaction".into(),
             ));
@@ -1730,9 +1737,11 @@ fn cleanup_mixed_ref_locks(repository: &Repository, prepared: &[PreparedMixedRef
 }
 
 /// Detect refnames that collide under ASCII case folding, mirroring Git's
-/// `REF_TRANSACTION_ERROR_CASE_CONFLICT` intent: two edits in one transaction
-/// cannot name refs that differ only in case, because a case-insensitive
-/// filesystem could not store them side by side.
+/// `REF_TRANSACTION_ERROR_CASE_CONFLICT` intent: when `core.ignorecase` is set,
+/// two edits in one transaction cannot name refs that differ only in ASCII
+/// case, because a case-insensitive filesystem could not store them side by
+/// side. ASCII-only folding is at parity with Git's behavior on typical
+/// case-insensitive filesystems; non-ASCII case variants are not folded.
 fn has_case_conflicting_updates<'a>(mut names: impl Iterator<Item = &'a str>) -> bool {
     let mut seen = std::collections::HashSet::new();
     names.any(|name| !seen.insert(name.to_ascii_lowercase()))
@@ -2218,13 +2227,39 @@ mod tests {
     }
 
     #[test]
-    fn transaction_rejects_case_conflicting_refnames() {
-        let repository = Repository::init(
-            MemoryFileSystem::new(),
-            "repo",
-            &InitOptions::default(),
-        )
-        .unwrap();
+    fn transaction_allows_case_conflicting_refnames_without_ignorecase() {
+        let (repository, _) = repository();
+        let first = ObjectId::from_str(FIRST).unwrap();
+        repository
+            .apply_reference_transaction(&[
+                ReferenceEdit::update(
+                    ReferenceName::branch("main").unwrap(),
+                    first,
+                    PreviousValue::MustNotExist,
+                ),
+                ReferenceEdit::update(
+                    ReferenceName::branch("Main").unwrap(),
+                    first,
+                    PreviousValue::MustNotExist,
+                ),
+            ])
+            .unwrap();
+        assert_eq!(
+            repository.resolve_reference("refs/heads/main").unwrap(),
+            first
+        );
+        assert_eq!(
+            repository.resolve_reference("refs/heads/Main").unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn transaction_rejects_case_conflicting_refnames_with_ignorecase() {
+        let (repository, _) = repository();
+        let mut config = repository.read_config().unwrap();
+        config.set("core.ignorecase", b"true").unwrap();
+        repository.write_config(&config).unwrap();
         let first = ObjectId::from_str(FIRST).unwrap();
         let result = repository.apply_reference_transaction(&[
             ReferenceEdit::update(
