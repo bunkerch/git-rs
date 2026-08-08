@@ -210,8 +210,8 @@ impl Repository {
     ///
     /// # Errors
     /// Returns an error for bare repositories, missing/non-file/oversized or
-    /// malformed config, duplicate names/paths/required keys, unsafe paths,
-    /// exceeded module limits, or storage failures.
+    /// malformed config, duplicate names/paths/required keys, unsafe names or
+    /// paths, exceeded module limits, or storage failures.
     pub fn submodules(&self, options: &SubmoduleOptions) -> Result<Vec<Submodule>> {
         let worktree = self
             .work_tree()
@@ -337,7 +337,7 @@ impl Repository {
     ) -> Result<SubmoduleAddReport> {
         validate_submodule_path(path)?;
         let name = options.name.as_deref().unwrap_or(path);
-        validate_submodule_path(name)?;
+        validate_submodule_name(name)?;
         if url.is_empty() || url.contains(&0) {
             return Err(Error::InvalidRepository("invalid submodule URL".into()));
         }
@@ -706,6 +706,7 @@ impl Repository {
     }
 
     fn submodule_admin_path(&self, name: &[u8]) -> Result<PathBuf> {
+        validate_submodule_name(name)?;
         let modules_root = self.common_dir().join("modules");
         let name_path = worktree_path(name)?;
         let mut prefix = modules_root.clone();
@@ -1067,6 +1068,7 @@ fn parse_modules(data: &[u8], options: &SubmoduleOptions) -> Result<Vec<Submodul
             .subsection()
             .ok_or_else(|| Error::InvalidRepository("submodule section has no name".into()))?
             .to_vec();
+        validate_submodule_name(&name)?;
         let value = entry
             .value()
             .ok_or_else(|| Error::InvalidRepository("implicit submodule value".into()))?
@@ -1125,6 +1127,20 @@ fn parse_modules(data: &[u8], options: &SubmoduleOptions) -> Result<Vec<Submodul
     }
     output.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     Ok(output)
+}
+
+fn validate_submodule_name(name: &[u8]) -> Result<()> {
+    if name.is_empty()
+        || name.contains(&0)
+        || name.starts_with(b"/")
+        || name.ends_with(b"/")
+        || name.split(|byte| *byte == b'/').any(|part| {
+            part.is_empty() || part == b"." || part == b".." || part.eq_ignore_ascii_case(b".git")
+        })
+    {
+        return Err(Error::InvalidRepository("unsafe submodule name".into()));
+    }
+    Ok(())
 }
 
 fn validate_submodule_path(path: &[u8]) -> Result<()> {
@@ -1296,6 +1312,25 @@ mod tests {
         let duplicate =
             b"[submodule \"a\"]\npath = x\nurl = a\n[submodule \"b\"]\npath = x\nurl = b\n";
         assert!(parse_modules(duplicate, &SubmoduleOptions::default()).is_err());
+    }
+
+    #[test]
+    fn rejects_suspicious_submodule_names() {
+        for name in &[b"foo/../.." as &[u8], b"..", b"a/../b", b".git", b""] {
+            let config = format!(
+                "[submodule \"{}\"]\n\tpath = deps\n\turl = x\n",
+                String::from_utf8_lossy(name)
+            );
+            assert!(
+                parse_modules(config.as_bytes(), &SubmoduleOptions::default()).is_err(),
+                "suspicious submodule name `{}` must be rejected",
+                String::from_utf8_lossy(name)
+            );
+        }
+        let control = b"[submodule \"deps/lib\"]\n\tpath = deps/lib\n\turl = x\n";
+        let modules = parse_modules(control, &SubmoduleOptions::default()).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name(), b"deps/lib");
     }
 
     #[test]
