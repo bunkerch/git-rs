@@ -4,8 +4,8 @@ use std::process::Command;
 use std::io::Write;
 
 use git_rs::{
-    CommitBuilder, EntryMode, HostFileSystem, InitOptions, ObjectKind,
-    ReferenceName, Repository, Signature, Tree, TreeEntry,
+    CommitBuilder, DescribeOptions, DiffOptions, EntryMode, GraphOptions, HostFileSystem,
+    InitOptions, ObjectKind, PackOptions, ReferenceName, Repository, Signature, Tree, TreeEntry,
 };
 
 fn git(args: &[&str], cwd: &Path) -> Vec<u8> {
@@ -185,7 +185,7 @@ fn build_pack_matches_git_verify() {
     let repo = init_repo(dir.path(), true);
 
     let blob_id = repo.write_object(ObjectKind::Blob, b"pack test\n").unwrap();
-    let pack = repo.build_pack(&[blob_id], &Default::default()).unwrap();
+    let pack = repo.build_pack(&[blob_id], &PackOptions::default()).unwrap();
 
     let pack_dir = dir.path().join("objects/pack");
     std::fs::create_dir_all(&pack_dir).unwrap();
@@ -275,8 +275,8 @@ fn describe_matches_git() {
     )
     .unwrap();
 
-    let description = repo.describe("HEAD", &Default::default()).unwrap();
-    let describe_str = &*description.rendered();
+    let description = repo.describe("HEAD", &DescribeOptions::default()).unwrap();
+    let describe_str = description.rendered();
 
     let git_output = git(&["describe", "--always"], dir.path());
     let git_desc = String::from_utf8_lossy(&git_output).trim().to_owned();
@@ -347,7 +347,7 @@ fn merge_base_matches_git() {
     )
     .unwrap();
 
-    let mb = repo.merge_bases(left, right, &Default::default()).unwrap();
+    let mb = repo.merge_bases(left, right, &GraphOptions::default()).unwrap();
     assert_eq!(mb.len(), 1, "expected exactly one merge base");
     assert_eq!(mb[0], root, "merge base should be root commit");
 
@@ -384,7 +384,7 @@ fn mktree_with_git() {
     let lines: Vec<&str> = raw_output.lines().collect();
     assert_eq!(lines.len(), 2, "expected 2 tree entries, got {lines:?}");
     assert!(
-        lines.iter().any(|l| l.contains("blob") && l.ends_with("a")),
+        lines.iter().any(|l| l.contains("blob") && l.ends_with('a')),
         "missing blob entry 'a': {lines:?}"
     );
     assert!(
@@ -434,10 +434,10 @@ fn diff_matches_git_format() {
     .unwrap();
 
     // Get the diff between the two trees
-    let diff_entries = repo.diff_trees(Some(first_tree), Some(second_tree), &Default::default()).unwrap();
+    let diff_entries = repo.diff_trees(Some(first_tree), Some(second_tree), &DiffOptions::default()).unwrap();
     let mut diff_output = Vec::new();
     for entry in &diff_entries {
-        diff_output.extend(repo.render_patch(entry, &Default::default()).unwrap());
+        diff_output.extend(repo.render_patch(entry, &DiffOptions::default()).unwrap());
     }
     let diff_str = String::from_utf8_lossy(&diff_output);
     assert!(

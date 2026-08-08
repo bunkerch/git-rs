@@ -631,9 +631,9 @@ impl Repository {
     /// prepared under `packed-refs.lock` before publication begins.
     ///
     /// # Errors
-    /// Returns an error for duplicate edits, invalid null updates, stale values,
-    /// symbolic refs, lock contention, directory/file conflicts, malformed
-    /// packed refs, or storage failures.
+    /// Returns an error for duplicate or case-conflicting edits, invalid null
+    /// updates, stale values, symbolic refs, lock contention, directory/file
+    /// conflicts, malformed packed refs, or storage failures.
     pub fn apply_reference_transaction(&self, edits: &[ReferenceEdit]) -> Result<()> {
         if edits.is_empty() {
             return Ok(());
@@ -643,6 +643,11 @@ impl Repository {
         if edits.windows(2).any(|pair| pair[0].name == pair[1].name) {
             return Err(Error::InvalidReference(
                 "duplicate ref in transaction".into(),
+            ));
+        }
+        if has_case_conflicting_updates(edits.iter().map(|edit| edit.name.as_str())) {
+            return Err(Error::InvalidReference(
+                "case-conflicting refs in transaction".into(),
             ));
         }
         if edits
@@ -742,9 +747,9 @@ impl Repository {
     /// preparation failure publishes no change.
     ///
     /// # Errors
-    /// Returns an error for invalid or duplicate names, null direct targets,
-    /// stale target preconditions, absent deletes, lock contention, malformed
-    /// packed refs, or storage failure.
+    /// Returns an error for invalid, duplicate, or case-conflicting names,
+    /// null direct targets, stale target preconditions, absent deletes, lock
+    /// contention, malformed packed refs, or storage failure.
     #[allow(clippy::too_many_lines)]
     pub fn apply_mixed_reference_transaction(
         &self,
@@ -758,6 +763,11 @@ impl Repository {
         if edits.windows(2).any(|pair| pair[0].name == pair[1].name) {
             return Err(Error::InvalidReference(
                 "duplicate ref in transaction".into(),
+            ));
+        }
+        if has_case_conflicting_updates(edits.iter().map(|edit| edit.name.as_str())) {
+            return Err(Error::InvalidReference(
+                "case-conflicting refs in transaction".into(),
             ));
         }
         for edit in &edits {
@@ -1719,6 +1729,15 @@ fn cleanup_mixed_ref_locks(repository: &Repository, prepared: &[PreparedMixedRef
     }
 }
 
+/// Detect refnames that collide under ASCII case folding, mirroring Git's
+/// `REF_TRANSACTION_ERROR_CASE_CONFLICT` intent: two edits in one transaction
+/// cannot name refs that differ only in case, because a case-insensitive
+/// filesystem could not store them side by side.
+fn has_case_conflicting_updates<'a>(mut names: impl Iterator<Item = &'a str>) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    names.any(|name| !seen.insert(name.to_ascii_lowercase()))
+}
+
 fn previous_matches(previous: PreviousValue, actual: Option<ObjectId>) -> bool {
     match previous {
         PreviousValue::Any => true,
@@ -2196,6 +2215,32 @@ mod tests {
             fs.read(Path::new("repo/.git/packed-refs")).unwrap(),
             format!("{FIRST} refs/heads/main\n").as_bytes()
         );
+    }
+
+    #[test]
+    fn transaction_rejects_case_conflicting_refnames() {
+        let repository = Repository::init(
+            MemoryFileSystem::new(),
+            "repo",
+            &InitOptions::default(),
+        )
+        .unwrap();
+        let first = ObjectId::from_str(FIRST).unwrap();
+        let result = repository.apply_reference_transaction(&[
+            ReferenceEdit::update(
+                ReferenceName::branch("main").unwrap(),
+                first,
+                PreviousValue::MustNotExist,
+            ),
+            ReferenceEdit::update(
+                ReferenceName::branch("Main").unwrap(),
+                first,
+                PreviousValue::MustNotExist,
+            ),
+        ]);
+        assert!(matches!(result, Err(Error::InvalidReference(_))));
+        assert!(repository.resolve_reference("refs/heads/main").is_err());
+        assert!(repository.resolve_reference("refs/heads/Main").is_err());
     }
 
     #[test]

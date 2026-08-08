@@ -1926,7 +1926,7 @@ mod tests {
     #[test]
     fn rejects_pack_object_with_bad_crc32() {
         let fs = MemoryFileSystem::new();
-        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
         let contents = b"crc check";
         let id = ObjectId::compute(ObjectKind::Blob, contents);
         let size = u8::try_from(contents.len()).unwrap();
