@@ -533,9 +533,12 @@ impl Repository {
         if has_symlink_leading_path(self.filesystem(), work_tree, &source)? {
             return Err(Error::BeyondSymbolicLink(source));
         }
-        if options.include_sparse
-            && has_symlink_leading_path(self.filesystem(), work_tree, &destination)?
-        {
+        // Reject a destination reached through any symlinked directory. Git's
+        // `git mv` writes through a depth-1 symlinked destination parent, but
+        // git-rs deliberately guards all leading components: any symlinked
+        // intermediate can redirect the rename outside the repository root,
+        // which the triage's confinement boundary must prevent.
+        if has_symlink_leading_path(self.filesystem(), work_tree, &destination)? {
             return Err(Error::BeyondSymbolicLink(destination));
         }
         let source_index = index_path(&source)?;
@@ -2541,6 +2544,21 @@ mod tests {
             ),
             Err(Error::BeyondSymbolicLink(_))
         ));
+    }
+
+    #[test]
+    fn move_rejects_a_deep_symlinked_destination_ancestor() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.write(Path::new("repo/src"), b"contents").unwrap();
+        repository.add("src").unwrap();
+        fs.create_symlink(Path::new("repo/link"), b"outside").unwrap();
+        assert!(matches!(
+            repository.move_path("src", "link/sub/dst.txt", &MoveOptions::default()),
+            Err(Error::BeyondSymbolicLink(_))
+        ));
+        assert!(fs.exists(Path::new("repo/src")).unwrap());
+        assert!(!fs.exists(Path::new("repo/link/sub/dst.txt")).unwrap());
     }
 
     #[test]

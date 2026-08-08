@@ -121,7 +121,12 @@ impl Repository {
         let mut paths_to_stage = BTreeSet::new();
 
         for path in paths {
-            let full_path = work_tree.join(worktree_path(&path)?);
+            let relative = worktree_path(&path)?;
+            if crate::worktree::has_symlink_leading_path(self.filesystem(), work_tree, &relative)?
+            {
+                return Err(Error::BeyondSymbolicLink(relative));
+            }
+            let full_path = work_tree.join(relative);
             let contents = match self.filesystem().read(&full_path) {
                 Ok(contents) => contents,
                 Err(Error::NotFound(_)) => continue,

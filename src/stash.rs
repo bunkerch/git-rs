@@ -582,7 +582,12 @@ impl Repository {
         let entries = self.flattened_tree(tree, max_object_size)?;
         let mut collisions = Vec::new();
         for entry in &entries {
-            let full = work_tree.join(worktree_path(&entry.path)?);
+            let relative = worktree_path(&entry.path)?;
+            if crate::worktree::has_symlink_leading_path(self.filesystem(), work_tree, &relative)?
+            {
+                return Err(Error::BeyondSymbolicLink(relative));
+            }
+            let full = work_tree.join(relative);
             if self.filesystem().exists(&full)? {
                 collisions.push(entry.path.clone());
             }
@@ -596,7 +601,12 @@ impl Repository {
             ));
         }
         for entry in entries {
-            let full = work_tree.join(worktree_path(&entry.path)?);
+            let relative = worktree_path(&entry.path)?;
+            if crate::worktree::has_symlink_leading_path(self.filesystem(), work_tree, &relative)?
+            {
+                return Err(Error::BeyondSymbolicLink(relative));
+            }
+            let full = work_tree.join(relative);
             if let Some(parent) = full.parent() {
                 self.filesystem().create_dir_all(parent)?;
             }
@@ -681,7 +691,10 @@ fn worktree_path(path: &[u8]) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ChangeKind, FileSystem, HostFileSystem, InitOptions, MemoryFileSystem};
+    use crate::{
+        ChangeKind, FileSystem, HostFileSystem, IndexVersion, InitOptions, MemoryFileSystem, Tree,
+        TreeEntry,
+    };
 
     fn fixture() -> (Repository, MemoryFileSystem, Signature, ObjectId) {
         let filesystem = MemoryFileSystem::new();
@@ -967,6 +980,48 @@ mod tests {
         assert!(
             repository.resolve_reference("refs/stash").is_err(),
             "no stash commit may be created from through-link content"
+        );
+    }
+
+    #[test]
+    fn refuses_restoring_untracked_stash_through_a_symlinked_directory() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let fs = HostFileSystem::new(base.path()).unwrap();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.create_symlink(Path::new("repo/link"), outside.to_str().unwrap().as_bytes())
+            .unwrap();
+        let blob = repository.write_object(ObjectKind::Blob, b"secret\n").unwrap();
+        let link_tree = repository
+            .write_tree(
+                &Tree::new(vec![TreeEntry::new(
+                    EntryMode::Blob,
+                    b"new.txt".to_vec(),
+                    blob,
+                )
+                .unwrap()])
+                .unwrap(),
+            )
+            .unwrap();
+        let untracked = repository
+            .write_tree(
+                &Tree::new(vec![TreeEntry::new(
+                    EntryMode::Tree,
+                    b"link".to_vec(),
+                    link_tree,
+                )
+                .unwrap()])
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            repository.restore_untracked_tree(untracked, IndexVersion::V2, 4096),
+            Err(Error::BeyondSymbolicLink(_))
+        ));
+        assert!(
+            !outside.join("new.txt").exists(),
+            "untracked stash content must not be written outside the worktree"
         );
     }
 }
