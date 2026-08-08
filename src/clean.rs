@@ -1,6 +1,7 @@
 //! Discover and remove untracked worktree content without host assumptions.
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
 use crate::{Error, IgnoreMatcher, Repository, Result};
@@ -146,7 +147,7 @@ impl Repository {
         let directory = context.root.join(relative);
         for child in self.filesystem().read_dir(&directory)? {
             let child_relative = relative.join(child);
-            if child_relative == Path::new(".git")
+            if child_relative.file_name() == Some(OsStr::new(".git"))
                 || context.root.join(&child_relative) == self.git_dir()
             {
                 continue;
@@ -574,5 +575,112 @@ mod tests {
             )
             .unwrap();
         assert!(!filesystem.exists(Path::new("repo/nested")).unwrap());
+    }
+
+    #[test]
+    fn nested_git_directory_survives_recursion_below_tracked_descendant() {
+        let (repository, filesystem) = fixture();
+        filesystem
+            .create_dir_all(Path::new("repo/nested"))
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/nested/tracked.txt"), b"tracked")
+            .unwrap();
+        repository.add("nested/tracked.txt").unwrap();
+        filesystem
+            .create_dir_all(Path::new("repo/nested/.git"))
+            .unwrap();
+        filesystem
+            .write(
+                Path::new("repo/nested/.git/HEAD"),
+                b"ref: refs/heads/main\n",
+            )
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/nested/victim.txt"), b"victim")
+            .unwrap();
+        let discovered = repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(paths(&discovered).contains(&b"nested/victim.txt".to_vec()));
+        assert!(!paths(&discovered).contains(&b"nested/.git".to_vec()));
+        repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    force: true,
+                    dry_run: false,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(!filesystem.exists(Path::new("repo/nested/victim.txt")).unwrap());
+        assert!(
+            filesystem
+                .exists(Path::new("repo/nested/.git/HEAD"))
+                .unwrap()
+        );
+        assert!(
+            filesystem
+                .exists(Path::new("repo/nested/tracked.txt"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn nested_git_gitfile_survives_recursion_below_tracked_descendant() {
+        let (repository, filesystem) = fixture();
+        filesystem
+            .create_dir_all(Path::new("repo/nested"))
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/nested/tracked.txt"), b"tracked")
+            .unwrap();
+        repository.add("nested/tracked.txt").unwrap();
+        filesystem
+            .write(
+                Path::new("repo/nested/.git"),
+                b"gitdir: /external/nested-gitdir\n",
+            )
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/nested/victim.txt"), b"victim")
+            .unwrap();
+        let discovered = repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(paths(&discovered).contains(&b"nested/victim.txt".to_vec()));
+        assert!(!paths(&discovered).contains(&b"nested/.git".to_vec()));
+        repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    force: true,
+                    dry_run: false,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(!filesystem.exists(Path::new("repo/nested/victim.txt")).unwrap());
+        assert!(filesystem.exists(Path::new("repo/nested/.git")).unwrap());
+        assert!(
+            filesystem
+                .exists(Path::new("repo/nested/tracked.txt"))
+                .unwrap()
+        );
     }
 }
