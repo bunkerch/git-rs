@@ -410,21 +410,31 @@ fn clean_git_directory(repository: &Repository, path: &Path, depth: u8) -> Resul
 }
 
 /// Resolve a linked worktree's `commondir` file to the common git directory,
-/// or `None` when the common directory escapes the repository root and cannot
-/// be verified through the repository-scoped filesystem.
+/// or `None` when the common directory cannot be determined and the subtree
+/// must be conservatively preserved: a present but unreadable or empty
+/// `commondir` leaves the common dir unverifiable (git aborts the clean in
+/// this case), and a target escaping the repository root cannot be verified.
 fn clean_common_dir(repository: &Repository, git_dir: &Path) -> Result<Option<PathBuf>> {
     let commondir = git_dir.join("commondir");
-    if repository.filesystem().exists(&commondir)? {
-        if let Ok(contents) = repository.filesystem().read(&commondir) {
-            if let Ok(text) = std::str::from_utf8(&contents) {
-                let target = text.lines().next().map_or("", str::trim);
-                if !target.is_empty() {
-                    return clean_resolve_target(&commondir, target.as_bytes());
-                }
-            }
-        }
+    let metadata = match repository.filesystem().metadata(&commondir) {
+        Ok(metadata) => metadata,
+        Err(Error::NotFound(_)) => return Ok(Some(git_dir.to_path_buf())),
+        Err(_) => return Ok(None),
+    };
+    if !metadata.is_file() {
+        return Ok(Some(git_dir.to_path_buf()));
     }
-    Ok(Some(git_dir.to_path_buf()))
+    let Ok(contents) = repository.filesystem().read(&commondir) else {
+        return Ok(None);
+    };
+    let Ok(text) = std::str::from_utf8(&contents) else {
+        return Ok(None);
+    };
+    let target = text.lines().next().map_or("", str::trim);
+    if target.is_empty() {
+        return Ok(None);
+    }
+    clean_resolve_target(&commondir, target.as_bytes())
 }
 
 /// Resolve a symlink or `gitdir:` target relative to the directory containing
@@ -1812,6 +1822,136 @@ mod tests {
         assert!(root.join("repo/foo/.git").exists());
         assert!(root.join("repo/foo/victim.txt").exists());
         assert!(root.join("repo/foo").exists());
+    }
+
+    #[test]
+    fn untracked_subtree_preserves_linked_worktree_with_empty_commondir() {
+        let (repository, filesystem) = fixture();
+        filesystem
+            .create_dir_all(Path::new("repo/foo/link-to-worktree"))
+            .unwrap();
+        filesystem
+            .create_dir_all(Path::new("repo/foo/worktree-git"))
+            .unwrap();
+        filesystem
+            .write(
+                Path::new("repo/foo/worktree-git/HEAD"),
+                b"ref: refs/heads/main\n",
+            )
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/foo/worktree-git/commondir"), b"")
+            .unwrap();
+        filesystem
+            .write(
+                Path::new("repo/foo/link-to-worktree/.git"),
+                b"gitdir: ../worktree-git\n",
+            )
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/foo/link-to-worktree/victim.txt"), b"victim")
+            .unwrap();
+        repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    force: true,
+                    dry_run: false,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            filesystem
+                .exists(Path::new("repo/foo/link-to-worktree/.git"))
+                .unwrap()
+        );
+        assert!(
+            filesystem
+                .exists(Path::new("repo/foo/link-to-worktree/victim.txt"))
+                .unwrap()
+        );
+        assert!(filesystem.exists(Path::new("repo/foo")).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_untracked_subtree_preserves_linked_worktree_with_unreadable_commondir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = host_fixture_root();
+        let repository =
+            Repository::init(HostFileSystem::new(&root).unwrap(), "repo", &InitOptions::default())
+                .unwrap();
+        std::fs::write(root.join("repo/base.txt"), b"base").unwrap();
+        repository.add("base.txt").unwrap();
+        std::fs::create_dir_all(root.join("repo/foo/link-to-worktree")).unwrap();
+        std::fs::create_dir_all(root.join("repo/foo/worktree-git")).unwrap();
+        std::fs::write(root.join("repo/foo/worktree-git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        let commondir = root.join("repo/foo/worktree-git/commondir");
+        std::fs::write(&commondir, b"../common-git\n").unwrap();
+        std::fs::set_permissions(&commondir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::write(root.join("repo/foo/link-to-worktree/.git"), b"gitdir: ../worktree-git\n").unwrap();
+        std::fs::write(root.join("repo/foo/link-to-worktree/victim.txt"), b"victim").unwrap();
+        repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    force: true,
+                    dry_run: false,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(root.join("repo/foo/link-to-worktree/.git").exists());
+        assert!(root.join("repo/foo/link-to-worktree/victim.txt").exists());
+        assert!(root.join("repo/foo").exists());
+    }
+
+    #[test]
+    fn untracked_subtree_removes_gitfile_to_gitfile_chain() {
+        let (repository, filesystem) = fixture();
+        filesystem.create_dir_all(Path::new("repo/foo/bar")).unwrap();
+        create_git_dir(&filesystem, Path::new("repo/foo/gitreal"));
+        filesystem
+            .write(
+                Path::new("repo/foo/bar/gitfile2"),
+                b"gitdir: ../gitreal\n",
+            )
+            .unwrap();
+        filesystem
+            .write(
+                Path::new("repo/foo/bar/.git"),
+                b"gitdir: gitfile2\n",
+            )
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/foo/bar/victim.txt"), b"victim")
+            .unwrap();
+        let discovered = repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(paths(&discovered).contains(&b"foo".to_vec()));
+        repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    force: true,
+                    dry_run: false,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(!filesystem.exists(Path::new("repo/foo")).unwrap());
     }
 
     fn host_fixture_root() -> std::path::PathBuf {
