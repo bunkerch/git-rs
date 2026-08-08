@@ -369,6 +369,29 @@ impl Repository {
         self.write_atomic(Path::new("config"), &config.encode())?;
         self.invalidate_replacements()
     }
+
+    /// Whether refnames compare case-insensitively, mirroring Git's
+    /// `core.ignorecase`.
+    ///
+    /// Git sets `core.ignorecase` automatically on case-insensitive
+    /// filesystems; git-rs has no host-filesystem case detection and instead
+    /// consults the configured value. The default is case-sensitive when the
+    /// key is absent or no config file exists, so case-only refs remain
+    /// distinct on hosts that store them separately.
+    ///
+    /// # Errors
+    /// Returns an error when an existing config file is malformed.
+    pub(crate) fn case_insensitive_refnames(&self) -> Result<bool> {
+        let config = match self.read_config() {
+            Ok(config) => config,
+            Err(Error::NotFound(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if config.get("core.ignorecase")?.is_none() {
+            return Ok(false);
+        }
+        config.get_bool("core.ignorecase")
+    }
 }
 
 fn parse_key(value: &str) -> Result<Key> {

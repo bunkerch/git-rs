@@ -1094,7 +1094,10 @@ fn reject_file_directory_collisions<'a>(paths: impl Iterator<Item = &'a Vec<u8>>
             .enumerate()
             .filter_map(|(index, byte)| (*byte == b'/').then_some(index))
         {
-            if paths.contains(&path[..slash].to_vec()) {
+            if paths
+                .iter()
+                .any(|existing| existing.as_slice() == &path[..slash])
+            {
                 return Err(Error::InvalidRepository(format!(
                     "file/directory merge conflict at `{}`",
                     String::from_utf8_lossy(&path[..slash])
@@ -1986,7 +1989,7 @@ mod tests {
 
     #[test]
     fn modify_delete_conflict_is_detected() {
-        let (repository, _, signature) = repository();
+        let (repository, _, _) = repository();
         let base = commit(&repository, &[], &[(&b"shared"[..], b"base\n")], 1);
         set_main(&repository, base);
         checkout(&repository, base);
@@ -2011,7 +2014,7 @@ mod tests {
 
     #[test]
     fn file_directory_conflict_is_detected() {
-        let (repository, _, signature) = repository();
+        let (repository, _, _) = repository();
         let base = commit(&repository, &[], &[], 1);
         set_main(&repository, base);
         checkout(&repository, base);

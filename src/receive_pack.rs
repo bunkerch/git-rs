@@ -252,10 +252,20 @@ impl Repository {
             }
         };
         let checked_out = self.checked_out_receive_ref(options)?;
+        let ignore_case = if checked_out.is_some() {
+            self.case_insensitive_refnames()?
+        } else {
+            false
+        };
 
         let mut statuses = Vec::with_capacity(request.commands.len());
         for command in &request.commands {
-            let error = if checked_out.as_ref() == Some(&command.name) {
+            let error = if checked_out
+                .as_ref()
+                .is_some_and(|checked_out| {
+                    matches_checked_out(checked_out, &command.name, ignore_case)
+                })
+            {
                 Some("branch is currently checked out".to_owned())
             } else if !current_matches(self, command)? {
                 Some("stale old object ID".to_owned())
@@ -403,6 +413,18 @@ fn current_matches(repository: &Repository, command: &ReceiveCommand) -> Result<
         Ok(current) => Ok(!command.old.is_null() && current == command.old),
         Err(Error::NotFound(_)) => Ok(command.old.is_null()),
         Err(error) => Err(error),
+    }
+}
+
+fn matches_checked_out(
+    checked_out: &ReferenceName,
+    name: &ReferenceName,
+    ignore_case: bool,
+) -> bool {
+    if ignore_case {
+        checked_out.as_str().eq_ignore_ascii_case(name.as_str())
+    } else {
+        checked_out.as_str() == name.as_str()
     }
 }
 
@@ -802,6 +824,154 @@ mod tests {
             repository.resolve_reference("refs/heads/main").unwrap(),
             current
         );
+    }
+
+    #[test]
+    fn checked_out_branch_update_is_rejected_by_exact_name() {
+        let repository = Repository::init(
+            MemoryFileSystem::new(),
+            "repo",
+            &InitOptions::default(),
+        )
+        .unwrap();
+        let current = repository
+            .write_object(ObjectKind::Blob, b"current")
+            .unwrap();
+        repository.create_branch("main", current, false).unwrap();
+        let replacement = repository
+            .write_object(ObjectKind::Blob, b"replacement")
+            .unwrap();
+        let request = ReceivePackRequest::parse(&receive_input(
+            current,
+            replacement,
+            "refs/heads/main",
+            "report-status",
+            &[],
+        ))
+        .unwrap();
+        let result = repository
+            .receive_pack(&request, &ReceivePackOptions::default())
+            .unwrap();
+        assert_eq!(
+            result.statuses[0].error.as_deref(),
+            Some("branch is currently checked out")
+        );
+        assert_eq!(
+            repository.resolve_reference("refs/heads/main").unwrap(),
+            current
+        );
+    }
+
+    #[test]
+    fn case_only_variant_update_succeeds_without_ignorecase() {
+        let repository = Repository::init(
+            MemoryFileSystem::new(),
+            "repo",
+            &InitOptions::default(),
+        )
+        .unwrap();
+        let current = repository
+            .write_object(ObjectKind::Blob, b"current")
+            .unwrap();
+        repository.create_branch("main", current, false).unwrap();
+        let replacement = repository
+            .write_object(ObjectKind::Blob, b"replacement")
+            .unwrap();
+        let request = ReceivePackRequest::parse(&receive_input(
+            ObjectId::null(),
+            replacement,
+            "refs/heads/Main",
+            "report-status",
+            &[],
+        ))
+        .unwrap();
+        let result = repository
+            .receive_pack(&request, &ReceivePackOptions::default())
+            .unwrap();
+        assert_eq!(result.statuses[0].error, None);
+        assert_eq!(
+            repository.resolve_reference("refs/heads/Main").unwrap(),
+            replacement
+        );
+        assert_eq!(
+            repository.resolve_reference("refs/heads/main").unwrap(),
+            current
+        );
+    }
+
+    #[test]
+    fn case_only_variant_update_is_rejected_with_ignorecase() {
+        let repository = Repository::init(
+            MemoryFileSystem::new(),
+            "repo",
+            &InitOptions::default(),
+        )
+        .unwrap();
+        let current = repository
+            .write_object(ObjectKind::Blob, b"current")
+            .unwrap();
+        repository.create_branch("main", current, false).unwrap();
+        enable_ignorecase(&repository);
+        let replacement = repository
+            .write_object(ObjectKind::Blob, b"replacement")
+            .unwrap();
+        let request = ReceivePackRequest::parse(&receive_input(
+            ObjectId::null(),
+            replacement,
+            "refs/heads/Main",
+            "report-status",
+            &[],
+        ))
+        .unwrap();
+        let result = repository
+            .receive_pack(&request, &ReceivePackOptions::default())
+            .unwrap();
+        assert_eq!(
+            result.statuses[0].error.as_deref(),
+            Some("branch is currently checked out")
+        );
+        assert_eq!(
+            repository.resolve_reference("refs/heads/main").unwrap(),
+            current
+        );
+        assert!(repository.resolve_reference("refs/heads/Main").is_err());
+    }
+
+    #[test]
+    fn non_checked_out_branch_update_still_succeeds() {
+        let repository = Repository::init(
+            MemoryFileSystem::new(),
+            "repo",
+            &InitOptions::default(),
+        )
+        .unwrap();
+        let current = repository
+            .write_object(ObjectKind::Blob, b"current")
+            .unwrap();
+        repository.create_branch("main", current, false).unwrap();
+        let topic = repository.write_object(ObjectKind::Blob, b"topic").unwrap();
+        let request = ReceivePackRequest::parse(&receive_input(
+            ObjectId::null(),
+            topic,
+            "refs/heads/topic",
+            "report-status",
+            &[],
+        ))
+        .unwrap();
+        let result = repository
+            .receive_pack(&request, &ReceivePackOptions::default())
+            .unwrap();
+        assert_eq!(result.statuses[0].error, None);
+        assert_eq!(
+            repository.resolve_reference("refs/heads/topic").unwrap(),
+            topic
+        );
+    }
+
+    fn enable_ignorecase(repository: &Repository) {
+        let mut config = repository.read_config().unwrap();
+        config.set("core.ignorecase", b"true").unwrap();
+        repository.write_config(&config).unwrap();
     }
 
     fn receive_input(
