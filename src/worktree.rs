@@ -1,12 +1,12 @@
 //! Worktree-to-index operations over the abstract filesystem.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use crate::fs::path::{reject_backslash, validate_path};
 use crate::{
-    EntryMode, Error, FileStat, IgnoreMatcher, Index, IndexEntry, ObjectId, ObjectKind, Repository,
-    Result, StatData, Tree, TreeEntry,
+    EntryMode, Error, FileStat, FileSystem, IgnoreMatcher, Index, IndexEntry, ObjectId, ObjectKind,
+    Repository, Result, StatData, Tree, TreeEntry,
 };
 
 #[derive(Clone, Debug)]
@@ -141,6 +141,9 @@ impl Repository {
         let work_tree = self
             .work_tree()
             .ok_or_else(|| Error::InvalidRepository("cannot add from a bare repository".into()))?;
+        if has_symlink_leading_path(self.filesystem(), work_tree, &relative)? {
+            return Err(Error::BeyondSymbolicLink(relative));
+        }
         let existing = self.read_index()?;
         let tracked = existing
             .entries()
@@ -225,6 +228,9 @@ impl Repository {
         let mut ignored = std::collections::BTreeSet::new();
         for path in paths {
             let relative = normalize_relative(path.as_ref())?;
+            if has_symlink_leading_path(self.filesystem(), work_tree, &relative)? {
+                return Err(Error::BeyondSymbolicLink(relative));
+            }
             let prefix = index_path(&relative)?;
             let tracked_match = tracked
                 .iter()
@@ -346,6 +352,18 @@ impl Repository {
             .iter()
             .map(|path| normalize_relative(path.as_ref()).and_then(|path| index_path(&path)))
             .collect::<Result<Vec<_>>>()?;
+        // Index-only (`cached`) removals never touch the filesystem, so the
+        // symlink guard applies only to worktree removals.
+        if !options.cached {
+            if let Some(root) = work_tree {
+                for path in &requested {
+                    let relative = worktree_path(path)?;
+                    if has_symlink_leading_path(self.filesystem(), root, &relative)? {
+                        return Err(Error::BeyondSymbolicLink(relative));
+                    }
+                }
+            }
+        }
         let mut selected = BTreeMap::<Vec<u8>, Vec<&IndexEntry>>::new();
         for prefix in &requested {
             let matches = index
@@ -445,6 +463,12 @@ impl Repository {
             let root = work_tree.ok_or_else(|| {
                 Error::InvalidRepository("worktree removal requires a non-bare repository".into())
             })?;
+            for path in &removed {
+                let relative = worktree_path(path)?;
+                if has_symlink_leading_path(self.filesystem(), root, &relative)? {
+                    return Err(Error::BeyondSymbolicLink(relative));
+                }
+            }
             for (removed_from_worktree, path) in removed.iter().enumerate() {
                 let full = root.join(worktree_path(path)?);
                 let entry = selected[path][0];
@@ -507,6 +531,17 @@ impl Repository {
         })?;
         let source = normalize_relative(source.as_ref())?;
         let destination = normalize_relative(destination.as_ref())?;
+        if has_symlink_leading_path(self.filesystem(), work_tree, &source)? {
+            return Err(Error::BeyondSymbolicLink(source));
+        }
+        // Reject a destination reached through any symlinked directory. Git's
+        // `git mv` writes through a depth-1 symlinked destination parent, but
+        // git-rs deliberately guards all leading components: any symlinked
+        // intermediate can redirect the rename outside the repository root,
+        // which the triage's confinement boundary must prevent.
+        if has_symlink_leading_path(self.filesystem(), work_tree, &destination)? {
+            return Err(Error::BeyondSymbolicLink(destination));
+        }
         let source_index = index_path(&source)?;
         let destination_index = index_path(&destination)?;
         if source_index.is_empty()
@@ -780,6 +815,24 @@ impl Repository {
             .cloned()
             .collect::<Vec<_>>();
         removals.sort_unstable_by_key(|path| std::cmp::Reverse(path.len()));
+        let removals_set = removals.iter().cloned().collect::<BTreeSet<_>>();
+        for path in &removals {
+            let relative = worktree_path(path)?;
+            if has_symlink_leading_path(self.filesystem(), work_tree, &relative)? {
+                return Err(Error::BeyondSymbolicLink(relative));
+            }
+        }
+        for target in &desired {
+            let relative = worktree_path(&target.path)?;
+            if has_symlink_leading_path_replaced(
+                self.filesystem(),
+                work_tree,
+                &relative,
+                &removals_set,
+            )? {
+                return Err(Error::BeyondSymbolicLink(relative));
+            }
+        }
         for path in removals {
             let relative = worktree_path(&path)?;
             let full_path = work_tree.join(&relative);
@@ -1179,6 +1232,81 @@ fn entry_mode(mode: u32) -> Result<EntryMode> {
     }
 }
 
+/// Return whether any leading directory component of a repository-relative
+/// path is a symbolic link on disk.
+///
+/// Mirrors git's `has_symlink_leading_path` refusal ("pathspec is beyond a
+/// symbolic link"): every directory component except the final one is examined
+/// without following symlinks. The final component is intentionally exempt so
+/// that operating on a symlink itself (adding, moving, or removing one) stays
+/// permitted, matching git.
+///
+/// Detection relies on [`FileSystem::metadata`] reporting symlink status for
+/// each leading component. On Windows, directory junctions and other reparse
+/// points are only blocked when the host reports them as symlinks; add
+/// reparse-point detection to `HostFileSystem::metadata` if junction traversal
+/// must be rejected there.
+///
+/// # Errors
+/// Returns storage errors other than an absent leading component, which is
+/// treated as not being a symlink.
+pub(crate) fn has_symlink_leading_path(
+    filesystem: &dyn FileSystem,
+    work_tree: &Path,
+    relative: &Path,
+) -> Result<bool> {
+    let mut prefix = PathBuf::new();
+    for component in relative.components() {
+        if let Component::Normal(part) = component {
+            prefix.push(part);
+            if prefix == relative {
+                continue;
+            }
+            let path = work_tree.join(&prefix);
+            match filesystem.metadata(&path) {
+                Ok(metadata) if metadata.is_symlink() => return Ok(true),
+                Ok(_) | Err(Error::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Like [`has_symlink_leading_path`], but leading components that this checkout
+/// replaces with real directories (currently-tracked paths present in
+/// `removals`) are not treated as symlink traversal.
+///
+/// Git handles the symlink- or file-to-directory transition by removing the
+/// old entry before materializing the directory, so those leading components
+/// are never traversed; only symlinks that survive the checkout block the path.
+pub(crate) fn has_symlink_leading_path_replaced(
+    filesystem: &dyn FileSystem,
+    work_tree: &Path,
+    relative: &Path,
+    removals: &BTreeSet<Vec<u8>>,
+) -> Result<bool> {
+    let mut prefix = PathBuf::new();
+    for component in relative.components() {
+        if let Component::Normal(part) = component {
+            prefix.push(part);
+            if prefix == relative {
+                continue;
+            }
+            if removals.contains(&index_path(&prefix)?) {
+                continue;
+            }
+            let path = work_tree.join(&prefix);
+            match filesystem.metadata(&path) {
+                Ok(metadata) if metadata.is_symlink() => return Ok(true),
+                Ok(_) | Err(Error::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn normalize_relative(path: &Path) -> Result<PathBuf> {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -1382,7 +1510,9 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::{FileSystem, IndexVersion, InitOptions, MemoryFileSystem};
+    use crate::{
+        FileSystem, HostFileSystem, IndexVersion, InitOptions, MemoryFileSystem,
+    };
 
     #[test]
     fn recursively_adds_files_executables_and_symlinks_in_memory() {
@@ -2254,5 +2384,281 @@ mod tests {
                 "expected {path:?} to be accepted"
             );
         }
+    }
+
+    /// Stage an index entry for `link/secret.txt` so symlink-guard checks that
+    /// require a tracked source are reachable even though `add` now refuses it.
+    fn stage_through_link(repository: &Repository) {
+        let index = repository.read_index().unwrap();
+        let secret = ObjectId::compute(ObjectKind::Blob, b"top-secret\n");
+        let mut entries = index.entries().to_vec();
+        entries.push(
+            IndexEntry::new("link/secret.txt", 0o100_644, secret, StatData::default()).unwrap(),
+        );
+        repository
+            .write_index(&Index::new(index.version(), entries).unwrap())
+            .unwrap();
+    }
+
+    fn symlink_escape_fixture() -> (tempfile::TempDir, HostFileSystem, Repository) {
+        let base = tempfile::tempdir().unwrap();
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"top-secret\n").unwrap();
+        let fs = HostFileSystem::new(base.path()).unwrap();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.create_symlink(Path::new("repo/link"), outside.to_str().unwrap().as_bytes())
+            .unwrap();
+        (base, fs, repository)
+    }
+
+    #[test]
+    fn rejects_adding_through_a_symlinked_directory() {
+        let (base, _, repository) = symlink_escape_fixture();
+        assert!(matches!(
+            repository.add("link/secret.txt"),
+            Err(Error::BeyondSymbolicLink(_))
+        ));
+        assert!(repository.read_index().unwrap().entries().is_empty());
+        assert!(base.path().join("outside/secret.txt").exists());
+    }
+
+    #[test]
+    fn rejects_moving_through_a_symlinked_directory_before_renaming() {
+        let (base, _, repository) = symlink_escape_fixture();
+        stage_through_link(&repository);
+        assert!(matches!(
+            repository.move_path("link/secret.txt", "moved.txt", &MoveOptions::default()),
+            Err(Error::BeyondSymbolicLink(_))
+        ));
+        assert!(
+            base.path().join("outside/secret.txt").exists(),
+            "external file must not be relocated"
+        );
+        assert!(
+            !base.path().join("repo/moved.txt").exists(),
+            "no file may be moved into the repository"
+        );
+    }
+
+    #[test]
+    fn rejects_removing_through_a_symlinked_directory() {
+        let (base, _, repository) = symlink_escape_fixture();
+        stage_through_link(&repository);
+        assert!(matches!(
+            repository.remove(&["link/secret.txt"], &RemoveOptions::default()),
+            Err(Error::BeyondSymbolicLink(_))
+        ));
+        assert!(base.path().join("outside/secret.txt").exists());
+    }
+
+    #[test]
+    fn rejects_checkout_through_a_symlinked_directory() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let fs = HostFileSystem::new(base.path()).unwrap();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.create_symlink(Path::new("repo/link"), outside.to_str().unwrap().as_bytes())
+            .unwrap();
+        let blob = repository
+            .write_object(ObjectKind::Blob, b"secret\n")
+            .unwrap();
+        let link_tree = repository
+            .write_tree(
+                &Tree::new(vec![TreeEntry::new(
+                    EntryMode::Blob,
+                    b"secret.txt".to_vec(),
+                    blob,
+                )
+                .unwrap()])
+                .unwrap(),
+            )
+            .unwrap();
+        let tree = repository
+            .write_tree(
+                &Tree::new(vec![TreeEntry::new(
+                    EntryMode::Tree,
+                    b"link".to_vec(),
+                    link_tree,
+                )
+                .unwrap()])
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            repository.checkout_tree(
+                tree,
+                &CheckoutOptions {
+                    force: true,
+                    ..CheckoutOptions::default()
+                }
+            ),
+            Err(Error::BeyondSymbolicLink(_))
+        ));
+        assert!(
+            !outside.join("secret.txt").exists(),
+            "checkout must not write through a symlinked directory"
+        );
+    }
+
+    #[test]
+    fn adding_and_moving_through_real_directories_still_works() {
+        let base = tempfile::tempdir().unwrap();
+        let fs = HostFileSystem::new(base.path()).unwrap();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.create_dir_all(Path::new("repo/dir")).unwrap();
+        fs.write(Path::new("repo/dir/file"), b"contents").unwrap();
+        assert_eq!(repository.add("dir/file").unwrap(), 1);
+        assert_eq!(
+            repository
+                .move_path("dir/file", "moved.txt", &MoveOptions::default())
+                .unwrap(),
+            1
+        );
+        assert_eq!(fs.read(Path::new("repo/moved.txt")).unwrap(), b"contents");
+        assert!(!fs.exists(Path::new("repo/dir/file")).unwrap());
+    }
+
+    #[test]
+    fn moving_a_symlink_file_itself_is_still_allowed() {
+        let base = tempfile::tempdir().unwrap();
+        let fs = HostFileSystem::new(base.path()).unwrap();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.write(Path::new("repo/target"), b"contents").unwrap();
+        fs.create_symlink(Path::new("repo/link"), b"target").unwrap();
+        repository.add("link").unwrap();
+        assert_eq!(
+            repository
+                .move_path("link", "renamed-link", &MoveOptions::default())
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            fs.read_link(Path::new("repo/renamed-link")).unwrap(),
+            b"target"
+        );
+        assert!(!fs.exists(Path::new("repo/link")).unwrap());
+    }
+
+    #[test]
+    fn checkout_replaces_a_tracked_symlink_pointing_outside_with_a_directory() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let fs = HostFileSystem::new(base.path()).unwrap();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.create_symlink(Path::new("repo/link"), outside.to_str().unwrap().as_bytes())
+            .unwrap();
+        repository.add("link").unwrap();
+        let blob = repository
+            .write_object(ObjectKind::Blob, b"nested\n")
+            .unwrap();
+        let link_tree = repository
+            .write_tree(
+                &Tree::new(vec![TreeEntry::new(
+                    EntryMode::Blob,
+                    b"sub.txt".to_vec(),
+                    blob,
+                )
+                .unwrap()])
+                .unwrap(),
+            )
+            .unwrap();
+        let desired = repository
+            .write_tree(
+                &Tree::new(vec![TreeEntry::new(
+                    EntryMode::Tree,
+                    b"link".to_vec(),
+                    link_tree,
+                )
+                .unwrap()])
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            repository
+                .checkout_tree(desired, &CheckoutOptions::default())
+                .unwrap(),
+            1
+        );
+        assert!(!fs.metadata(Path::new("repo/link")).unwrap().is_symlink());
+        assert_eq!(fs.read(Path::new("repo/link/sub.txt")).unwrap(), b"nested\n");
+        assert!(
+            !outside.join("sub.txt").exists(),
+            "checkout must not write through the replaced symlink"
+        );
+    }
+
+    #[test]
+    fn sparse_move_rejects_a_symlinked_destination() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.write(Path::new("repo/src"), b"contents").unwrap();
+        repository.add("src").unwrap();
+        fs.create_symlink(Path::new("repo/link"), b"outside").unwrap();
+        let index = repository.read_index().unwrap();
+        let entries = index
+            .entries()
+            .iter()
+            .map(|entry| entry.clone().with_skip_worktree(true))
+            .collect::<Vec<_>>();
+        repository
+            .write_index(&Index::new(IndexVersion::V3, entries).unwrap())
+            .unwrap();
+        assert!(matches!(
+            repository.move_path(
+                "src",
+                "link/dst.txt",
+                &MoveOptions {
+                    include_sparse: true,
+                    ..MoveOptions::default()
+                }
+            ),
+            Err(Error::BeyondSymbolicLink(_))
+        ));
+    }
+
+    #[test]
+    fn move_rejects_a_deep_symlinked_destination_ancestor() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.write(Path::new("repo/src"), b"contents").unwrap();
+        repository.add("src").unwrap();
+        fs.create_symlink(Path::new("repo/link"), b"outside").unwrap();
+        assert!(matches!(
+            repository.move_path("src", "link/sub/dst.txt", &MoveOptions::default()),
+            Err(Error::BeyondSymbolicLink(_))
+        ));
+        assert!(fs.exists(Path::new("repo/src")).unwrap());
+        assert!(!fs.exists(Path::new("repo/link/sub/dst.txt")).unwrap());
+    }
+
+    #[test]
+    fn cached_removal_ignores_symlinked_leading_paths() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.create_symlink(Path::new("repo/link"), b"outside").unwrap();
+        let index = repository.read_index().unwrap();
+        let secret = ObjectId::compute(ObjectKind::Blob, b"top-secret\n");
+        let mut entries = index.entries().to_vec();
+        entries.push(
+            IndexEntry::new("link/secret.txt", 0o100_644, secret, StatData::default()).unwrap(),
+        );
+        repository
+            .write_index(&Index::new(index.version(), entries).unwrap())
+            .unwrap();
+        let removed = repository
+            .remove(
+                &["link/secret.txt"],
+                &RemoveOptions {
+                    cached: true,
+                    ..RemoveOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(removed, vec![b"link/secret.txt".to_vec()]);
+        assert!(repository.read_index().unwrap().entries().is_empty());
+        assert!(fs.exists(Path::new("repo/link")).unwrap());
     }
 }

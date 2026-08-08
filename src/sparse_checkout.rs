@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::worktree::worktree_path;
+use crate::worktree::{has_symlink_leading_path, worktree_path};
 use crate::{
     Config, Error, IgnoreMatcher, Index, IndexVersion, Repository, RestoreOptions, Result,
 };
@@ -302,6 +302,11 @@ impl Repository {
             return Ok(report);
         }
         for (_, relative) in &remove {
+            if has_symlink_leading_path(self.filesystem(), root, relative)? {
+                return Err(Error::BeyondSymbolicLink(relative.clone()));
+            }
+        }
+        for (_, relative) in &remove {
             let full = root.join(relative);
             self.filesystem().remove_file(&full)?;
             self.prune_empty_parents(root, relative.parent())?;
@@ -548,8 +553,9 @@ mod tests {
     use std::path::Path;
 
     use crate::{
-        CommitOptions, FileSystem, InitOptions, MemoryFileSystem, Repository, Signature,
-        SparseCheckoutOptions,
+        CommitOptions, Error, FileSystem, HostFileSystem, Index, IndexEntry, InitOptions,
+        MemoryFileSystem, ObjectId, ObjectKind, Repository, Signature, SparseCheckoutOptions,
+        StatData,
     };
 
     fn repository() -> (Repository, MemoryFileSystem) {
@@ -716,6 +722,41 @@ mod tests {
             !filesystem
                 .exists(Path::new("repo/.git/config.lock"))
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_sparse_removal_through_a_symlinked_directory() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("x.txt"), b"x\n").unwrap();
+        let fs = HostFileSystem::new(base.path()).unwrap();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.create_symlink(Path::new("repo/link"), outside.to_str().unwrap().as_bytes())
+            .unwrap();
+        let index = repository.read_index().unwrap();
+        let x = ObjectId::compute(ObjectKind::Blob, b"x\n");
+        let mut entries = index.entries().to_vec();
+        entries.push(IndexEntry::new("link/x.txt", 0o100_644, x, StatData::default()).unwrap());
+        repository
+            .write_index(&Index::new(index.version(), entries).unwrap())
+            .unwrap();
+        assert!(matches!(
+            repository.apply_sparse_selection(
+                &[],
+                &SparseCheckoutOptions {
+                    cone: true,
+                    force: true,
+                    ..SparseCheckoutOptions::default()
+                },
+                false,
+            ),
+            Err(Error::BeyondSymbolicLink(_))
+        ));
+        assert!(
+            outside.join("x.txt").exists(),
+            "external file must not be deleted by sparse removal"
         );
     }
 }

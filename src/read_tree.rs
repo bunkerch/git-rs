@@ -232,6 +232,26 @@ impl Repository {
         if !rejected.is_empty() {
             return Err(Error::CheckoutConflict(rejected));
         }
+        let removals_set = removals.iter().cloned().collect::<BTreeSet<_>>();
+        for path in &removals {
+            let relative = worktree_path(path)?;
+            if crate::worktree::has_symlink_leading_path(self.filesystem(), root, &relative)? {
+                return Err(Error::BeyondSymbolicLink(relative));
+            }
+        }
+        for parent in &obstructing_parents {
+            let relative = parent
+                .strip_prefix(root)
+                .map_err(|_| Error::InvalidPath(parent.clone()))?;
+            if crate::worktree::has_symlink_leading_path_replaced(
+                self.filesystem(),
+                root,
+                relative,
+                &removals_set,
+            )? {
+                return Err(Error::BeyondSymbolicLink(relative.to_path_buf()));
+            }
+        }
         if dry_run {
             return Ok(());
         }
@@ -557,9 +577,10 @@ fn read_error<T>(message: impl Into<String>) -> Result<T> {
 mod tests {
     use super::ReadTreeOptions;
     use crate::{
-        Index, IndexEntry, IndexVersion, InitOptions, MemoryFileSystem, ObjectKind, Repository,
-        StatData,
+        Error, FileSystem, HostFileSystem, Index, IndexEntry, IndexVersion, InitOptions,
+        MemoryFileSystem, ObjectId, ObjectKind, Repository, StatData,
     };
+    use std::path::Path;
 
     #[test]
     fn replaces_empties_and_binds_prefixed_trees_atomically() {
@@ -835,6 +856,45 @@ mod tests {
                 .map(IndexEntry::stage)
                 .collect::<Vec<_>>(),
             [1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn refuses_update_worktree_removal_through_a_symlinked_directory() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"top-secret\n").unwrap();
+        let fs = HostFileSystem::new(base.path()).unwrap();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        fs.create_symlink(Path::new("repo/link"), outside.to_str().unwrap().as_bytes())
+            .unwrap();
+        let index = repository.read_index().unwrap();
+        let secret = ObjectId::compute(ObjectKind::Blob, b"top-secret\n");
+        let mut entries = index.entries().to_vec();
+        entries.push(
+            IndexEntry::new("link/secret.txt", 0o100_644, secret, StatData::default()).unwrap(),
+        );
+        repository
+            .write_index(&Index::new(index.version(), entries).unwrap())
+            .unwrap();
+        let empty = repository
+            .write_index_tree(&Index::new(IndexVersion::V2, Vec::new()).unwrap())
+            .unwrap();
+        assert!(matches!(
+            repository.read_tree_into_index(
+                &[empty],
+                &ReadTreeOptions {
+                    update_worktree: true,
+                    reset: true,
+                    ..ReadTreeOptions::default()
+                }
+            ),
+            Err(Error::BeyondSymbolicLink(_))
+        ));
+        assert!(
+            outside.join("secret.txt").exists(),
+            "read-tree -u must not delete through a symlinked directory"
         );
     }
 
