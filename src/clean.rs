@@ -74,8 +74,12 @@ impl Repository {
     ///
     /// Like `git clean`, a directory with tracked descendants is recursed into
     /// even when it contains a nested repository (only its untracked content is
-    /// removed), and a `.git` entry — a directory or gitfile, at any depth — is
-    /// never removed without that authority.
+    /// removed), and a real nested repository's `.git` — a directory or a valid
+    /// `gitdir:` gitfile, at any depth — is never removed without that
+    /// authority. Plain directories or garbage files merely named `.git` are
+    /// cleaned, exactly as git cleans them. With `remove_nested_repositories`,
+    /// nested repositories and their emptied ancestors are removed wholesale
+    /// (mirroring `git clean -ffd`).
     ///
     /// # Errors
     /// Returns an error for a bare repository, unsafe path, missing force,
@@ -130,11 +134,14 @@ impl Repository {
         }
         for entry in &entries {
             let full = work_tree.join(clean_worktree_path(&entry.path)?);
+            let worktree_path = clean_worktree_path(&entry.path)?;
+            let parent = worktree_path.parent();
             if entry.directory {
                 remove_clean_tree(self, &full)?;
+                prune_clean_parents(self, work_tree, parent)?;
             } else {
                 self.filesystem().remove_file(&full)?;
-                prune_clean_parents(self, work_tree, clean_worktree_path(&entry.path)?.parent())?;
+                prune_clean_parents(self, work_tree, parent)?;
             }
         }
         Ok(entries)
@@ -146,10 +153,11 @@ impl Repository {
         ignores: &mut IgnoreMatcher,
         context: &CleanContext<'_>,
         output: &mut Vec<CleanEntry>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let relative_bytes = clean_index_path(relative)?;
         ignores.add_worktree_patterns(self, context.root, &relative_bytes)?;
         let directory = context.root.join(relative);
+        let mut preserved = false;
         for child in self.filesystem().read_dir(&directory)? {
             let child_relative = relative.join(child);
             if child_relative.file_name() == Some(OsStr::new(".git"))
@@ -164,6 +172,7 @@ impl Repository {
             }
             let path = clean_index_path(&child_relative)?;
             if context.gitlinks.contains(&path) {
+                preserved = true;
                 continue;
             }
             let metadata = self
@@ -174,14 +183,17 @@ impl Repository {
             if metadata.is_dir() {
                 let tracked_below = clean_tracked_below(context.tracked, &path);
                 if tracked_below {
+                    preserved = true;
                     self.collect_clean_entries(&child_relative, ignores, context, output)?;
                     continue;
                 }
                 if !selected && !ancestor {
+                    preserved = true;
                     continue;
                 }
                 let nested = nested_repository(self, context.root, &child_relative)?;
                 if nested && !context.options.remove_nested_repositories {
+                    preserved = true;
                     continue;
                 }
                 let repository_ignored = ignores.is_ignored(&path, true);
@@ -190,27 +202,28 @@ impl Repository {
                     clean_mode_matches(context.options.ignored, repository_ignored, manual);
                 let fully_selected = selected && !ancestor;
                 if context.options.directories && fully_selected && removable {
-                    if nested
-                        || !clean_directory_contains_git(
-                            self,
-                            context.root,
-                            &child_relative,
-                            self.git_dir(),
-                        )?
-                    {
+                    let mut temp = Vec::new();
+                    let child_preserved =
+                        self.collect_clean_entries(&child_relative, ignores, context, &mut temp)?;
+                    if child_preserved {
+                        preserved = true;
+                        output.extend(temp);
+                    } else {
                         output.push(CleanEntry {
                             path,
                             directory: true,
                         });
-                    } else {
-                        self.collect_clean_entries(&child_relative, ignores, context, output)?;
                     }
                 } else if ancestor
                     || (context.options.ignored == CleanIgnoredMode::Only
                         && !repository_ignored
                         && !manual)
                 {
-                    self.collect_clean_entries(&child_relative, ignores, context, output)?;
+                    let child_preserved =
+                        self.collect_clean_entries(&child_relative, ignores, context, output)?;
+                    preserved |= child_preserved;
+                } else {
+                    preserved = true;
                 }
             } else if selected && !context.tracked.contains(&path) {
                 let repository_ignored = ignores.is_ignored(&path, false);
@@ -220,10 +233,14 @@ impl Repository {
                         path,
                         directory: false,
                     });
+                } else {
+                    preserved = true;
                 }
+            } else {
+                preserved = true;
             }
         }
-        Ok(())
+        Ok(preserved)
     }
 }
 
@@ -269,37 +286,66 @@ fn clean_tracked_below(tracked: &BTreeSet<Vec<u8>>, path: &[u8]) -> bool {
 }
 
 fn nested_repository(repository: &Repository, root: &Path, relative: &Path) -> Result<bool> {
-    repository
-        .filesystem()
-        .exists(&root.join(relative).join(".git"))
+    let entry = root.join(relative).join(".git");
+    if !repository.filesystem().exists(&entry)? {
+        return Ok(false);
+    }
+    clean_git_repository(repository, &entry)
 }
 
-/// Detect a `.git` entry (directory or gitfile) anywhere below `relative`,
-/// mirroring git's per-entry `.git` skip at every level. Used before a
-/// directory is queued for wholesale removal so a nested repository at any
-/// depth is never destroyed without `remove_nested_repositories` authority.
-fn clean_directory_contains_git(
-    repository: &Repository,
-    root: &Path,
-    relative: &Path,
-    git_dir: &Path,
-) -> Result<bool> {
-    let directory = root.join(relative);
-    for child in repository.filesystem().read_dir(&directory)? {
-        let child_relative = relative.join(child);
-        if root.join(&child_relative) == git_dir {
-            continue;
-        }
-        if child_relative.file_name() == Some(OsStr::new(".git")) {
-            return Ok(true);
-        }
-        if repository.filesystem().metadata(&root.join(&child_relative))?.is_dir()
-            && clean_directory_contains_git(repository, root, &child_relative, git_dir)?
-        {
-            return Ok(true);
-        }
+/// True when `entry` (a path named `.git`) is a real repository, matching
+/// git's `is_nonbare_repository_dir`: a git directory with a valid `HEAD`
+/// (or `objects`/`refs`), or a file in `gitdir: <path>` format. Plain empty
+/// directories or garbage files named `.git` are not repositories and are
+/// cleaned, exactly as git cleans them.
+fn clean_git_repository(repository: &Repository, entry: &Path) -> Result<bool> {
+    let metadata = repository.filesystem().metadata(entry)?;
+    if metadata.is_dir() {
+        return Ok(clean_valid_head(repository, &entry.join("HEAD"))?
+            || (repository.filesystem().exists(&entry.join("objects"))?
+                && repository.filesystem().exists(&entry.join("refs"))?));
     }
-    Ok(false)
+    let Ok(contents) = repository.filesystem().read(entry) else {
+        return Ok(false);
+    };
+    let Ok(text) = std::str::from_utf8(&contents) else {
+        return Ok(false);
+    };
+    Ok(text
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("gitdir: "))
+        .map(str::trim)
+        .is_some_and(|target| !target.is_empty()))
+}
+
+/// Mirror `validate_headref`: a symbolic ref to `refs/...`, a `ref:` symbolic
+/// ref, or a detached hexadecimal object id.
+fn clean_valid_head(repository: &Repository, head: &Path) -> Result<bool> {
+    let Ok(metadata) = repository.filesystem().metadata(head) else {
+        return Ok(false);
+    };
+    if metadata.is_symlink() {
+        return Ok(repository
+            .filesystem()
+            .read_link(head)?
+            .starts_with(&b"refs/"[..]));
+    }
+    if !metadata.is_file() {
+        return Ok(false);
+    }
+    let Ok(contents) = repository.filesystem().read(head) else {
+        return Ok(false);
+    };
+    let Ok(text) = std::str::from_utf8(&contents) else {
+        return Ok(false);
+    };
+    let text = text.trim_start();
+    if let Some(rest) = text.strip_prefix("ref:") {
+        return Ok(rest.trim_start().starts_with("refs/"));
+    }
+    let hex = text.trim_end();
+    Ok(matches!(hex.len(), 40 | 64) && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 fn remove_clean_tree(repository: &Repository, path: &Path) -> Result<()> {
@@ -944,23 +990,22 @@ mod tests {
     }
 
     #[test]
-    fn deeper_tracked_descendant_preserves_git_at_third_level() {
+    fn tracked_ancestor_preserves_real_git_at_depth_three() {
         let (repository, filesystem) = fixture();
         filesystem
-            .create_dir_all(Path::new("repo/nested/sub/.git"))
+            .create_dir_all(Path::new("repo/tracked-dir/sub/.git"))
             .unwrap();
         filesystem
             .write(
-                Path::new("repo/nested/sub/.git/HEAD"),
+                Path::new("repo/tracked-dir/sub/.git/HEAD"),
                 b"ref: refs/heads/main\n",
             )
             .unwrap();
         filesystem
-            .write(Path::new("repo/nested/tracked.txt"), b"tracked")
+            .write(Path::new("repo/tracked-dir/sub/victim.txt"), b"victim")
             .unwrap();
-        repository.add("nested/tracked.txt").unwrap();
         filesystem
-            .write(Path::new("repo/nested/sub/victim.txt"), b"victim")
+            .write(Path::new("repo/tracked-dir/other.txt"), b"other")
             .unwrap();
         let discovered = repository
             .clean::<&str>(
@@ -971,7 +1016,12 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(!paths(&discovered).iter().any(|path| path.starts_with(b"nested/")));
+        assert!(paths(&discovered).contains(&b"tracked-dir/other.txt".to_vec()));
+        assert!(
+            !paths(&discovered)
+                .iter()
+                .any(|path| path.starts_with(b"tracked-dir/sub"))
+        );
         repository
             .clean::<&str>(
                 &[],
@@ -985,18 +1035,158 @@ mod tests {
             .unwrap();
         assert!(
             filesystem
-                .exists(Path::new("repo/nested/sub/.git/HEAD"))
+                .exists(Path::new("repo/tracked-dir/sub/.git/HEAD"))
                 .unwrap()
         );
         assert!(
             filesystem
-                .exists(Path::new("repo/nested/sub/victim.txt"))
+                .exists(Path::new("repo/tracked-dir/sub/victim.txt"))
                 .unwrap()
         );
+        assert!(!filesystem.exists(Path::new("repo/tracked-dir/other.txt")).unwrap());
         assert!(
             filesystem
-                .exists(Path::new("repo/nested/tracked.txt"))
+                .exists(Path::new("repo/tracked-dir/file"))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn tracked_subtree_cleans_invalid_git_directory() {
+        let (repository, filesystem) = fixture();
+        filesystem
+            .create_dir_all(Path::new("repo/tracked-dir/sub/.git"))
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/tracked-dir/sub/victim.txt"), b"victim")
+            .unwrap();
+        let discovered = repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(paths(&discovered).contains(&b"tracked-dir/sub".to_vec()));
+        repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    force: true,
+                    dry_run: false,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(!filesystem.exists(Path::new("repo/tracked-dir/sub")).unwrap());
+        assert!(
+            filesystem
+                .exists(Path::new("repo/tracked-dir/file"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn authorized_removal_prunes_empty_parents_of_deep_nested_repository() {
+        let (repository, filesystem) = fixture();
+        filesystem
+            .create_dir_all(Path::new("repo/foo/bar/.git"))
+            .unwrap();
+        filesystem
+            .write(
+                Path::new("repo/foo/bar/.git/HEAD"),
+                b"ref: refs/heads/main\n",
+            )
+            .unwrap();
+        repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    force: true,
+                    remove_nested_repositories: true,
+                    dry_run: false,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(!filesystem.exists(Path::new("repo/foo/bar/.git/HEAD")).unwrap());
+        assert!(!filesystem.exists(Path::new("repo/foo/bar")).unwrap());
+        assert!(!filesystem.exists(Path::new("repo/foo")).unwrap());
+    }
+
+    #[test]
+    fn untracked_subtree_removes_plain_empty_git_directory() {
+        let (repository, filesystem) = fixture();
+        filesystem
+            .create_dir_all(Path::new("repo/foo/bar/.git"))
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/foo/bar/victim.txt"), b"victim")
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/foo/other.txt"), b"other")
+            .unwrap();
+        let discovered = repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(paths(&discovered).contains(&b"foo".to_vec()));
+        repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    force: true,
+                    dry_run: false,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(!filesystem.exists(Path::new("repo/foo")).unwrap());
+    }
+
+    #[test]
+    fn untracked_subtree_removes_garbage_git_file() {
+        let (repository, filesystem) = fixture();
+        filesystem
+            .create_dir_all(Path::new("repo/foo/bar"))
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/foo/bar/.git"), b"not a gitfile")
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/foo/bar/victim.txt"), b"victim")
+            .unwrap();
+        let discovered = repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(paths(&discovered).contains(&b"foo".to_vec()));
+        repository
+            .clean::<&str>(
+                &[],
+                &CleanOptions {
+                    directories: true,
+                    force: true,
+                    dry_run: false,
+                    ..CleanOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(!filesystem.exists(Path::new("repo/foo")).unwrap());
     }
 }
