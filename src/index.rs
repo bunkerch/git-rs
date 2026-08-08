@@ -590,7 +590,7 @@ fn encode_entry(
     Ok(())
 }
 
-fn validate_path(path: &[u8]) -> Result<()> {
+pub(crate) fn validate_path(path: &[u8]) -> Result<()> {
     if path.is_empty()
         || path[0] == b'/'
         || path.contains(&0)

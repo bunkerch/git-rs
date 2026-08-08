@@ -439,6 +439,7 @@ impl Repository {
         path: &[u8],
         options: &SubmoduleDeinitOptions,
     ) -> Result<SubmoduleDeinitReport> {
+        validate_submodule_path(path)?;
         let selection = SubmoduleOptions {
             paths: vec![path.to_vec()],
             max_modules: options.max_modules,
@@ -1130,9 +1131,10 @@ fn parse_modules(data: &[u8], options: &SubmoduleOptions) -> Result<Vec<Submodul
 fn validate_submodule_path(path: &[u8]) -> Result<()> {
     if path.is_empty()
         || path.contains(&0)
+        || path.contains(&b'\\')
         || path.starts_with(b"/")
         || path.ends_with(b"/")
-        || path.split(|byte| *byte == b'/').any(|part| {
+        || path.split(|byte| *byte == b'/' || *byte == b'\\').any(|part| {
             part.is_empty() || part == b"." || part == b".." || part.eq_ignore_ascii_case(b".git")
         })
     {
@@ -1607,5 +1609,41 @@ mod tests {
         );
 
         assert_deinit_and_restore(&superproject, &filesystem, &mut transport);
+    }
+
+    #[test]
+    fn rejects_windows_backslash_submodule_paths() {
+        for path in [&b"..\\pwned"[..], &b"foo\\bar"[..], &b"..\\pwned\\x"[..]] {
+            assert!(
+                validate_submodule_path(path).is_err(),
+                "expected {path:?} to be rejected"
+            );
+        }
+        assert!(validate_submodule_path(b"deps/lib").is_ok());
+    }
+
+    #[test]
+    fn add_and_deinit_reject_backslash_paths_without_escaping() {
+        let filesystem = MemoryFileSystem::new();
+        let (remote, _) = remote_fixture(&filesystem);
+        let superproject =
+            Repository::init(filesystem.clone(), "super", &InitOptions::default()).unwrap();
+        let mut transport = RepositoryTransport::new(&remote, UploadPackOptions::default());
+        assert!(
+            superproject
+                .add_submodule(
+                    b"..\\pwned",
+                    b"memory://remote",
+                    &mut transport,
+                    &SubmoduleAddOptions::default(),
+                )
+                .is_err()
+        );
+        assert!(!filesystem.exists(Path::new("super/..\\pwned")).unwrap());
+        assert!(
+            superproject
+                .deinit_submodule(b"foo\\bar", &SubmoduleDeinitOptions::default())
+                .is_err()
+        );
     }
 }
