@@ -14,6 +14,11 @@ pub struct HostFileSystem {
 impl HostFileSystem {
     /// Create a host adapter rooted at `root`, creating the root when needed.
     ///
+    /// The root is canonicalized once at construction so that every subsequent
+    /// operation can verify its resolved target stays inside it. If the root
+    /// directory is renamed after construction, the cached canonical root
+    /// becomes stale and containment checks fail closed.
+    ///
     /// # Errors
     /// Returns an I/O error when the root directory cannot be created.
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
@@ -60,6 +65,15 @@ impl HostFileSystem {
     /// new files cannot traverse a symlink out of the root either. A component
     /// that is itself a symlink is resolved with [`fs::canonicalize`], which
     /// fails for dangling links instead of permitting the operation to escape.
+    ///
+    /// The check rejects symlinks that resolve outside the root: legitimate
+    /// in-root layouts (`.git` or `objects` as a symlink to another in-root
+    /// location, symlinked refs) keep working, while any symlink chain that
+    /// points outside the root fails with [`Error::InvalidPath`]. The
+    /// canonicalize-then-open sequence is not atomic, so an attacker who can
+    /// swap paths concurrently between the check and the open could still
+    /// redirect an operation; this is the inherent limit of a std-only
+    /// containment check.
     fn contained(&self, candidate: &Path, original: &Path) -> Result<PathBuf> {
         let mut missing = Vec::new();
         let mut path = candidate;
@@ -291,67 +305,6 @@ mod tests {
         (dir, fs)
     }
 
-    #[cfg(unix)]
-    fn symlink(target: &Path, link: &Path) {
-        std::os::unix::fs::symlink(target, link).unwrap();
-    }
-
-    #[test]
-    fn read_rejects_a_symlink_that_escapes_the_root() {
-        let (dir, fs) = test_fs();
-        std::fs::write(dir.path().join("outside.txt"), b"secret").unwrap();
-        symlink(Path::new("../outside.txt"), &fs.root().join("leak.txt"));
-        assert!(matches!(
-            fs.read(Path::new("leak.txt")),
-            Err(Error::InvalidPath(_))
-        ));
-    }
-
-    #[test]
-    fn write_rejects_a_symlink_that_escapes_the_root() {
-        let (dir, fs) = test_fs();
-        std::fs::write(dir.path().join("outside.txt"), b"secret").unwrap();
-        symlink(Path::new("../outside.txt"), &fs.root().join("leak.txt"));
-        assert!(matches!(
-            fs.write(Path::new("leak.txt"), b"owned"),
-            Err(Error::InvalidPath(_))
-        ));
-        assert_eq!(
-            std::fs::read(dir.path().join("outside.txt")).unwrap(),
-            b"secret"
-        );
-    }
-
-    #[test]
-    fn write_rejects_creation_through_a_dangling_symlink() {
-        let (dir, fs) = test_fs();
-        symlink(Path::new("../nonexistent"), &fs.root().join("linkdir"));
-        assert!(fs.write(Path::new("linkdir/file.txt"), b"owned").is_err());
-        assert!(!dir.path().join("nonexistent").exists());
-    }
-
-    #[test]
-    fn read_follows_a_symlink_that_stays_inside_the_root() {
-        let (_dir, fs) = test_fs();
-        fs.create_dir_all(Path::new("dir")).unwrap();
-        fs.write(Path::new("dir/real.txt"), b"data").unwrap();
-        symlink(Path::new("dir/real.txt"), &fs.root().join("link.txt"));
-        assert_eq!(fs.read(Path::new("link.txt")).unwrap(), b"data");
-    }
-
-    #[test]
-    fn read_follows_an_in_root_directory_symlink() {
-        let (_dir, fs) = test_fs();
-        fs.create_dir_all(Path::new("real")).unwrap();
-        fs.write(Path::new("real/HEAD"), b"ref: refs/heads/main\n")
-            .unwrap();
-        symlink(Path::new("real"), &fs.root().join(".git"));
-        assert_eq!(
-            fs.read(Path::new(".git/HEAD")).unwrap(),
-            b"ref: refs/heads/main\n"
-        );
-    }
-
     #[test]
     fn normal_file_operations_are_unaffected() {
         let (_dir, fs) = test_fs();
@@ -375,5 +328,186 @@ mod tests {
             fs.read_dir(Path::new(".")),
             Ok(entries) if entries.is_empty()
         ));
+    }
+
+    #[cfg(unix)]
+    mod symlinks {
+        use super::*;
+        use crate::{InitOptions, Repository, ShowIndexOptions};
+
+        fn symlink(target: &Path, link: &Path) {
+            std::os::unix::fs::symlink(target, link).unwrap();
+        }
+
+        fn escape_dir(dir: &Path) -> PathBuf {
+            let outside = dir.join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            outside
+        }
+
+        #[test]
+        fn read_rejects_a_symlink_that_escapes_the_root() {
+            let (dir, fs) = test_fs();
+            std::fs::write(dir.path().join("outside.txt"), b"secret").unwrap();
+            symlink(Path::new("../outside.txt"), &fs.root().join("leak.txt"));
+            assert!(matches!(
+                fs.read(Path::new("leak.txt")),
+                Err(Error::InvalidPath(_))
+            ));
+        }
+
+        #[test]
+        fn write_rejects_a_symlink_that_escapes_the_root() {
+            let (dir, fs) = test_fs();
+            std::fs::write(dir.path().join("outside.txt"), b"secret").unwrap();
+            symlink(Path::new("../outside.txt"), &fs.root().join("leak.txt"));
+            assert!(matches!(
+                fs.write(Path::new("leak.txt"), b"owned"),
+                Err(Error::InvalidPath(_))
+            ));
+            assert_eq!(
+                std::fs::read(dir.path().join("outside.txt")).unwrap(),
+                b"secret"
+            );
+        }
+
+        #[test]
+        fn write_rejects_creation_through_an_existing_directory_symlink() {
+            let (dir, fs) = test_fs();
+            let outside = escape_dir(dir.path());
+            symlink(Path::new("../outside"), &fs.root().join("linkdir"));
+            assert!(matches!(
+                fs.write(Path::new("linkdir/file.txt"), b"owned"),
+                Err(Error::InvalidPath(_))
+            ));
+            assert!(!outside.join("file.txt").exists());
+        }
+
+        #[test]
+        fn write_new_rejects_creation_through_an_escaping_directory_symlink() {
+            let (dir, fs) = test_fs();
+            let outside = escape_dir(dir.path());
+            symlink(Path::new("../outside"), &fs.root().join("linkdir"));
+            assert!(matches!(
+                fs.write_new(Path::new("linkdir/new.txt"), b"owned"),
+                Err(Error::InvalidPath(_))
+            ));
+            assert!(!outside.join("new.txt").exists());
+        }
+
+        #[test]
+        fn create_dir_all_rejects_creation_through_an_escaping_directory_symlink() {
+            let (dir, fs) = test_fs();
+            let outside = escape_dir(dir.path());
+            symlink(Path::new("../outside"), &fs.root().join("linkdir"));
+            assert!(matches!(
+                fs.create_dir_all(Path::new("linkdir/newdir")),
+                Err(Error::InvalidPath(_))
+            ));
+            assert!(!outside.join("newdir").exists());
+        }
+
+        #[test]
+        fn read_dir_rejects_an_escaping_directory_symlink() {
+            let (dir, fs) = test_fs();
+            escape_dir(dir.path());
+            symlink(Path::new("../outside"), &fs.root().join("linkdir"));
+            assert!(matches!(
+                fs.read_dir(Path::new("linkdir")),
+                Err(Error::InvalidPath(_))
+            ));
+        }
+
+        #[test]
+        fn rename_rejects_an_escaping_destination_directory() {
+            let (dir, fs) = test_fs();
+            fs.write(Path::new("inside.txt"), b"data").unwrap();
+            let outside = escape_dir(dir.path());
+            symlink(Path::new("../outside"), &fs.root().join("linkdir"));
+            assert!(matches!(
+                fs.rename(Path::new("inside.txt"), Path::new("linkdir/moved.txt")),
+                Err(Error::InvalidPath(_))
+            ));
+            assert_eq!(fs.read(Path::new("inside.txt")).unwrap(), b"data");
+            assert!(!outside.join("moved.txt").exists());
+        }
+
+        #[test]
+        fn remove_file_rejects_removal_through_an_escaping_directory_symlink() {
+            let (dir, fs) = test_fs();
+            let outside = escape_dir(dir.path());
+            std::fs::write(outside.join("victim.txt"), b"secret").unwrap();
+            symlink(Path::new("../outside"), &fs.root().join("linkdir"));
+            assert!(matches!(
+                fs.remove_file(Path::new("linkdir/victim.txt")),
+                Err(Error::InvalidPath(_))
+            ));
+            assert!(outside.join("victim.txt").exists());
+        }
+
+        #[test]
+        fn metadata_rejects_an_escaping_intermediate_directory_symlink() {
+            let (dir, fs) = test_fs();
+            let outside = escape_dir(dir.path());
+            std::fs::write(outside.join("target.txt"), b"secret").unwrap();
+            symlink(Path::new("../outside"), &fs.root().join("linkdir"));
+            assert!(matches!(
+                fs.metadata(Path::new("linkdir/target.txt")),
+                Err(Error::InvalidPath(_))
+            ));
+        }
+
+        #[test]
+        fn set_executable_rejects_an_escaping_file_symlink() {
+            let (dir, fs) = test_fs();
+            std::fs::write(dir.path().join("outside.txt"), b"secret").unwrap();
+            symlink(Path::new("../outside.txt"), &fs.root().join("leak.txt"));
+            assert!(matches!(
+                fs.set_executable(Path::new("leak.txt"), true),
+                Err(Error::InvalidPath(_))
+            ));
+        }
+
+        #[test]
+        fn read_follows_a_symlink_that_stays_inside_the_root() {
+            let (_dir, fs) = test_fs();
+            fs.create_dir_all(Path::new("dir")).unwrap();
+            fs.write(Path::new("dir/real.txt"), b"data").unwrap();
+            symlink(Path::new("dir/real.txt"), &fs.root().join("link.txt"));
+            assert_eq!(fs.read(Path::new("link.txt")).unwrap(), b"data");
+        }
+
+        #[test]
+        fn read_follows_an_in_root_directory_symlink() {
+            let (_dir, fs) = test_fs();
+            fs.create_dir_all(Path::new("real")).unwrap();
+            fs.write(Path::new("real/HEAD"), b"ref: refs/heads/main\n")
+                .unwrap();
+            symlink(Path::new("real"), &fs.root().join(".git"));
+            assert_eq!(
+                fs.read(Path::new(".git/HEAD")).unwrap(),
+                b"ref: refs/heads/main\n"
+            );
+        }
+
+        #[test]
+        fn show_index_rejects_an_escaping_symlink() {
+            let (dir, fs) = test_fs();
+            let mut body = Vec::new();
+            body.extend_from_slice(&[0_u8; 256 * 4]);
+            body.extend_from_slice(&[0_u8; 20]);
+            let mut index = body.clone();
+            index.extend_from_slice(&crate::object::sha1::digest(&body));
+            std::fs::write(dir.path().join("outside.idx"), &index).unwrap();
+
+            let repo = Repository::init(fs, "repo", &InitOptions::default()).unwrap();
+            repo.filesystem()
+                .create_symlink(Path::new("repo/leak.idx"), b"../../outside.idx")
+                .unwrap();
+            assert!(matches!(
+                repo.show_index("repo/leak.idx", &ShowIndexOptions::default()),
+                Err(Error::InvalidPath(_))
+            ));
+        }
     }
 }
