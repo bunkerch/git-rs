@@ -168,8 +168,13 @@ impl Repository {
                 path.push(b'/');
             }
             path.extend_from_slice(item.name());
+            // Reject traversal components from repository-controlled tree entry
+            // names before selection/attribute filtering. This is fail-closed by
+            // design: git's default archive also refuses such trees wholesale
+            // (verify_path during index unpack), so a `.`/`..` entry rejects the
+            // archive even when `paths` or export-ignore would have excluded it.
             if has_unsafe_path_component(&path) {
-                return Err(Error::InvalidPath(bytes_path(&path)));
+                return Err(archive_path_error(&path));
             }
             let selected =
                 selections.is_empty() || selections.iter().any(|value| path_selected(&path, value));
@@ -561,6 +566,13 @@ fn has_unsafe_path_component(path: &[u8]) -> bool {
         .any(|component| matches!(component, b"." | b".."))
 }
 
+fn archive_path_error(path: &[u8]) -> Error {
+    Error::InvalidRepository(format!(
+        "invalid archive path '{}': traversal component",
+        bytes_path(path).display()
+    ))
+}
+
 fn bytes_path(value: &[u8]) -> std::path::PathBuf {
     String::from_utf8_lossy(value).into_owned().into()
 }
@@ -603,6 +615,11 @@ fn encode_tar(
     }
     for (index, entry) in entries.iter().enumerate() {
         let path = entry_path(entry);
+        // Defense-in-depth: the collector already rejects traversal components,
+        // but any future caller path must not reach TAR/PAX headers verbatim.
+        if has_unsafe_path_component(&path) {
+            return Err(archive_path_error(&path));
+        }
         let link = (entry.mode == EntryMode::Link).then_some(entry.data.as_slice());
         let mut pax = Vec::new();
         if !tar_path_fits(&path) {
@@ -773,6 +790,11 @@ fn encode_zip(
     let extra = zip_time_extra(unix_time);
     for entry in entries {
         let path = entry_path(entry);
+        // Defense-in-depth: the collector already rejects traversal components,
+        // but any future caller path must not reach ZIP headers verbatim.
+        if has_unsafe_path_component(&path) {
+            return Err(archive_path_error(&path));
+        }
         if path.len() > usize::from(u16::MAX) {
             return Err(archive_too_large());
         }
@@ -1208,76 +1230,82 @@ mod tests {
     fn archive_rejects_dotdot_tree_entries() {
         let (repository, _commit) = fixture();
         let blob = repository.write_object(ObjectKind::Blob, b"owned\n").unwrap();
+        let empty = repository
+            .write_tree(&crate::Tree::new(Vec::new()).unwrap())
+            .unwrap();
 
-        let top_level = crate::Tree::new(vec![
+        assert_rejected(
+            &repository,
+            &crate::Tree::new(vec![
+                crate::TreeEntry::new(EntryMode::Blob, b"..".to_vec(), blob).unwrap(),
+            ])
+            .unwrap(),
+        );
+
+        let inner = crate::Tree::new(vec![
             crate::TreeEntry::new(EntryMode::Blob, b"..".to_vec(), blob).unwrap(),
         ])
         .unwrap();
-        let top_level = repository.write_tree(&top_level).unwrap();
-        for format in [ArchiveFormat::Tar, ArchiveFormat::Zip] {
-            assert!(
-                repository
-                    .archive(
-                        &top_level.to_string(),
-                        &ArchiveOptions {
-                            format,
-                            ..ArchiveOptions::default()
-                        },
-                    )
-                    .is_err()
-            );
-        }
-
-        let nested_blob = repository
-            .write_object(ObjectKind::Blob, b"nested\n")
-            .unwrap();
-        let inner = crate::Tree::new(vec![
-            crate::TreeEntry::new(EntryMode::Blob, b"..".to_vec(), nested_blob).unwrap(),
-        ])
-        .unwrap();
         let inner = repository.write_tree(&inner).unwrap();
-        let outer = crate::Tree::new(vec![
-            crate::TreeEntry::new(EntryMode::Tree, b"dir".to_vec(), inner).unwrap(),
-        ])
-        .unwrap();
-        let outer = repository.write_tree(&outer).unwrap();
-        for format in [ArchiveFormat::Tar, ArchiveFormat::Zip] {
-            assert!(
-                repository
-                    .archive(
-                        &outer.to_string(),
-                        &ArchiveOptions {
-                            format,
-                            ..ArchiveOptions::default()
-                        },
-                    )
-                    .is_err()
-            );
-        }
+        assert_rejected(
+            &repository,
+            &crate::Tree::new(vec![
+                crate::TreeEntry::new(EntryMode::Tree, b"dir".to_vec(), inner).unwrap(),
+            ])
+            .unwrap(),
+        );
+
+        assert_rejected(
+            &repository,
+            &crate::Tree::new(vec![
+                crate::TreeEntry::new(EntryMode::Link, b"..".to_vec(), blob).unwrap(),
+            ])
+            .unwrap(),
+        );
+
+        assert_rejected(
+            &repository,
+            &crate::Tree::new(vec![
+                crate::TreeEntry::new(EntryMode::Tree, b"..".to_vec(), empty).unwrap(),
+            ])
+            .unwrap(),
+        );
     }
 
     #[test]
     fn archive_rejects_single_dot_tree_entries() {
         let (repository, _commit) = fixture();
         let blob = repository.write_object(ObjectKind::Blob, b"owned\n").unwrap();
+        assert_rejected(
+            &repository,
+            &crate::Tree::new(vec![
+                crate::TreeEntry::new(EntryMode::Blob, b".".to_vec(), blob).unwrap(),
+            ])
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    fn archive_fails_closed_when_paths_exclude_dotdot_entry() {
+        let (repository, _commit) = fixture();
+        let blob = repository.write_object(ObjectKind::Blob, b"owned\n").unwrap();
         let tree = crate::Tree::new(vec![
-            crate::TreeEntry::new(EntryMode::Blob, b".".to_vec(), blob).unwrap(),
+            crate::TreeEntry::new(EntryMode::Blob, b"..".to_vec(), blob).unwrap(),
+            crate::TreeEntry::new(EntryMode::Blob, b"ok".to_vec(), blob).unwrap(),
         ])
         .unwrap();
         let tree = repository.write_tree(&tree).unwrap();
-        for format in [ArchiveFormat::Tar, ArchiveFormat::Zip] {
-            assert!(
-                repository
-                    .archive(
-                        &tree.to_string(),
-                        &ArchiveOptions {
-                            format,
-                            ..ArchiveOptions::default()
-                        },
-                    )
-                    .is_err()
-            );
-        }
+        let result = repository.archive(
+            &tree.to_string(),
+            &ArchiveOptions {
+                paths: vec![b"ok".to_vec()],
+                ..ArchiveOptions::default()
+            },
+        );
+        assert!(
+            matches!(result, Err(Error::InvalidRepository(message)) if message.contains("traversal")),
+            "fail-closed: a `..` entry rejects the archive even when `paths` excludes it"
+        );
     }
 
     #[test]
@@ -1295,6 +1323,58 @@ mod tests {
                 .unwrap();
             assert!(!archive.windows(2).any(|value| value == b".."));
             assert!(archive.windows(5).any(|value| value == b"plain"));
+        }
+    }
+
+    #[test]
+    fn has_unsafe_path_component_detects_dot_and_dotdot() {
+        let unsafe_paths: &[&[u8]] = &[
+            b"..",
+            b".",
+            b"a/.",
+            b"a/..",
+            b"../a",
+            b"./a",
+            b"a/../b",
+            b"a/./b",
+            b"a/b/..",
+        ];
+        for path in unsafe_paths {
+            assert!(has_unsafe_path_component(path), "{path:?} should be unsafe");
+        }
+        let safe_paths: &[&[u8]] = &[
+            b"",
+            b"a",
+            b"a/b",
+            b"a/",
+            b"/",
+            b"a/b/",
+            b"..a",
+            b"a..",
+            b"...",
+        ];
+        for path in safe_paths {
+            assert!(
+                !has_unsafe_path_component(path),
+                "{path:?} should be safe"
+            );
+        }
+    }
+
+    fn assert_rejected(repository: &Repository, tree: &crate::Tree) {
+        let tree = repository.write_tree(tree).unwrap();
+        for format in [ArchiveFormat::Tar, ArchiveFormat::Zip] {
+            let result = repository.archive(
+                &tree.to_string(),
+                &ArchiveOptions {
+                    format,
+                    ..ArchiveOptions::default()
+                },
+            );
+            assert!(
+                matches!(result, Err(Error::InvalidRepository(message)) if message.contains("traversal")),
+                "expected traversal rejection for {format:?}"
+            );
         }
     }
 
