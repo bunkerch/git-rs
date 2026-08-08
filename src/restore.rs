@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
+use crate::worktree::worktree_path as restore_worktree_path;
 use crate::{Error, Index, IndexEntry, ObjectId, ObjectKind, Repository, Result, StatData};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -381,24 +382,6 @@ fn restore_index_path(path: &Path) -> Result<Vec<u8>> {
     path.to_str()
         .map(|path| path.replace('\\', "/").into_bytes())
         .ok_or_else(|| Error::InvalidPath(path.to_path_buf()))
-}
-
-#[cfg(unix)]
-#[allow(clippy::unnecessary_wraps)]
-fn restore_worktree_path(path: &[u8]) -> Result<PathBuf> {
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt;
-    Ok(path
-        .split(|byte| *byte == b'/')
-        .map(OsStr::from_bytes)
-        .collect())
-}
-
-#[cfg(not(unix))]
-fn restore_worktree_path(path: &[u8]) -> Result<PathBuf> {
-    std::str::from_utf8(path)
-        .map(|path| path.split('/').collect())
-        .map_err(|_| Error::InvalidPath(PathBuf::from("non-UTF-8 index path")))
 }
 
 #[cfg(test)]

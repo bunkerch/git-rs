@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::index::validate_path;
+use crate::fs::path::validate_path;
 use crate::worktree::worktree_path;
 use crate::{Error, FileStat, IndexEntry, ObjectKind, Repository, Result, StatData};
 

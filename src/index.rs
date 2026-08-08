@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 use std::path::Path;
 
-use crate::fs::is_ntfs_dotgit;
+use crate::fs::path::validate_path;
 use crate::object::sha1;
 use crate::{Error, ObjectId, Repository, Result};
 
@@ -587,22 +587,6 @@ fn encode_entry(
         data.extend_from_slice(&entry.path);
         data.push(0);
         data.resize(start + (data.len() - start).div_ceil(8) * 8, 0);
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_path(path: &[u8]) -> Result<()> {
-    if path.is_empty()
-        || path[0] == b'/'
-        || path.contains(&0)
-        || path.contains(&b'\\')
-        || path
-            .split(|byte| *byte == b'/' || *byte == b'\\')
-            .any(|part| {
-                part.is_empty() || matches!(part, b"." | b"..") || is_ntfs_dotgit(part)
-            })
-    {
-        return Err(Error::InvalidRepository("unsafe index path".into()));
     }
     Ok(())
 }

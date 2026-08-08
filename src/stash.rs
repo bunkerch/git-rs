@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::worktree::worktree_path;
 use crate::{
     CheckoutOptions, CommitBuilder, EntryMode, Error, Index, IndexEntry, ObjectId, ObjectKind,
     PreviousValue, ReferenceName, ReferenceTarget, Repository, Result, Signature, StatData,
@@ -654,20 +655,6 @@ fn remove_worktree_file(repository: &Repository, root: &Path, path: &[u8]) -> Re
     Ok(())
 }
 
-#[cfg(unix)]
-#[allow(clippy::unnecessary_wraps)]
-fn worktree_path(path: &[u8]) -> Result<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
-    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(path)))
-}
-
-#[cfg(not(unix))]
-fn worktree_path(path: &[u8]) -> Result<PathBuf> {
-    let path = std::str::from_utf8(path)
-        .map_err(|_| Error::InvalidRepository("non-UTF-8 worktree path".into()))?;
-    Ok(PathBuf::from(path))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -916,5 +903,12 @@ mod tests {
             filesystem.read(Path::new("repo/saved.txt")).unwrap(),
             b"collision\n"
         );
+    }
+
+    #[test]
+    fn worktree_path_consistently_rejects_backslashes() {
+        assert!(worktree_path(b"..\\pwned").is_err());
+        assert!(worktree_path(b"foo\\bar").is_err());
+        assert!(worktree_path(b"deps/lib").is_ok());
     }
 }

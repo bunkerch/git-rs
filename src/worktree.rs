@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
+use crate::fs::path::{reject_backslash, validate_path};
 use crate::{
     EntryMode, Error, FileStat, IgnoreMatcher, Index, IndexEntry, ObjectId, ObjectKind, Repository,
     Result, StatData, Tree, TreeEntry,
@@ -702,6 +703,9 @@ impl Repository {
             Error::InvalidRepository("cannot check out into a bare repository".into())
         })?;
         let mut desired = self.flattened_tree(tree, options.max_object_size)?;
+        for target in &desired {
+            validate_path(&target.path)?;
+        }
         desired.sort_unstable_by(|left, right| left.path.cmp(&right.path));
 
         let current = self.read_index()?;
@@ -1330,6 +1334,7 @@ pub(crate) fn worktree_path(path: &[u8]) -> Result<PathBuf> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
+    reject_backslash(path)?;
     let mut output = PathBuf::new();
     for component in path.split(|byte| *byte == b'/') {
         if crate::fs::is_ntfs_dotgit(component) {
@@ -1344,6 +1349,7 @@ pub(crate) fn worktree_path(path: &[u8]) -> Result<PathBuf> {
 
 #[cfg(not(unix))]
 pub(crate) fn worktree_path(path: &[u8]) -> Result<PathBuf> {
+    reject_backslash(path)?;
     let text = std::str::from_utf8(path)
         .map_err(|_| Error::InvalidPath(PathBuf::from("non-UTF-8 index path")))?;
     for component in text.split('/') {
@@ -1771,6 +1777,39 @@ mod tests {
         ));
         assert_eq!(fs.read(Path::new("repo/untracked")).unwrap(), b"local");
         assert!(repository.read_index().unwrap().entries().is_empty());
+    }
+
+    #[test]
+    fn checkout_rejects_gitlink_with_backslash_path_before_creating_directory() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let gitlink = repository.write_object(ObjectKind::Blob, b"x").unwrap();
+        let tree = repository
+            .write_tree(
+                &Tree::new(vec![TreeEntry::new(
+                    EntryMode::Gitlink,
+                    b"..\\pwned".to_vec(),
+                    gitlink,
+                )
+                .unwrap()])
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            repository.checkout_tree(tree, &CheckoutOptions::default()),
+            Err(Error::InvalidRepository(_))
+        ));
+        assert!(!fs.exists(Path::new("repo/..\\pwned")).unwrap());
+        assert!(!fs.exists(Path::new("pwned")).unwrap());
+    }
+
+    #[test]
+    fn worktree_path_rejects_backslashes_on_all_platforms() {
+        assert!(worktree_path(b"..\\pwned").is_err());
+        assert!(worktree_path(b"foo\\bar").is_err());
+        assert!(worktree_path(b"a\\b\\c").is_err());
+        assert!(worktree_path(b"deps/lib").is_ok());
+        assert!(worktree_path(b"plain").is_ok());
     }
 
     fn removal_fixture() -> (Repository, MemoryFileSystem) {

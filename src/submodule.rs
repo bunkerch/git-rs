@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::fs::path::validate_path;
 use crate::worktree::worktree_path;
 use crate::{
     CheckoutOptions, CloneOptions, Config, Error, FetchOptions, IndexEntry, ObjectId, Repository,
@@ -439,6 +440,7 @@ impl Repository {
         path: &[u8],
         options: &SubmoduleDeinitOptions,
     ) -> Result<SubmoduleDeinitReport> {
+        validate_path(path)?;
         let selection = SubmoduleOptions {
             paths: vec![path.to_vec()],
             max_modules: options.max_modules,
@@ -1131,24 +1133,18 @@ fn parse_modules(data: &[u8], options: &SubmoduleOptions) -> Result<Vec<Submodul
 
 /// Validate a `.gitmodules` name or declared path as a safe relative path.
 ///
-/// Components are split on both `/` and `\` (git's `is_xplatform_dir_sep`), so
-/// crafted values such as `foo/../..` or `foo\..\..` cannot escape the
-/// `.git/modules` administration directory. Unlike git, which warns and skips
-/// suspicious entries, this library rejects the whole configuration.
+/// Delegates to the crate's shared [`crate::fs::path::validate_path`], which
+/// rejects absolute paths, NUL bytes, Windows backslash separators, empty/`.`
+//// `..` components, and `.git`-sensitive components (including the
+/// Windows-normalized aliases detected by `is_ntfs_dotgit`), so crafted values
+/// such as `foo/../..` or `foo\..\..` cannot escape the `.git/modules`
+/// administration directory. Unlike git, which warns and skips suspicious
+/// entries, this library rejects the whole configuration.
 fn validate_relative_path(path: &[u8], what: &str) -> Result<()> {
-    if path.is_empty()
-        || path.contains(&0)
-        || path
-            .split(|byte| matches!(*byte, b'/' | b'\\'))
-            .any(|part| {
-                part.is_empty() || part == b"." || part == b".." || part.eq_ignore_ascii_case(b".git")
-            })
-    {
-        return Err(Error::InvalidRepository(format!("unsafe submodule {what}")));
-    }
-    Ok(())
+    crate::fs::path::validate_path(path).map_err(|_| {
+        Error::InvalidRepository(format!("unsafe submodule {what}"))
+    })
 }
-
 fn subsection_value<'a>(config: &'a Config, subsection: &[u8], name: &str) -> Option<&'a [u8]> {
     config_value_in_subsection(config, "submodule", subsection, name)
 }
@@ -1690,5 +1686,41 @@ mod tests {
         );
 
         assert_deinit_and_restore(&superproject, &filesystem, &mut transport);
+    }
+
+    #[test]
+    fn rejects_windows_backslash_submodule_paths() {
+        for path in [&b"..\\pwned"[..], &b"foo\\bar"[..], &b"..\\pwned\\x"[..]] {
+            assert!(
+                validate_path(path).is_err(),
+                "expected {path:?} to be rejected"
+            );
+        }
+        assert!(validate_path(b"deps/lib").is_ok());
+    }
+
+    #[test]
+    fn add_and_deinit_reject_backslash_paths_without_escaping() {
+        let filesystem = MemoryFileSystem::new();
+        let (remote, _) = remote_fixture(&filesystem);
+        let superproject =
+            Repository::init(filesystem.clone(), "super", &InitOptions::default()).unwrap();
+        let mut transport = RepositoryTransport::new(&remote, UploadPackOptions::default());
+        assert!(
+            superproject
+                .add_submodule(
+                    b"..\\pwned",
+                    b"memory://remote",
+                    &mut transport,
+                    &SubmoduleAddOptions::default(),
+                )
+                .is_err()
+        );
+        assert!(!filesystem.exists(Path::new("super/..\\pwned")).unwrap());
+        assert!(
+            superproject
+                .deinit_submodule(b"foo\\bar", &SubmoduleDeinitOptions::default())
+                .is_err()
+        );
     }
 }
