@@ -210,8 +210,8 @@ impl Repository {
     ///
     /// # Errors
     /// Returns an error for bare repositories, missing/non-file/oversized or
-    /// malformed config, duplicate names/paths/required keys, unsafe paths,
-    /// exceeded module limits, or storage failures.
+    /// malformed config, duplicate names/paths/required keys, unsafe names or
+    /// paths, exceeded module limits, or storage failures.
     pub fn submodules(&self, options: &SubmoduleOptions) -> Result<Vec<Submodule>> {
         let worktree = self
             .work_tree()
@@ -335,9 +335,9 @@ impl Repository {
         transport: &mut T,
         options: &SubmoduleAddOptions,
     ) -> Result<SubmoduleAddReport> {
-        validate_submodule_path(path)?;
+        validate_relative_path(path, "path")?;
         let name = options.name.as_deref().unwrap_or(path);
-        validate_submodule_path(name)?;
+        validate_relative_path(name, "name")?;
         if url.is_empty() || url.contains(&0) {
             return Err(Error::InvalidRepository("invalid submodule URL".into()));
         }
@@ -706,6 +706,7 @@ impl Repository {
     }
 
     fn submodule_admin_path(&self, name: &[u8]) -> Result<PathBuf> {
+        validate_relative_path(name, "name")?;
         let modules_root = self.common_dir().join("modules");
         let name_path = worktree_path(name)?;
         let mut prefix = modules_root.clone();
@@ -1067,6 +1068,7 @@ fn parse_modules(data: &[u8], options: &SubmoduleOptions) -> Result<Vec<Submodul
             .subsection()
             .ok_or_else(|| Error::InvalidRepository("submodule section has no name".into()))?
             .to_vec();
+        validate_relative_path(&name, "name")?;
         let value = entry
             .value()
             .ok_or_else(|| Error::InvalidRepository("implicit submodule value".into()))?
@@ -1098,7 +1100,7 @@ fn parse_modules(data: &[u8], options: &SubmoduleOptions) -> Result<Vec<Submodul
                 String::from_utf8_lossy(&name)
             ))
         })?;
-        validate_submodule_path(&path)?;
+        validate_relative_path(&path, "path")?;
         let url = builder.url.ok_or_else(|| {
             Error::InvalidRepository(format!(
                 "submodule `{}` has no URL",
@@ -1127,16 +1129,22 @@ fn parse_modules(data: &[u8], options: &SubmoduleOptions) -> Result<Vec<Submodul
     Ok(output)
 }
 
-fn validate_submodule_path(path: &[u8]) -> Result<()> {
+/// Validate a `.gitmodules` name or declared path as a safe relative path.
+///
+/// Components are split on both `/` and `\` (git's `is_xplatform_dir_sep`), so
+/// crafted values such as `foo/../..` or `foo\..\..` cannot escape the
+/// `.git/modules` administration directory. Unlike git, which warns and skips
+/// suspicious entries, this library rejects the whole configuration.
+fn validate_relative_path(path: &[u8], what: &str) -> Result<()> {
     if path.is_empty()
         || path.contains(&0)
-        || path.starts_with(b"/")
-        || path.ends_with(b"/")
-        || path.split(|byte| *byte == b'/').any(|part| {
-            part.is_empty() || part == b"." || part == b".." || part.eq_ignore_ascii_case(b".git")
-        })
+        || path
+            .split(|byte| matches!(*byte, b'/' | b'\\'))
+            .any(|part| {
+                part.is_empty() || part == b"." || part == b".." || part.eq_ignore_ascii_case(b".git")
+            })
     {
-        return Err(Error::InvalidRepository("unsafe submodule path".into()));
+        return Err(Error::InvalidRepository(format!("unsafe submodule {what}")));
     }
     Ok(())
 }
@@ -1296,6 +1304,81 @@ mod tests {
         let duplicate =
             b"[submodule \"a\"]\npath = x\nurl = a\n[submodule \"b\"]\npath = x\nurl = b\n";
         assert!(parse_modules(duplicate, &SubmoduleOptions::default()).is_err());
+    }
+
+    #[test]
+    fn rejects_suspicious_submodule_names() {
+        for name in [
+            b"foo/../..".as_slice(),
+            b"..",
+            b"a/../b",
+            b".git",
+            b".GIT",
+            b"",
+            b"/leading",
+            b"trailing/",
+            b"a//b",
+        ] {
+            let config = format!(
+                "[submodule \"{}\"]\n\tpath = deps\n\turl = x\n",
+                String::from_utf8_lossy(name)
+            );
+            assert!(
+                parse_modules(config.as_bytes(), &SubmoduleOptions::default()).is_err(),
+                "suspicious submodule name `{}` must be rejected",
+                String::from_utf8_lossy(name)
+            );
+        }
+        // Backslash separators reach the name after config unquoting (`\\` -> `\`).
+        for name in [b"foo\\\\..\\\\..".as_slice(), b"..\\\\pwned", b"a\\\\..\\\\b"] {
+            let config = format!(
+                "[submodule \"{}\"]\n\tpath = deps\n\turl = x\n",
+                String::from_utf8_lossy(name)
+            );
+            assert!(
+                parse_modules(config.as_bytes(), &SubmoduleOptions::default()).is_err(),
+                "suspicious submodule name `{}` must be rejected",
+                String::from_utf8_lossy(name)
+            );
+        }
+        let control = b"[submodule \"deps/lib\"]\n\tpath = deps/lib\n\turl = x\n";
+        let modules = parse_modules(control, &SubmoduleOptions::default()).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name(), b"deps/lib");
+
+        let unicode = b"[submodule \"deps/m\xC3\xBCnchen\"]\n\tpath = deps/m\xC3\xBCnchen\n\turl = x\n";
+        let modules = parse_modules(unicode, &SubmoduleOptions::default()).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name(), b"deps/m\xC3\xBCnchen");
+    }
+
+    #[test]
+    fn validates_name_and_path_components_consistently() {
+        for value in [
+            b"foo\\..\\..".as_slice(),
+            b"..\\pwned",
+            b"a\\..\\b",
+            b".GIT",
+            b"/x",
+            b"x/",
+            b"a//b",
+            b"a\0b",
+        ] {
+            assert!(
+                validate_relative_path(value, "name").is_err(),
+                "name `{}` must be rejected",
+                String::from_utf8_lossy(value)
+            );
+            assert!(
+                validate_relative_path(value, "path").is_err(),
+                "path `{}` must be rejected",
+                String::from_utf8_lossy(value)
+            );
+        }
+        for value in [b"lib".as_slice(), b"deps/lib", "deps/münchen".as_bytes()] {
+            assert!(validate_relative_path(value, "name").is_ok());
+            assert!(validate_relative_path(value, "path").is_ok());
+        }
     }
 
     #[test]
