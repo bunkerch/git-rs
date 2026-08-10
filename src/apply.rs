@@ -178,7 +178,7 @@ impl Repository {
         if index_data.is_some()
             && let Err(error) = self
                 .filesystem()
-                .rename(&index_lock, &self.git_path("index"))
+                .publish(&index_lock, &self.git_path("index"))
         {
             let _ = self.filesystem().remove_file(&index_lock);
             return Err(error);

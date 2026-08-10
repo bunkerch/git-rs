@@ -300,6 +300,19 @@ mod tests {
     }
 
     #[test]
+    fn publish_atomically_replaces_a_file() {
+        let fs = MemoryFileSystem::new();
+        fs.write(Path::new("HEAD"), b"old").unwrap();
+        fs.write(Path::new("HEAD.lock"), b"new").unwrap();
+
+        fs.publish(Path::new("HEAD.lock"), Path::new("HEAD"))
+            .unwrap();
+
+        assert_eq!(fs.read(Path::new("HEAD")).unwrap(), b"new");
+        assert!(!fs.exists(Path::new("HEAD.lock")).unwrap());
+    }
+
+    #[test]
     fn rename_atomically_moves_a_directory_tree() {
         let fs = MemoryFileSystem::new();
         fs.create_dir_all(Path::new("old/nested")).unwrap();

@@ -517,7 +517,7 @@ impl Repository {
                 invalid("content-addressed pack path changed during publication")
             };
         }
-        if let Err(error) = self.filesystem().rename(&lock_path, &path) {
+        if let Err(error) = self.filesystem().publish(&lock_path, &path) {
             let _ = self.filesystem().remove_file(&lock_path);
             return Err(error);
         }
