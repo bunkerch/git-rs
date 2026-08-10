@@ -136,6 +136,28 @@ pub struct WrittenPack {
     pub object_count: usize,
 }
 
+/// A published pack protected from garbage collection for the guard lifetime.
+pub struct KeptPack {
+    written: WrittenPack,
+    repository: Repository,
+    owned_keep_path: Option<PathBuf>,
+}
+
+impl KeptPack {
+    #[must_use]
+    pub const fn written(&self) -> &WrittenPack {
+        &self.written
+    }
+}
+
+impl Drop for KeptPack {
+    fn drop(&mut self) {
+        if let Some(path) = &self.owned_keep_path {
+            let _ = self.repository.filesystem().remove_file(path);
+        }
+    }
+}
+
 /// An incoming pack whose checksum, compression streams, deltas, and object
 /// identities have been validated but which has not yet been published.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -462,6 +484,49 @@ impl Repository {
     /// Returns an error if content-addressed publication fails.
     pub fn publish_validated_pack(&self, pack: &ValidatedPack) -> Result<WrittenPack> {
         self.publish_bundle(&pack.bundle)
+    }
+
+    /// Publish a validated incoming pack while protecting it from concurrent
+    /// garbage collection until the returned guard is dropped.
+    ///
+    /// The keep marker is acquired before the pack index becomes visible. An
+    /// existing marker is preserved and is not removed by the returned guard.
+    ///
+    /// # Errors
+    /// Returns an error if the keep marker or content-addressed pack files
+    /// cannot be published.
+    pub fn publish_validated_pack_kept(&self, pack: &ValidatedPack) -> Result<KeptPack> {
+        let bundle = &pack.bundle;
+        let stem = bundle.stem();
+        let pack_relative = Path::new("objects/pack").join(format!("{stem}.pack"));
+        let index_relative = Path::new("objects/pack").join(format!("{stem}.idx"));
+        let keep_path = self.git_path(
+            Path::new("objects/pack").join(format!("{stem}.keep")),
+        );
+        let owned_keep_path = match self.filesystem().write_new(&keep_path, b"") {
+            Ok(()) => Some(keep_path),
+            Err(Error::AlreadyExists(_)) => None,
+            Err(error) => return Err(error),
+        };
+        let guard = KeptPack {
+            written: WrittenPack {
+                pack_path: self.git_path(&pack_relative),
+                index_path: self.git_path(&index_relative),
+                checksum: bundle.checksum,
+                object_count: bundle.object_count,
+            },
+            repository: self.clone(),
+            owned_keep_path,
+        };
+        if let Err(error) = self.publish_pack_file(&pack_relative, bundle.pack()) {
+            drop(guard);
+            return Err(error);
+        }
+        if let Err(error) = self.publish_pack_file(&index_relative, bundle.index()) {
+            drop(guard);
+            return Err(error);
+        }
+        Ok(guard)
     }
 
     pub(crate) fn publish_validated_pack_with_markers(
@@ -1857,6 +1922,34 @@ mod tests {
             target.read_object(incoming, 1024),
             Err(Error::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn kept_publication_removes_only_its_owned_marker_on_drop() {
+        let fs = MemoryFileSystem::new();
+        let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
+        let id = repository.write_object(ObjectKind::Blob, b"kept").unwrap();
+        let bundle = repository
+            .build_pack(&[id], &PackOptions::default())
+            .unwrap();
+        let validated = repository
+            .validate_incoming_pack(bundle.pack(), &IncomingPackOptions::default())
+            .unwrap();
+
+        let guard = repository
+            .publish_validated_pack_kept(&validated)
+            .unwrap();
+        let keep_path = guard.written().pack_path.with_extension("keep");
+        assert!(fs.exists(&keep_path).unwrap());
+        drop(guard);
+        assert!(!fs.exists(&keep_path).unwrap());
+
+        fs.write(&keep_path, b"external keeper").unwrap();
+        let guard = repository
+            .publish_validated_pack_kept(&validated)
+            .unwrap();
+        drop(guard);
+        assert_eq!(fs.read(&keep_path).unwrap(), b"external keeper");
     }
 
     #[test]

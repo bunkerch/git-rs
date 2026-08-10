@@ -166,8 +166,8 @@ pub use notes::{DEFAULT_NOTES_REF, Note, NotesOptions};
 pub use object::{Object, ObjectId, ObjectKind};
 pub use operations::{ResetMode, ResetOptions, SwitchOptions};
 pub use pack::{
-    IncomingPackOptions, PackBundle, PackIndex, PackIndexEntry, PackOptions, ValidatedPack,
-    VerifiedPackObject, VerifyPackOptions, VerifyPackReport, WrittenPack,
+    IncomingPackOptions, KeptPack, PackBundle, PackIndex, PackIndexEntry, PackOptions,
+    ValidatedPack, VerifiedPackObject, VerifyPackOptions, VerifyPackReport, WrittenPack,
 };
 pub use pack_refs::{PackRefsOptions, PackRefsResult};
 pub use protocol::{Capability, PktLine, PktLineDecoder, Sideband};
