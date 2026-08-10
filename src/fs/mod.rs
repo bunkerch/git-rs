@@ -2,12 +2,14 @@
 
 mod host;
 mod memory;
+mod overlay;
 pub(crate) mod path;
 
 use std::path::{Path, PathBuf};
 
 pub use host::HostFileSystem;
 pub use memory::MemoryFileSystem;
+pub(crate) use overlay::OverlayFileSystem;
 pub(crate) use path::is_ntfs_dotgit;
 pub(crate) use path::validate as normalize_path;
 

@@ -54,6 +54,19 @@ impl Repository {
         Arc::clone(&self.fs)
     }
 
+    pub(crate) fn with_filesystem(&self, fs: Arc<dyn FileSystem>) -> Self {
+        Self {
+            fs,
+            git_dir: self.git_dir.clone(),
+            common_dir: self.common_dir.clone(),
+            work_tree: self.work_tree.clone(),
+            pack_indexes: Arc::new(RwLock::new(BTreeMap::new())),
+            pack_data: Arc::new(RwLock::new(BTreeMap::new())),
+            multi_pack_index: Arc::new(RwLock::new(None)),
+            replacements: Arc::new(RwLock::new(None)),
+        }
+    }
+
     /// Open an existing bare or non-bare repository.
     ///
     /// A path containing `.git/HEAD` is treated as a working tree. Otherwise,

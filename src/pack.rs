@@ -309,6 +309,23 @@ impl PackIndex {
 }
 
 impl Repository {
+    /// Create an isolated repository view containing a validated incoming pack.
+    ///
+    /// Existing repository data remains visible, while the pack and every
+    /// mutation made through the returned repository live only in memory. This
+    /// allows hooks and policy checks to inspect incoming commits before the
+    /// pack is published to durable storage.
+    ///
+    /// # Errors
+    /// Returns an error if the in-memory pack cannot be published into the
+    /// isolated view.
+    pub fn quarantine_validated_pack(&self, pack: &ValidatedPack) -> Result<Self> {
+        let filesystem = crate::fs::OverlayFileSystem::new(self.shared_filesystem());
+        let repository = self.with_filesystem(Arc::new(filesystem));
+        repository.publish_validated_pack(pack)?;
+        Ok(repository)
+    }
+
     /// Verify an index and its sibling pack and return verbose object metadata.
     ///
     /// `index_path` is relative to the configured filesystem root, as are paths
@@ -1801,6 +1818,45 @@ mod tests {
             repository.read_object(id, 1024).unwrap().data(),
             b"incoming"
         );
+    }
+
+    #[test]
+    fn quarantined_repository_reads_incoming_and_existing_objects_without_publication() {
+        let source = Repository::init(
+            MemoryFileSystem::new(),
+            "source",
+            &InitOptions::default(),
+        )
+        .unwrap();
+        let incoming = source
+            .write_object(ObjectKind::Blob, b"incoming")
+            .unwrap();
+        let bundle = source
+            .build_pack(&[incoming], &PackOptions::default())
+            .unwrap();
+
+        let target_fs = MemoryFileSystem::new();
+        let target = Repository::init(target_fs, "target", &InitOptions::default()).unwrap();
+        let existing = target
+            .write_object(ObjectKind::Blob, b"existing")
+            .unwrap();
+        let validated = target
+            .validate_incoming_pack(bundle.pack(), &IncomingPackOptions::default())
+            .unwrap();
+        let quarantine = target.quarantine_validated_pack(&validated).unwrap();
+
+        assert_eq!(
+            quarantine.read_object(incoming, 1024).unwrap().data(),
+            b"incoming"
+        );
+        assert_eq!(
+            quarantine.read_object(existing, 1024).unwrap().data(),
+            b"existing"
+        );
+        assert!(matches!(
+            target.read_object(incoming, 1024),
+            Err(Error::NotFound(_))
+        ));
     }
 
     #[test]
