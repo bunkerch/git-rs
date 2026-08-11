@@ -211,6 +211,16 @@ impl Repository {
         self.fs.as_ref()
     }
 
+    /// Return a shared handle to the repository filesystem.
+    ///
+    /// This is useful for storage adapters that compose repository object
+    /// databases without materializing their contents in a temporary host
+    /// directory.
+    #[must_use]
+    pub fn filesystem_handle(&self) -> Arc<dyn FileSystem> {
+        Arc::clone(&self.fs)
+    }
+
     #[must_use]
     pub(crate) fn git_path(&self, path: impl AsRef<Path>) -> PathBuf {
         let path = path.as_ref();
