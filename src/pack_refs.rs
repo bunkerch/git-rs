@@ -158,7 +158,7 @@ impl Repository {
         }
         self.filesystem()
             .write(packed_lock, &encode_packed_values(&packed))?;
-        self.filesystem().rename(packed_lock, packed_path)?;
+        self.filesystem().publish(packed_lock, packed_path)?;
 
         let mut pruned = 0;
         for item in locked {

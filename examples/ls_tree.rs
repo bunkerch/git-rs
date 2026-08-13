@@ -45,11 +45,7 @@ fn main() -> Result<()> {
                 size,
             );
         } else {
-            println!(
-                "{:06o} {kind} {}\t{path}",
-                entry.mode_number(),
-                entry.id(),
-            );
+            println!("{:06o} {kind} {}\t{path}", entry.mode_number(), entry.id(),);
         }
     }
     Ok(())

@@ -183,7 +183,7 @@ fn write_storage_atomic(
     }
     let lock = destination.with_extension("lock");
     repository.filesystem().write_new(&lock, contents)?;
-    if let Err(error) = repository.filesystem().rename(&lock, destination) {
+    if let Err(error) = repository.filesystem().publish(&lock, destination) {
         let _ = repository.filesystem().remove_file(&lock);
         return Err(error);
     }

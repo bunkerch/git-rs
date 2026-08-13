@@ -1510,9 +1510,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::{
-        FileSystem, HostFileSystem, IndexVersion, InitOptions, MemoryFileSystem,
-    };
+    use crate::{FileSystem, HostFileSystem, IndexVersion, InitOptions, MemoryFileSystem};
 
     #[test]
     fn recursively_adds_files_executables_and_symlinks_in_memory() {
@@ -1916,12 +1914,9 @@ mod tests {
         let gitlink = repository.write_object(ObjectKind::Blob, b"x").unwrap();
         let tree = repository
             .write_tree(
-                &Tree::new(vec![TreeEntry::new(
-                    EntryMode::Gitlink,
-                    b"..\\pwned".to_vec(),
-                    gitlink,
-                )
-                .unwrap()])
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Gitlink, b"..\\pwned".to_vec(), gitlink).unwrap(),
+                ])
                 .unwrap(),
             )
             .unwrap();
@@ -2466,23 +2461,17 @@ mod tests {
             .unwrap();
         let link_tree = repository
             .write_tree(
-                &Tree::new(vec![TreeEntry::new(
-                    EntryMode::Blob,
-                    b"secret.txt".to_vec(),
-                    blob,
-                )
-                .unwrap()])
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Blob, b"secret.txt".to_vec(), blob).unwrap(),
+                ])
                 .unwrap(),
             )
             .unwrap();
         let tree = repository
             .write_tree(
-                &Tree::new(vec![TreeEntry::new(
-                    EntryMode::Tree,
-                    b"link".to_vec(),
-                    link_tree,
-                )
-                .unwrap()])
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Tree, b"link".to_vec(), link_tree).unwrap(),
+                ])
                 .unwrap(),
             )
             .unwrap();
@@ -2526,7 +2515,8 @@ mod tests {
         let fs = HostFileSystem::new(base.path()).unwrap();
         let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
         fs.write(Path::new("repo/target"), b"contents").unwrap();
-        fs.create_symlink(Path::new("repo/link"), b"target").unwrap();
+        fs.create_symlink(Path::new("repo/link"), b"target")
+            .unwrap();
         repository.add("link").unwrap();
         assert_eq!(
             repository
@@ -2556,23 +2546,17 @@ mod tests {
             .unwrap();
         let link_tree = repository
             .write_tree(
-                &Tree::new(vec![TreeEntry::new(
-                    EntryMode::Blob,
-                    b"sub.txt".to_vec(),
-                    blob,
-                )
-                .unwrap()])
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Blob, b"sub.txt".to_vec(), blob).unwrap(),
+                ])
                 .unwrap(),
             )
             .unwrap();
         let desired = repository
             .write_tree(
-                &Tree::new(vec![TreeEntry::new(
-                    EntryMode::Tree,
-                    b"link".to_vec(),
-                    link_tree,
-                )
-                .unwrap()])
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Tree, b"link".to_vec(), link_tree).unwrap(),
+                ])
                 .unwrap(),
             )
             .unwrap();
@@ -2583,7 +2567,10 @@ mod tests {
             1
         );
         assert!(!fs.metadata(Path::new("repo/link")).unwrap().is_symlink());
-        assert_eq!(fs.read(Path::new("repo/link/sub.txt")).unwrap(), b"nested\n");
+        assert_eq!(
+            fs.read(Path::new("repo/link/sub.txt")).unwrap(),
+            b"nested\n"
+        );
         assert!(
             !outside.join("sub.txt").exists(),
             "checkout must not write through the replaced symlink"
@@ -2596,7 +2583,8 @@ mod tests {
         let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
         fs.write(Path::new("repo/src"), b"contents").unwrap();
         repository.add("src").unwrap();
-        fs.create_symlink(Path::new("repo/link"), b"outside").unwrap();
+        fs.create_symlink(Path::new("repo/link"), b"outside")
+            .unwrap();
         let index = repository.read_index().unwrap();
         let entries = index
             .entries()
@@ -2625,7 +2613,8 @@ mod tests {
         let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
         fs.write(Path::new("repo/src"), b"contents").unwrap();
         repository.add("src").unwrap();
-        fs.create_symlink(Path::new("repo/link"), b"outside").unwrap();
+        fs.create_symlink(Path::new("repo/link"), b"outside")
+            .unwrap();
         assert!(matches!(
             repository.move_path("src", "link/sub/dst.txt", &MoveOptions::default()),
             Err(Error::BeyondSymbolicLink(_))
@@ -2638,7 +2627,8 @@ mod tests {
     fn cached_removal_ignores_symlinked_leading_paths() {
         let fs = MemoryFileSystem::new();
         let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
-        fs.create_symlink(Path::new("repo/link"), b"outside").unwrap();
+        fs.create_symlink(Path::new("repo/link"), b"outside")
+            .unwrap();
         let index = repository.read_index().unwrap();
         let secret = ObjectId::compute(ObjectKind::Blob, b"top-secret\n");
         let mut entries = index.entries().to_vec();

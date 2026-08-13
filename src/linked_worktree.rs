@@ -860,12 +860,12 @@ fn publish_linking_files(
         let _ = filesystem.remove_file(&admin_lock);
         return Err(error);
     }
-    if let Err(error) = filesystem.rename(&admin_lock, admin_path) {
+    if let Err(error) = filesystem.publish(&admin_lock, admin_path) {
         let _ = filesystem.remove_file(&admin_lock);
         let _ = filesystem.remove_file(&dot_git_lock);
         return Err(error);
     }
-    if let Err(error) = filesystem.rename(&dot_git_lock, dot_git_path) {
+    if let Err(error) = filesystem.publish(&dot_git_lock, dot_git_path) {
         let _ = filesystem.remove_file(&dot_git_lock);
         match old_admin_contents {
             Some(contents) => {

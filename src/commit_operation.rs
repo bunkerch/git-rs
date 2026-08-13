@@ -254,7 +254,7 @@ impl Repository {
             self.filesystem()
                 .write(&lock, format!("{new}\n").as_bytes())?;
             self.append_reflog("HEAD", old, new, committer, message)?;
-            self.filesystem().rename(&lock, &destination)
+            self.filesystem().publish(&lock, &destination)
         })();
         if result.is_err() {
             let _ = self.filesystem().remove_file(&lock);

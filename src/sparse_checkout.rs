@@ -358,7 +358,7 @@ impl Repository {
         lock_name.push(".lock");
         let lock = destination.with_file_name(lock_name);
         self.filesystem().write_new(&lock, contents)?;
-        if let Err(error) = self.filesystem().rename(&lock, &destination) {
+        if let Err(error) = self.filesystem().publish(&lock, &destination) {
             let _ = self.filesystem().remove_file(&lock);
             return Err(error);
         }

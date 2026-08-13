@@ -122,8 +122,7 @@ impl Repository {
 
         for path in paths {
             let relative = worktree_path(&path)?;
-            if crate::worktree::has_symlink_leading_path(self.filesystem(), work_tree, &relative)?
-            {
+            if crate::worktree::has_symlink_leading_path(self.filesystem(), work_tree, &relative)? {
                 return Err(Error::BeyondSymbolicLink(relative));
             }
             let full_path = work_tree.join(relative);
@@ -383,9 +382,9 @@ impl Repository {
         paths: &BTreeSet<Vec<u8>>,
         max_file_size: usize,
     ) -> Result<()> {
-        let work_tree = self.work_tree().ok_or_else(|| {
-            Error::InvalidRepository("worktree required for rerere".into())
-        })?;
+        let work_tree = self
+            .work_tree()
+            .ok_or_else(|| Error::InvalidRepository("worktree required for rerere".into()))?;
         let mut entries = index.entries().to_vec();
         entries.retain(|entry| !paths.contains(entry.path()));
         for path in paths {

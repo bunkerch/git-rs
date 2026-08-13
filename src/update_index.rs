@@ -382,8 +382,8 @@ fn stage_zero(entries: &[IndexEntry], path: &[u8]) -> Result<usize> {
 mod tests {
     use super::*;
     use crate::{
-        FileSystem, HostFileSystem, Index, InitOptions, MemoryFileSystem, ObjectId,
-        PreviousValue, ReferenceName, StatData,
+        FileSystem, HostFileSystem, Index, InitOptions, MemoryFileSystem, ObjectId, PreviousValue,
+        ReferenceName, StatData,
     };
     use std::path::Path;
 

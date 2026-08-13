@@ -345,16 +345,25 @@ mod tests {
         let mut decoder = PktLineDecoder::new();
         // FFFF hex = 65535 bytes - well above allowed max
         decoder.extend(b"\xFF\xFF\x00\x00");
-        assert!(decoder.next_packet().is_err(), "oversized pkt-line should be rejected");
+        assert!(
+            decoder.next_packet().is_err(),
+            "oversized pkt-line should be rejected"
+        );
     }
 
     #[test]
     fn pkt_line_decoder_accumulates_partial_data() {
         let mut decoder = PktLineDecoder::new();
         decoder.extend(b"00");
-        assert!(decoder.next_packet().unwrap().is_none(), "partial header should produce None");
+        assert!(
+            decoder.next_packet().unwrap().is_none(),
+            "partial header should produce None"
+        );
         decoder.extend(b"05");
-        assert!(decoder.next_packet().unwrap().is_none(), "partial body should produce None");
+        assert!(
+            decoder.next_packet().unwrap().is_none(),
+            "partial body should produce None"
+        );
         decoder.extend(b"a");
         let packet = decoder.next_packet().unwrap();
         assert_eq!(packet, Some(PktLine::Data(b"a".to_vec())));

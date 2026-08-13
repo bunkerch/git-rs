@@ -517,7 +517,7 @@ impl Repository {
                 invalid("content-addressed pack path changed during publication")
             };
         }
-        if let Err(error) = self.filesystem().rename(&lock_path, &path) {
+        if let Err(error) = self.filesystem().publish(&lock_path, &path) {
             let _ = self.filesystem().remove_file(&lock_path);
             return Err(error);
         }
@@ -571,12 +571,7 @@ impl Repository {
             let Some(entry) = index.find(id) else {
                 continue;
             };
-            return self.read_indexed_object_at(
-                &index_path,
-                id,
-                entry.offset,
-                max_size,
-            );
+            return self.read_indexed_object_at(&index_path, id, entry.offset, max_size);
         }
         Err(Error::NotFound(self.git_path(object_label(id))))
     }
@@ -1533,7 +1528,9 @@ fn be_u32(data: &[u8], offset: usize) -> Result<u32> {
         .get(offset..end)
         .ok_or_else(|| pack_error("truncated integer"))?;
     Ok(u32::from_be_bytes(
-        slice.try_into().map_err(|_| pack_error("invalid integer length"))?,
+        slice
+            .try_into()
+            .map_err(|_| pack_error("invalid integer length"))?,
     ))
 }
 fn be_u64(data: &[u8], offset: usize) -> Result<u64> {
@@ -1542,7 +1539,9 @@ fn be_u64(data: &[u8], offset: usize) -> Result<u64> {
         .get(offset..end)
         .ok_or_else(|| pack_error("truncated integer"))?;
     Ok(u64::from_be_bytes(
-        slice.try_into().map_err(|_| pack_error("invalid integer length"))?,
+        slice
+            .try_into()
+            .map_err(|_| pack_error("invalid integer length"))?,
     ))
 }
 fn read_hash(data: &[u8], offset: usize) -> Result<[u8; HASH_SIZE]> {
@@ -1875,10 +1874,10 @@ mod tests {
     fn rejects_pack_with_bad_trailer_checksum() {
         let fs = MemoryFileSystem::new();
         let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
-        let id = repository
-            .write_object(ObjectKind::Blob, b"valid")
+        let id = repository.write_object(ObjectKind::Blob, b"valid").unwrap();
+        let source = repository
+            .build_pack(&[id], &PackOptions::default())
             .unwrap();
-        let source = repository.build_pack(&[id], &PackOptions::default()).unwrap();
         let mut corrupt = source.pack().to_vec();
         let len = corrupt.len();
         corrupt[len - 1] ^= 1;
@@ -1905,7 +1904,9 @@ mod tests {
         let id = repository
             .write_object(ObjectKind::Blob, b"truncated")
             .unwrap();
-        let source = repository.build_pack(&[id], &PackOptions::default()).unwrap();
+        let source = repository
+            .build_pack(&[id], &PackOptions::default())
+            .unwrap();
         let truncated = &source.pack()[..source.pack().len() - super::HASH_SIZE - 1];
         assert!(
             repository
@@ -1977,12 +1978,28 @@ mod tests {
 
     #[test]
     fn ofs_distance_encodes_and_decodes_large_offsets() {
-        for distance in [1, 127, 128, 16383, 16384, 1_000_000, 10_000_000, 1_000_000_000] {
+        for distance in [
+            1,
+            127,
+            128,
+            16383,
+            16384,
+            1_000_000,
+            10_000_000,
+            1_000_000_000,
+        ] {
             let encoded = super::encode_ofs_distance(distance);
             let mut cursor = 0;
             let decoded = super::parse_ofs_distance(&encoded, &mut cursor).unwrap();
-            assert_eq!(decoded, distance, "OFS_DELTA round-trip failed for {distance}");
-            assert_eq!(cursor, encoded.len(), "OFS_DELTA consumed all bytes for {distance}");
+            assert_eq!(
+                decoded, distance,
+                "OFS_DELTA round-trip failed for {distance}"
+            );
+            assert_eq!(
+                cursor,
+                encoded.len(),
+                "OFS_DELTA consumed all bytes for {distance}"
+            );
         }
     }
 

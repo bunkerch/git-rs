@@ -10,8 +10,10 @@ output is ordinary Git data: a non-bare repository has `.git/HEAD`, `.git/config
 `objects`, and `refs`; a bare repository places those entries at its root.
 
 Mutations that become visible to concurrent readers exclusively create the
-canonical `.lock` file, write its complete contents, and atomically rename it.
-Future ref and packed-ref transactions will build on this same primitive.
+canonical `.lock` file, write its complete contents, and publish it atomically
+at the destination. Host filesystems use rename; object stores may atomically
+replace a destination key or pointer before cleaning up the temporary source.
+Ref and packed-ref transactions build on this same primitive.
 
 ## Reference implementation comparisons
 

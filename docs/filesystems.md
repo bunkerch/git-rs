@@ -9,12 +9,20 @@ All paths passed to an adapter are relative to its storage root. Adapters must
 reject absolute paths and parent traversal. Directory reads return child names,
 not recursively expanded paths.
 
-`write_new` is lock acquisition and must fail if the path exists. `rename(from,
-to)` is the publication boundary: it atomically replaces file destinations and
-must also atomically relocate complete directory subtrees to unoccupied paths.
-Remote adapters can implement these with a database transaction, namespace
-prefix swap, object generation plus compare-and-swap, or another storage-native
-atomic primitive. Directory rename is required for linked-worktree moves.
+`write_new` is lock acquisition and must fail if the path exists. `publish(from,
+to)` is the file-publication boundary: readers of the destination must see its
+complete old or complete new value without an availability gap. Host adapters
+normally implement this as a rename. Object stores can upload immutable bytes,
+atomically replace the destination key or pointer, and then clean up the source;
+an interrupted cleanup may temporarily leave both names without making the
+destination unavailable.
+
+`rename(from, to)` retains the stronger contract needed for worktree moves: it
+atomically relocates a file, symlink, or complete directory subtree. Remote
+adapters can implement directory moves with a database transaction, namespace
+prefix swap, object generation plus compare-and-swap, or another
+storage-native atomic primitive. Bare repository ref and pack publication uses
+`publish`, so it does not require an atomic object-store directory rename.
 
 Metadata is no-follow: adapters distinguish regular files, directories, and
 symbolic links. `read_link` returns target bytes, and executable state plus

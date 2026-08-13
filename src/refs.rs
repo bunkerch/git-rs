@@ -482,9 +482,9 @@ impl Repository {
             let contents = format!("ref: {target}\n");
             self.filesystem().write(&lock, contents.as_bytes())?;
             if reflog.is_some() {
-                self.filesystem().rename(&log_lock, &log_destination)?;
+                self.filesystem().publish(&log_lock, &log_destination)?;
             }
-            self.filesystem().rename(&lock, &destination)
+            self.filesystem().publish(&lock, &destination)
         })();
         if result.is_err() {
             let _ = self.filesystem().remove_file(&lock);
@@ -596,7 +596,7 @@ impl Repository {
             if let Some(contents) = packed {
                 let filtered = remove_packed_reference(&contents, name.as_str())?;
                 self.filesystem().write(&packed_lock, &filtered)?;
-                self.filesystem().rename(&packed_lock, &packed_path)?;
+                self.filesystem().publish(&packed_lock, &packed_path)?;
             } else {
                 self.filesystem().remove_file(&packed_lock)?;
             }
@@ -713,7 +713,7 @@ impl Repository {
 
         if deletes_packed {
             if packed_exists {
-                self.filesystem().rename(&packed_lock, &packed_path)?;
+                self.filesystem().publish(&packed_lock, &packed_path)?;
             } else {
                 self.filesystem().remove_file(&packed_lock)?;
             }
@@ -723,7 +723,7 @@ impl Repository {
             .any(|item| item.edit.name.as_str().starts_with("refs/replace/"));
         for item in &prepared {
             if item.edit.new.is_some() {
-                self.filesystem().rename(&item.lock, &item.destination)?;
+                self.filesystem().publish(&item.lock, &item.destination)?;
             } else {
                 match self.filesystem().remove_file(&item.destination) {
                     Ok(()) | Err(Error::NotFound(_)) => {}
@@ -836,7 +836,7 @@ impl Repository {
         };
         if deletes {
             if packed_exists {
-                self.filesystem().rename(&packed_lock, &packed_path)?;
+                self.filesystem().publish(&packed_lock, &packed_path)?;
             } else {
                 self.filesystem().remove_file(&packed_lock)?;
             }
@@ -847,7 +847,7 @@ impl Repository {
         for item in &prepared {
             match item.edit.change {
                 ReferenceTransactionChange::Update(_) => {
-                    self.filesystem().rename(&item.lock, &item.destination)?;
+                    self.filesystem().publish(&item.lock, &item.destination)?;
                 }
                 ReferenceTransactionChange::Delete => {
                     match self.filesystem().remove_file(&item.destination) {
@@ -1069,9 +1069,9 @@ impl Repository {
             contents.push(b'\n');
             self.filesystem().write(&lock, &contents)?;
             if reflog.is_some() {
-                self.filesystem().rename(&log_lock, &log_destination)?;
+                self.filesystem().publish(&log_lock, &log_destination)?;
             }
-            self.filesystem().rename(&lock, &destination)
+            self.filesystem().publish(&lock, &destination)
         })();
 
         if result.is_err() {
@@ -1573,10 +1573,10 @@ impl Repository {
                 contents.push(b'\n');
                 self.filesystem().write(&reference_lock, &contents)?;
             }
-            self.filesystem().rename(&log_lock, &log_destination)?;
+            self.filesystem().publish(&log_lock, &log_destination)?;
             if options.update_reference && new_tip.is_some() {
                 self.filesystem()
-                    .rename(&reference_lock, &reference_destination)?;
+                    .publish(&reference_lock, &reference_destination)?;
             }
             Ok(outcome)
         })();
@@ -1609,7 +1609,7 @@ impl Repository {
             };
             append_reflog_line(&mut contents, old, new, committer, message);
             self.filesystem().write(&lock, &contents)?;
-            self.filesystem().rename(&lock, &destination)
+            self.filesystem().publish(&lock, &destination)
         })();
         if result.is_err() {
             let _ = self.filesystem().remove_file(&lock);
@@ -2623,16 +2623,19 @@ mod tests {
             .unwrap();
 
         let outcome = repository
-            .expire_reflog_before(
-                name.as_str(),
-                150,
-                &ReflogRewriteOptions::default(),
-            )
+            .expire_reflog_before(name.as_str(), 150, &ReflogRewriteOptions::default())
             .unwrap();
-        assert_eq!(outcome.removed, 1, "expected 1 entry expired (timestamp=100 < 150)");
+        assert_eq!(
+            outcome.removed, 1,
+            "expected 1 entry expired (timestamp=100 < 150)"
+        );
         let entries = repository.read_reflog(name.as_str()).unwrap();
         assert_eq!(entries.len(), 1, "expected 1 entry remaining");
-        assert_eq!(entries[0].new_id(), second, "remaining entry should be the newer one");
+        assert_eq!(
+            entries[0].new_id(),
+            second,
+            "remaining entry should be the newer one"
+        );
     }
 
     #[test]

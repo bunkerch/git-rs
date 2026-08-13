@@ -96,7 +96,11 @@ impl fmt::Display for Error {
             }
             Self::EmptyReplay => write!(f, "replayed commit would be empty"),
             Self::InvalidReferenceName(name) => {
-                write!(f, "invalid reference name: {}", sanitize_control_bytes(name))
+                write!(
+                    f,
+                    "invalid reference name: {}",
+                    sanitize_control_bytes(name)
+                )
             }
             Self::InvalidReference(message) => {
                 write!(f, "invalid reference: {}", sanitize_control_bytes(message))
@@ -258,11 +262,20 @@ mod tests {
                 !rendered.contains(c),
                 "byte {byte:#x} leaked raw into {rendered:?}"
             );
-            assert!(rendered.contains('?'), "byte {byte:#x} not replaced: {rendered:?}");
+            assert!(
+                rendered.contains('?'),
+                "byte {byte:#x} not replaced: {rendered:?}"
+            );
         }
         let c = '\x7f';
         let rendered = Error::CheckoutConflict(vec![format!("a{c}b")]).to_string();
-        assert!(!rendered.contains(c), "byte 0x7f leaked raw into {rendered:?}");
-        assert!(rendered.contains('?'), "byte 0x7f not replaced: {rendered:?}");
+        assert!(
+            !rendered.contains(c),
+            "byte 0x7f leaked raw into {rendered:?}"
+        );
+        assert!(
+            rendered.contains('?'),
+            "byte 0x7f not replaced: {rendered:?}"
+        );
     }
 }

@@ -161,6 +161,25 @@ pub trait FileSystem: Send + Sync + 'static {
     /// Returns [`crate::Error::AlreadyExists`] if the path is occupied, or a
     /// storage error if the file cannot be created.
     fn write_new(&self, path: &Path, contents: &[u8]) -> Result<()>;
+    /// Atomically publish the complete contents at `from` as `to`.
+    ///
+    /// Readers of `to` must observe either its complete previous value or its
+    /// complete new value, and must never observe a missing or partially
+    /// written destination. Implementations should remove `from` before
+    /// returning when possible, but callers must tolerate a source left behind
+    /// by an interrupted publication and may reconcile it later.
+    ///
+    /// The default implementation uses [`Self::rename`], which provides the
+    /// stronger source-and-destination atomicity available on host and memory
+    /// filesystems. Object stores can override this with an atomic destination
+    /// write followed by best-effort source cleanup.
+    ///
+    /// # Errors
+    /// Returns an error when either path is invalid or the destination cannot
+    /// be atomically published.
+    fn publish(&self, from: &Path, to: &Path) -> Result<()> {
+        self.rename(from, to)
+    }
     /// Read the target bytes of a symbolic link without following it.
     ///
     /// # Errors

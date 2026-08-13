@@ -216,7 +216,7 @@ impl Repository {
         self.fs.read(&self.git_path(path))
     }
 
-    /// Publish a complete file using Git's lock-file-and-rename discipline.
+    /// Publish a complete file using Git's lock-file publication discipline.
     ///
     /// # Errors
     /// Returns an error if the temporary file cannot be written or published.
@@ -227,7 +227,7 @@ impl Repository {
         }
         let lock = destination.with_extension("lock");
         self.fs.write_new(&lock, contents)?;
-        if let Err(error) = self.fs.rename(&lock, &destination) {
+        if let Err(error) = self.fs.publish(&lock, &destination) {
             let _ = self.fs.remove_file(&lock);
             return Err(error);
         }

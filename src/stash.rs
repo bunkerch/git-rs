@@ -389,8 +389,7 @@ impl Repository {
                 continue;
             }
             let relative = worktree_path(entry.path())?;
-            if crate::worktree::has_symlink_leading_path(self.filesystem(), work_tree, &relative)?
-            {
+            if crate::worktree::has_symlink_leading_path(self.filesystem(), work_tree, &relative)? {
                 return Err(Error::BeyondSymbolicLink(relative));
             }
             let full = work_tree.join(relative);
@@ -411,8 +410,7 @@ impl Repository {
         let mut entries = Vec::with_capacity(paths.len());
         for path in paths {
             let relative = worktree_path(path)?;
-            if crate::worktree::has_symlink_leading_path(self.filesystem(), work_tree, &relative)?
-            {
+            if crate::worktree::has_symlink_leading_path(self.filesystem(), work_tree, &relative)? {
                 return Err(Error::BeyondSymbolicLink(relative));
             }
             let full = work_tree.join(relative);
@@ -584,8 +582,7 @@ impl Repository {
         let mut collisions = Vec::new();
         for entry in &entries {
             let relative = worktree_path(&entry.path)?;
-            if crate::worktree::has_symlink_leading_path(self.filesystem(), work_tree, &relative)?
-            {
+            if crate::worktree::has_symlink_leading_path(self.filesystem(), work_tree, &relative)? {
                 return Err(Error::BeyondSymbolicLink(relative));
             }
             let full = work_tree.join(relative);
@@ -603,8 +600,7 @@ impl Repository {
         }
         for entry in entries {
             let relative = worktree_path(&entry.path)?;
-            if crate::worktree::has_symlink_leading_path(self.filesystem(), work_tree, &relative)?
-            {
+            if crate::worktree::has_symlink_leading_path(self.filesystem(), work_tree, &relative)? {
                 return Err(Error::BeyondSymbolicLink(relative));
             }
             let full = work_tree.join(relative);
@@ -986,26 +982,22 @@ mod tests {
         let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
         fs.create_symlink(Path::new("repo/link"), outside.to_str().unwrap().as_bytes())
             .unwrap();
-        let blob = repository.write_object(ObjectKind::Blob, b"secret\n").unwrap();
+        let blob = repository
+            .write_object(ObjectKind::Blob, b"secret\n")
+            .unwrap();
         let link_tree = repository
             .write_tree(
-                &Tree::new(vec![TreeEntry::new(
-                    EntryMode::Blob,
-                    b"new.txt".to_vec(),
-                    blob,
-                )
-                .unwrap()])
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Blob, b"new.txt".to_vec(), blob).unwrap(),
+                ])
                 .unwrap(),
             )
             .unwrap();
         let untracked = repository
             .write_tree(
-                &Tree::new(vec![TreeEntry::new(
-                    EntryMode::Tree,
-                    b"link".to_vec(),
-                    link_tree,
-                )
-                .unwrap()])
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Tree, b"link".to_vec(), link_tree).unwrap(),
+                ])
                 .unwrap(),
             )
             .unwrap();
