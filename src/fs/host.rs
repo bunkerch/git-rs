@@ -90,17 +90,15 @@ impl HostFileSystem {
                         .rev()
                         .fold(resolved, |parent, name| parent.join(name)));
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    match path.parent() {
-                        Some(parent) => {
-                            if let Some(name) = path.file_name() {
-                                missing.push(PathBuf::from(name));
-                            }
-                            path = parent;
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => match path.parent() {
+                    Some(parent) => {
+                        if let Some(name) = path.file_name() {
+                            missing.push(PathBuf::from(name));
                         }
-                        None => return Err(Error::InvalidPath(original.to_path_buf())),
+                        path = parent;
                     }
-                }
+                    None => return Err(Error::InvalidPath(original.to_path_buf())),
+                },
                 Err(error) => return Err(Error::Io(error)),
             }
         }
@@ -133,8 +131,8 @@ impl FileSystem for HostFileSystem {
     }
 
     fn read_link(&self, path: &Path) -> Result<Vec<u8>> {
-        let target = fs::read_link(self.resolve(path, false)?)
-            .map_err(|error| map_io(error, path))?;
+        let target =
+            fs::read_link(self.resolve(path, false)?).map_err(|error| map_io(error, path))?;
         os_path_bytes(&target)
     }
 

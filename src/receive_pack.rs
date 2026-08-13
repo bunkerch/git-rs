@@ -260,12 +260,9 @@ impl Repository {
 
         let mut statuses = Vec::with_capacity(request.commands.len());
         for command in &request.commands {
-            let error = if checked_out
-                .as_ref()
-                .is_some_and(|checked_out| {
-                    matches_checked_out(checked_out, &command.name, ignore_case)
-                })
-            {
+            let error = if checked_out.as_ref().is_some_and(|checked_out| {
+                matches_checked_out(checked_out, &command.name, ignore_case)
+            }) {
                 Some("branch is currently checked out".to_owned())
             } else if !current_matches(self, command)? {
                 Some("stale old object ID".to_owned())
@@ -828,12 +825,8 @@ mod tests {
 
     #[test]
     fn checked_out_branch_update_is_rejected_by_exact_name() {
-        let repository = Repository::init(
-            MemoryFileSystem::new(),
-            "repo",
-            &InitOptions::default(),
-        )
-        .unwrap();
+        let repository =
+            Repository::init(MemoryFileSystem::new(), "repo", &InitOptions::default()).unwrap();
         let current = repository
             .write_object(ObjectKind::Blob, b"current")
             .unwrap();
@@ -864,12 +857,8 @@ mod tests {
 
     #[test]
     fn case_only_variant_update_succeeds_without_ignorecase() {
-        let repository = Repository::init(
-            MemoryFileSystem::new(),
-            "repo",
-            &InitOptions::default(),
-        )
-        .unwrap();
+        let repository =
+            Repository::init(MemoryFileSystem::new(), "repo", &InitOptions::default()).unwrap();
         let current = repository
             .write_object(ObjectKind::Blob, b"current")
             .unwrap();
@@ -901,12 +890,8 @@ mod tests {
 
     #[test]
     fn case_only_variant_update_is_rejected_with_ignorecase() {
-        let repository = Repository::init(
-            MemoryFileSystem::new(),
-            "repo",
-            &InitOptions::default(),
-        )
-        .unwrap();
+        let repository =
+            Repository::init(MemoryFileSystem::new(), "repo", &InitOptions::default()).unwrap();
         let current = repository
             .write_object(ObjectKind::Blob, b"current")
             .unwrap();
@@ -939,12 +924,8 @@ mod tests {
 
     #[test]
     fn non_checked_out_branch_update_still_succeeds() {
-        let repository = Repository::init(
-            MemoryFileSystem::new(),
-            "repo",
-            &InitOptions::default(),
-        )
-        .unwrap();
+        let repository =
+            Repository::init(MemoryFileSystem::new(), "repo", &InitOptions::default()).unwrap();
         let current = repository
             .write_object(ObjectKind::Blob, b"current")
             .unwrap();

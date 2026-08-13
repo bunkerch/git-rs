@@ -803,7 +803,9 @@ mod tests {
         }
         entry.extend_from_slice(&[0x11; 20]);
         entry.extend_from_slice(
-            &u16::try_from(path.len()).expect("test path fits in u16").to_be_bytes(),
+            &u16::try_from(path.len())
+                .expect("test path fits in u16")
+                .to_be_bytes(),
         );
         entry.extend_from_slice(path);
         entry.push(0);

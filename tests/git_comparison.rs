@@ -14,7 +14,12 @@ fn git(args: &[&str], cwd: &Path) -> Vec<u8> {
         .current_dir(cwd)
         .output()
         .expect("git binary must be available for integration tests");
-    assert!(output.status.success(), "git {:?} failed: {:?}", args, String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {:?}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
     output.stdout
 }
 
@@ -62,7 +67,9 @@ fn write_tree_matches_git_ls_tree() {
     let dir = tempfile::tempdir().unwrap();
     let repo = init_repo(dir.path(), true);
 
-    let blob_id = repo.write_object(ObjectKind::Blob, b"file content\n").unwrap();
+    let blob_id = repo
+        .write_object(ObjectKind::Blob, b"file content\n")
+        .unwrap();
     let tree = Tree::new(vec![
         TreeEntry::new(EntryMode::Blob, b"file.txt".to_vec(), blob_id).unwrap(),
     ])
@@ -71,7 +78,11 @@ fn write_tree_matches_git_ls_tree() {
 
     // Write a commit so we have something ls-tree can read
     let commit_id = repo
-        .write_commit(&CommitBuilder::new(tree_id, ident(), ident()).message(b"init\n".to_vec()).build())
+        .write_commit(
+            &CommitBuilder::new(tree_id, ident(), ident())
+                .message(b"init\n".to_vec())
+                .build(),
+        )
         .unwrap();
     repo.update_reference(
         &ReferenceName::branch("main").unwrap(),
@@ -82,7 +93,10 @@ fn write_tree_matches_git_ls_tree() {
 
     let git_output = git(&["ls-tree", &tree_id.to_string()], dir.path());
     let git_line = String::from_utf8_lossy(&git_output);
-    assert!(git_line.contains("100644 blob"), "ls-tree output: {git_line}");
+    assert!(
+        git_line.contains("100644 blob"),
+        "ls-tree output: {git_line}"
+    );
 }
 
 /// Verify git-rs cat-file matches `git cat-file`.
@@ -91,7 +105,9 @@ fn cat_file_matches_git() {
     let dir = tempfile::tempdir().unwrap();
     let repo = init_repo(dir.path(), true);
 
-    let id = repo.write_object(ObjectKind::Blob, b"test content\n").unwrap();
+    let id = repo
+        .write_object(ObjectKind::Blob, b"test content\n")
+        .unwrap();
     let object = repo.read_object(id, 4096).unwrap();
 
     let git_output = git(&["cat-file", "-p", &id.to_string()], dir.path());
@@ -112,7 +128,11 @@ fn rev_parse_matches_git() {
     .unwrap();
     let tree_id = repo.write_tree(&tree).unwrap();
     let commit_id = repo
-        .write_commit(&CommitBuilder::new(tree_id, ident(), ident()).message(b"commit\n".to_vec()).build())
+        .write_commit(
+            &CommitBuilder::new(tree_id, ident(), ident())
+                .message(b"commit\n".to_vec())
+                .build(),
+        )
         .unwrap();
     repo.update_reference(
         &ReferenceName::branch("main").unwrap(),
@@ -127,7 +147,11 @@ fn rev_parse_matches_git() {
 
     let git_tree = git(&["rev-parse", "HEAD^{tree}"], dir.path());
     let git_tree_hash = String::from_utf8_lossy(&git_tree).trim().to_owned();
-    assert_eq!(tree_id.to_string(), git_tree_hash, "rev-parse HEAD{{tree}} mismatch");
+    assert_eq!(
+        tree_id.to_string(),
+        git_tree_hash,
+        "rev-parse HEAD{{tree}} mismatch"
+    );
 }
 
 /// Verify git-rs show-ref matches `git show-ref`.
@@ -143,7 +167,11 @@ fn show_ref_matches_git() {
     .unwrap();
     let tree_id = repo.write_tree(&tree).unwrap();
     let commit_id = repo
-        .write_commit(&CommitBuilder::new(tree_id, ident(), ident()).message(b"x\n".to_vec()).build())
+        .write_commit(
+            &CommitBuilder::new(tree_id, ident(), ident())
+                .message(b"x\n".to_vec())
+                .build(),
+        )
         .unwrap();
     repo.update_reference(
         &ReferenceName::branch("main").unwrap(),
@@ -160,8 +188,14 @@ fn show_ref_matches_git() {
 
     let git_output = git(&["show-ref"], dir.path());
     let git_refs = String::from_utf8_lossy(&git_output);
-    assert!(git_refs.contains("refs/heads/main"), "show-ref missing main: {git_refs}");
-    assert!(git_refs.contains("refs/tags/v1"), "show-ref missing v1: {git_refs}");
+    assert!(
+        git_refs.contains("refs/heads/main"),
+        "show-ref missing main: {git_refs}"
+    );
+    assert!(
+        git_refs.contains("refs/tags/v1"),
+        "show-ref missing v1: {git_refs}"
+    );
 }
 
 /// Verify git-rs index encoding/decoding round-trips correctly.
@@ -175,7 +209,10 @@ fn index_round_trip_matches_git() {
 
     let git_output = git(&["ls-files", "--stage"], dir.path());
     let git_line = String::from_utf8_lossy(&git_output);
-    assert!(git_line.contains("hello.txt"), "ls-files missing hello.txt: {git_line}");
+    assert!(
+        git_line.contains("hello.txt"),
+        "ls-files missing hello.txt: {git_line}"
+    );
 }
 
 /// Verify git-rs pack construction produces a Git-valid pack.
@@ -185,7 +222,9 @@ fn build_pack_matches_git_verify() {
     let repo = init_repo(dir.path(), true);
 
     let blob_id = repo.write_object(ObjectKind::Blob, b"pack test\n").unwrap();
-    let pack = repo.build_pack(&[blob_id], &PackOptions::default()).unwrap();
+    let pack = repo
+        .build_pack(&[blob_id], &PackOptions::default())
+        .unwrap();
 
     let pack_dir = dir.path().join("objects/pack");
     std::fs::create_dir_all(&pack_dir).unwrap();
@@ -196,7 +235,10 @@ fn build_pack_matches_git_verify() {
         dir.path(),
     );
     let output = String::from_utf8_lossy(&git_output);
-    assert!(output.contains(&blob_id.to_string()), "verify-pack missing blob: {output}");
+    assert!(
+        output.contains(&blob_id.to_string()),
+        "verify-pack missing blob: {output}"
+    );
 }
 
 /// Verify git-rs commit tree matches `git commit-tree --stdin`.
@@ -217,15 +259,24 @@ fn commit_tree_matches_git() {
         .build();
     let commit_id = repo.write_commit(&commit).unwrap();
 
-    let git_output = git(
-        &["cat-file", "-p", &commit_id.to_string()],
-        dir.path(),
-    );
+    let git_output = git(&["cat-file", "-p", &commit_id.to_string()], dir.path());
     let git_body = String::from_utf8_lossy(&git_output);
-    assert!(git_body.starts_with("tree "), "commit missing tree header: {git_body}");
-    assert!(git_body.contains("author Test"), "commit missing author: {git_body}");
-    assert!(git_body.contains("committer Test"), "commit missing committer: {git_body}");
-    assert!(git_body.contains("\ninitial\n"), "commit missing message: {git_body}");
+    assert!(
+        git_body.starts_with("tree "),
+        "commit missing tree header: {git_body}"
+    );
+    assert!(
+        git_body.contains("author Test"),
+        "commit missing author: {git_body}"
+    );
+    assert!(
+        git_body.contains("committer Test"),
+        "commit missing committer: {git_body}"
+    );
+    assert!(
+        git_body.contains("\ninitial\n"),
+        "commit missing message: {git_body}"
+    );
 }
 
 /// Verify git-rs describe output matches `git describe`.
@@ -243,7 +294,11 @@ fn describe_matches_git() {
 
     // First commit on main
     let first = repo
-        .write_commit(&CommitBuilder::new(tree_id, ident(), ident()).message(b"first\n".to_vec()).build())
+        .write_commit(
+            &CommitBuilder::new(tree_id, ident(), ident())
+                .message(b"first\n".to_vec())
+                .build(),
+        )
         .unwrap();
     repo.update_reference(
         &ReferenceName::branch("main").unwrap(),
@@ -257,7 +312,8 @@ fn describe_matches_git() {
         .unwrap()
         .message(b"release\n".to_vec())
         .build();
-    repo.create_annotated_tag("v1.0", &tag, false, 4096).unwrap();
+    repo.create_annotated_tag("v1.0", &tag, false, 4096)
+        .unwrap();
 
     // Second commit
     let second = repo
@@ -284,7 +340,10 @@ fn describe_matches_git() {
         describe_str.starts_with("v1.0"),
         "describe should start with tag: {describe_str}"
     );
-    assert_eq!(describe_str, git_desc, "describe mismatch: git-rs={describe_str} git={git_desc}");
+    assert_eq!(
+        describe_str, git_desc,
+        "describe mismatch: git-rs={describe_str} git={git_desc}"
+    );
 }
 
 /// Verify git-rs merge-base matches `git merge-base`.
@@ -294,22 +353,34 @@ fn merge_base_matches_git() {
     let repo = init_repo(dir.path(), true);
 
     let blob_id = repo.write_object(ObjectKind::Blob, b"base\n").unwrap();
-    let tree_id = repo.write_tree(
-        &Tree::new(vec![TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap()]).unwrap(),
-    )
-    .unwrap();
+    let tree_id = repo
+        .write_tree(
+            &Tree::new(vec![
+                TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
 
     // Root commit
     let root = repo
-        .write_commit(&CommitBuilder::new(tree_id, ident(), ident()).message(b"root\n".to_vec()).build())
+        .write_commit(
+            &CommitBuilder::new(tree_id, ident(), ident())
+                .message(b"root\n".to_vec())
+                .build(),
+        )
         .unwrap();
 
     // Left branch
     let left_blob = repo.write_object(ObjectKind::Blob, b"left\n").unwrap();
-    let left_tree = repo.write_tree(
-        &Tree::new(vec![TreeEntry::new(EntryMode::Blob, b"f".to_vec(), left_blob).unwrap()]).unwrap(),
-    )
-    .unwrap();
+    let left_tree = repo
+        .write_tree(
+            &Tree::new(vec![
+                TreeEntry::new(EntryMode::Blob, b"f".to_vec(), left_blob).unwrap(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
     let left = repo
         .write_commit(
             &CommitBuilder::new(left_tree, ident(), ident())
@@ -321,10 +392,14 @@ fn merge_base_matches_git() {
 
     // Right branch
     let right_blob = repo.write_object(ObjectKind::Blob, b"right\n").unwrap();
-    let right_tree = repo.write_tree(
-        &Tree::new(vec![TreeEntry::new(EntryMode::Blob, b"f".to_vec(), right_blob).unwrap()]).unwrap(),
-    )
-    .unwrap();
+    let right_tree = repo
+        .write_tree(
+            &Tree::new(vec![
+                TreeEntry::new(EntryMode::Blob, b"f".to_vec(), right_blob).unwrap(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
     let right = repo
         .write_commit(
             &CommitBuilder::new(right_tree, ident(), ident())
@@ -347,11 +422,16 @@ fn merge_base_matches_git() {
     )
     .unwrap();
 
-    let mb = repo.merge_bases(left, right, &GraphOptions::default()).unwrap();
+    let mb = repo
+        .merge_bases(left, right, &GraphOptions::default())
+        .unwrap();
     assert_eq!(mb.len(), 1, "expected exactly one merge base");
     assert_eq!(mb[0], root, "merge base should be root commit");
 
-    let git_output = git(&["merge-base", "refs/heads/left", "refs/heads/right"], dir.path());
+    let git_output = git(
+        &["merge-base", "refs/heads/left", "refs/heads/right"],
+        dir.path(),
+    );
     let git_base = String::from_utf8_lossy(&git_output).trim().to_owned();
     assert_eq!(root.to_string(), git_base, "merge-base mismatch");
 }
@@ -388,7 +468,9 @@ fn mktree_with_git() {
         "missing blob entry 'a': {lines:?}"
     );
     assert!(
-        lines.iter().any(|l| l.contains("tree") && l.ends_with("sub")),
+        lines
+            .iter()
+            .any(|l| l.contains("tree") && l.ends_with("sub")),
         "missing tree entry 'sub': {lines:?}"
     );
 }
@@ -434,7 +516,9 @@ fn diff_matches_git_format() {
     .unwrap();
 
     // Get the diff between the two trees
-    let diff_entries = repo.diff_trees(Some(first_tree), Some(second_tree), &DiffOptions::default()).unwrap();
+    let diff_entries = repo
+        .diff_trees(Some(first_tree), Some(second_tree), &DiffOptions::default())
+        .unwrap();
     let mut diff_output = Vec::new();
     for entry in &diff_entries {
         diff_output.extend(repo.render_patch(entry, &DiffOptions::default()).unwrap());
@@ -471,10 +555,14 @@ fn in_process_fetch_matches_git() {
     // Source: create a repository with one commit
     let source = init_repo(source_dir.path(), true);
     let blob_id = source.write_object(ObjectKind::Blob, b"shared\n").unwrap();
-    let tree_id = source.write_tree(
-        &Tree::new(vec![TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap()]).unwrap(),
-    )
-    .unwrap();
+    let tree_id = source
+        .write_tree(
+            &Tree::new(vec![
+                TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
     let commit_id = source
         .write_commit(
             &CommitBuilder::new(tree_id, ident(), ident())
@@ -497,7 +585,9 @@ fn in_process_fetch_matches_git() {
     target
         .fetch(&mut transport, &git_rs::FetchOptions::default())
         .unwrap();
-    let new_id = target.resolve_reference("refs/remotes/origin/main").unwrap();
+    let new_id = target
+        .resolve_reference("refs/remotes/origin/main")
+        .unwrap();
     assert_eq!(new_id, commit_id, "fetched commit should match source");
 
     // Verify git can see the fetched data in the target
@@ -506,7 +596,10 @@ fn in_process_fetch_matches_git() {
         target_dir.path(),
     );
     let body = String::from_utf8_lossy(&git_output);
-    assert!(body.contains("shared\n"), "fetched object not readable by git: {body}");
+    assert!(
+        body.contains("shared\n"),
+        "fetched object not readable by git: {body}"
+    );
 }
 
 /// Verify in-process receive-pack (push) sends objects that git can verify.
@@ -517,11 +610,17 @@ fn in_process_push_matches_git() {
 
     // Source: create a repo with one commit
     let source = init_repo(source_dir.path(), true);
-    let blob_id = source.write_object(ObjectKind::Blob, b"pushed content\n").unwrap();
-    let tree_id = source.write_tree(
-        &Tree::new(vec![TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap()]).unwrap(),
-    )
-    .unwrap();
+    let blob_id = source
+        .write_object(ObjectKind::Blob, b"pushed content\n")
+        .unwrap();
+    let tree_id = source
+        .write_tree(
+            &Tree::new(vec![
+                TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
     let commit_id = source
         .write_commit(
             &CommitBuilder::new(tree_id, ident(), ident())
@@ -532,20 +631,11 @@ fn in_process_push_matches_git() {
 
     // Destination: bare repo, receive push via in-process transport
     let dest = init_repo(dest_dir.path(), true);
-    let mut transport = git_rs::InProcessReceivePackTransport::new(
-        &dest,
-        git_rs::ReceivePackOptions::default(),
-    );
-    let update = git_rs::PushUpdate::update(
-        ReferenceName::branch("main").unwrap(),
-        commit_id,
-    );
+    let mut transport =
+        git_rs::InProcessReceivePackTransport::new(&dest, git_rs::ReceivePackOptions::default());
+    let update = git_rs::PushUpdate::update(ReferenceName::branch("main").unwrap(), commit_id);
     let result = source
-        .push(
-            &mut transport,
-            &[update],
-            &git_rs::PushOptions::default(),
-        )
+        .push(&mut transport, &[update], &git_rs::PushOptions::default())
         .unwrap();
     assert!(
         result.statuses.iter().all(|s| s.error.is_none()),
@@ -554,12 +644,12 @@ fn in_process_push_matches_git() {
     );
 
     // Verify git can read the pushed data in the destination
-    let git_output = git(
-        &["cat-file", "-p", &commit_id.to_string()],
-        dest_dir.path(),
-    );
+    let git_output = git(&["cat-file", "-p", &commit_id.to_string()], dest_dir.path());
     let body = String::from_utf8_lossy(&git_output);
-    assert!(body.contains("pushed\n"), "pushed object not readable by git: {body}");
+    assert!(
+        body.contains("pushed\n"),
+        "pushed object not readable by git: {body}"
+    );
 
     // Verify git sees the ref in the destination
     let git_refs = git(&["show-ref"], dest_dir.path());
@@ -581,10 +671,14 @@ fn upload_pack_advertisement_matches_git() {
     let repo = init_repo(dir.path(), true);
 
     let blob_id = repo.write_object(ObjectKind::Blob, b"data\n").unwrap();
-    let tree_id = repo.write_tree(
-        &Tree::new(vec![TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap()]).unwrap(),
-    )
-    .unwrap();
+    let tree_id = repo
+        .write_tree(
+            &Tree::new(vec![
+                TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
     let commit_id = repo
         .write_commit(
             &CommitBuilder::new(tree_id, ident(), ident())
@@ -605,9 +699,11 @@ fn upload_pack_advertisement_matches_git() {
     // Verify the advertisement is a valid pkt-line stream
     let mut decoder = git_rs::PktLineDecoder::new();
     decoder.extend(&advertisement);
-    let packets: Vec<_> = std::iter::from_fn(|| decoder.next_packet().ok()?)
-        .collect();
-    assert!(!packets.is_empty(), "upload-pack advertisement should have packets");
+    let packets: Vec<_> = std::iter::from_fn(|| decoder.next_packet().ok()?).collect();
+    assert!(
+        !packets.is_empty(),
+        "upload-pack advertisement should have packets"
+    );
 
     // First packet should be a ref advertisement or capabilities
     let first = &packets[0];
@@ -639,10 +735,14 @@ fn upload_pack_v2_advertisement_matches_git() {
     let repo = init_repo(dir.path(), true);
 
     let blob_id = repo.write_object(ObjectKind::Blob, b"v2 data\n").unwrap();
-    let tree_id = repo.write_tree(
-        &Tree::new(vec![TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap()]).unwrap(),
-    )
-    .unwrap();
+    let tree_id = repo
+        .write_tree(
+            &Tree::new(vec![
+                TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
     let commit_id = repo
         .write_commit(
             &CommitBuilder::new(tree_id, ident(), ident())
@@ -659,13 +759,18 @@ fn upload_pack_v2_advertisement_matches_git() {
 
     // Generate v2 advertisement
     let advertisement = repo.advertise_upload_pack_v2().unwrap();
-    assert!(!advertisement.is_empty(), "v2 advertisement should not be empty");
+    assert!(
+        !advertisement.is_empty(),
+        "v2 advertisement should not be empty"
+    );
 
     let mut decoder = git_rs::PktLineDecoder::new();
     decoder.extend(&advertisement);
-    let packets: Vec<_> = std::iter::from_fn(|| decoder.next_packet().ok()?)
-        .collect();
-    assert!(!packets.is_empty(), "v2 should have at least a version packet");
+    let packets: Vec<_> = std::iter::from_fn(|| decoder.next_packet().ok()?).collect();
+    assert!(
+        !packets.is_empty(),
+        "v2 should have at least a version packet"
+    );
 
     // First packet should declare version 2
     let first = &packets[0];
@@ -695,11 +800,17 @@ fn branch_operations_matches_git() {
     let repo = init_repo(dir.path(), true);
 
     // Create a commit
-    let blob_id = repo.write_object(ObjectKind::Blob, b"branch test\n").unwrap();
-    let tree_id = repo.write_tree(
-        &Tree::new(vec![TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap()]).unwrap(),
-    )
-    .unwrap();
+    let blob_id = repo
+        .write_object(ObjectKind::Blob, b"branch test\n")
+        .unwrap();
+    let tree_id = repo
+        .write_tree(
+            &Tree::new(vec![
+                TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
     let commit_id = repo
         .write_commit(
             &CommitBuilder::new(tree_id, ident(), ident())
@@ -721,7 +832,10 @@ fn branch_operations_matches_git() {
     let git_branches = git(&["branch", "--list"], dir.path());
     let branches = String::from_utf8_lossy(&git_branches);
     assert!(branches.contains("main"), "missing main branch: {branches}");
-    assert!(branches.contains("feature"), "missing feature branch: {branches}");
+    assert!(
+        branches.contains("feature"),
+        "missing feature branch: {branches}"
+    );
 
     // Rename branch via git-rs (rename_branch takes options + committer)
     repo.rename_branch(
@@ -735,15 +849,25 @@ fn branch_operations_matches_git() {
     // Verify git sees renamed branch
     let git_branches = git(&["branch", "--list"], dir.path());
     let branches = String::from_utf8_lossy(&git_branches);
-    assert!(!branches.contains("feature"), "feature should be gone after rename: {branches}");
-    assert!(branches.contains("renamed"), "renamed branch missing: {branches}");
+    assert!(
+        !branches.contains("feature"),
+        "feature should be gone after rename: {branches}"
+    );
+    assert!(
+        branches.contains("renamed"),
+        "renamed branch missing: {branches}"
+    );
 
     // Delete branch via git-rs
-    repo.delete_branch("renamed", &git_rs::DeleteBranchOptions::default()).unwrap();
+    repo.delete_branch("renamed", &git_rs::DeleteBranchOptions::default())
+        .unwrap();
 
     let git_branches = git(&["branch", "--list"], dir.path());
     let branches = String::from_utf8_lossy(&git_branches);
-    assert!(!branches.contains("renamed"), "renamed should be deleted: {branches}");
+    assert!(
+        !branches.contains("renamed"),
+        "renamed should be deleted: {branches}"
+    );
 }
 
 /// Verify git-rs worktree add and prune match `git worktree` behavior.
@@ -757,7 +881,7 @@ fn worktree_operations_matches_git() {
     let tree_id = repo
         .write_tree(
             &Tree::new(vec![
-                TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap()
+                TreeEntry::new(EntryMode::Blob, b"f".to_vec(), blob_id).unwrap(),
             ])
             .unwrap(),
         )
@@ -806,5 +930,5 @@ fn worktree_operations_matches_git() {
     assert!(
         gitdir_contents.contains(worktree_name),
         "gitdir file should reference worktree path: {gitdir_contents}"
-  );
+    );
 }

@@ -76,9 +76,9 @@ pub(crate) fn validate_path(path: &[u8]) -> Result<()> {
     if path.is_empty()
         || path[0] == b'/'
         || path.contains(&0)
-        || path.split(|byte| *byte == b'/').any(|part| {
-            part.is_empty() || part == b"." || part == b".." || is_ntfs_dotgit(part)
-        })
+        || path
+            .split(|byte| *byte == b'/')
+            .any(|part| part.is_empty() || part == b"." || part == b".." || is_ntfs_dotgit(part))
     {
         return Err(Error::InvalidRepository("unsafe repository path".into()));
     }

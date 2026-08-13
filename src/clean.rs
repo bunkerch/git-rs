@@ -180,27 +180,17 @@ impl Repository {
             }
             let selected = clean_selected(&path, context.requested);
             let ancestor = clean_selection_below(&path, context.requested);
-            let metadata = match self.filesystem().metadata(&context.root.join(&child_relative)) {
+            let metadata = match self
+                .filesystem()
+                .metadata(&context.root.join(&child_relative))
+            {
                 Ok(metadata) => metadata,
                 Err(Error::NotFound(_)) => continue,
                 Err(_) => {
                     // A special file (FIFO/socket) cannot be stat'd; treat it
                     // as a removable non-directory rather than aborting the
                     // traversal.
-                    if selected && !context.tracked.contains(&path) {
-                        let repository_ignored = ignores.is_ignored(&path, false);
-                        let manual = context.manual.is_ignored(&path, false);
-                        if clean_mode_matches(context.options.ignored, repository_ignored, manual) {
-                            output.push(CleanEntry {
-                                path,
-                                directory: false,
-                            });
-                        } else {
-                            preserved = true;
-                        }
-                    } else {
-                        preserved = true;
-                    }
+                    preserved |= collect_clean_file(&path, selected, ignores, context, output);
                     continue;
                 }
             };
@@ -249,23 +239,34 @@ impl Repository {
                 } else {
                     preserved = true;
                 }
-            } else if selected && !context.tracked.contains(&path) {
-                let repository_ignored = ignores.is_ignored(&path, false);
-                let manual = context.manual.is_ignored(&path, false);
-                if clean_mode_matches(context.options.ignored, repository_ignored, manual) {
-                    output.push(CleanEntry {
-                        path,
-                        directory: false,
-                    });
-                } else {
-                    preserved = true;
-                }
             } else {
-                preserved = true;
+                preserved |= collect_clean_file(&path, selected, ignores, context, output);
             }
         }
         Ok(preserved)
     }
+}
+
+fn collect_clean_file(
+    path: &[u8],
+    selected: bool,
+    ignores: &IgnoreMatcher,
+    context: &CleanContext<'_>,
+    output: &mut Vec<CleanEntry>,
+) -> bool {
+    if !selected || context.tracked.contains(path) {
+        return true;
+    }
+    let repository_ignored = ignores.is_ignored(path, false);
+    let manual = context.manual.is_ignored(path, false);
+    if !clean_mode_matches(context.options.ignored, repository_ignored, manual) {
+        return true;
+    }
+    output.push(CleanEntry {
+        path: path.to_vec(),
+        directory: false,
+    });
+    false
 }
 
 struct CleanContext<'a> {
@@ -328,11 +329,7 @@ fn clean_git_repository(repository: &Repository, entry: &Path) -> bool {
     clean_git_repository_depth(repository, entry, 16).unwrap_or(false)
 }
 
-fn clean_git_repository_depth(
-    repository: &Repository,
-    entry: &Path,
-    depth: u8,
-) -> Result<bool> {
+fn clean_git_repository_depth(repository: &Repository, entry: &Path, depth: u8) -> Result<bool> {
     if depth == 0 {
         return Ok(false);
     }
@@ -637,9 +634,7 @@ mod tests {
     }
 
     fn create_git_dir(filesystem: &MemoryFileSystem, git_dir: &Path) {
-        filesystem
-            .create_dir_all(&git_dir.join("objects"))
-            .unwrap();
+        filesystem.create_dir_all(&git_dir.join("objects")).unwrap();
         filesystem.create_dir_all(&git_dir.join("refs")).unwrap();
         filesystem
             .write(&git_dir.join("HEAD"), b"ref: refs/heads/main\n")
@@ -821,9 +816,7 @@ mod tests {
     #[test]
     fn nested_git_directory_survives_recursion_below_tracked_descendant() {
         let (repository, filesystem) = fixture();
-        filesystem
-            .create_dir_all(Path::new("repo/nested"))
-            .unwrap();
+        filesystem.create_dir_all(Path::new("repo/nested")).unwrap();
         filesystem
             .write(Path::new("repo/nested/tracked.txt"), b"tracked")
             .unwrap();
@@ -854,7 +847,11 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(!filesystem.exists(Path::new("repo/nested/victim.txt")).unwrap());
+        assert!(
+            !filesystem
+                .exists(Path::new("repo/nested/victim.txt"))
+                .unwrap()
+        );
         assert!(
             filesystem
                 .exists(Path::new("repo/nested/.git/HEAD"))
@@ -870,9 +867,7 @@ mod tests {
     #[test]
     fn nested_git_gitfile_survives_recursion_below_tracked_descendant() {
         let (repository, filesystem) = fixture();
-        filesystem
-            .create_dir_all(Path::new("repo/nested"))
-            .unwrap();
+        filesystem.create_dir_all(Path::new("repo/nested")).unwrap();
         filesystem
             .write(Path::new("repo/nested/tracked.txt"), b"tracked")
             .unwrap();
@@ -908,7 +903,11 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(!filesystem.exists(Path::new("repo/nested/victim.txt")).unwrap());
+        assert!(
+            !filesystem
+                .exists(Path::new("repo/nested/victim.txt"))
+                .unwrap()
+        );
         assert!(filesystem.exists(Path::new("repo/nested/.git")).unwrap());
         assert!(
             filesystem
@@ -934,7 +933,11 @@ mod tests {
             )
             .unwrap();
         assert!(!paths(&discovered).contains(&b"foo".to_vec()));
-        assert!(!paths(&discovered).iter().any(|path| path.starts_with(b"foo/")));
+        assert!(
+            !paths(&discovered)
+                .iter()
+                .any(|path| path.starts_with(b"foo/"))
+        );
         repository
             .clean::<&str>(
                 &[],
@@ -962,12 +965,11 @@ mod tests {
     #[test]
     fn untracked_subtree_preserves_nested_repository_gitfile_at_depth() {
         let (repository, filesystem) = fixture();
-        filesystem.create_dir_all(Path::new("repo/foo/bar")).unwrap();
         filesystem
-            .write(
-                Path::new("repo/foo/bar/.git"),
-                b"gitdir: ../bar-git\n",
-            )
+            .create_dir_all(Path::new("repo/foo/bar"))
+            .unwrap();
+        filesystem
+            .write(Path::new("repo/foo/bar/.git"), b"gitdir: ../bar-git\n")
             .unwrap();
         create_git_dir(&filesystem, Path::new("repo/foo/bar-git"));
         filesystem
@@ -1043,10 +1045,7 @@ mod tests {
     fn exact_git_name_is_skipped_but_git_prefixed_untracked_paths_are_cleaned() {
         let (repository, filesystem) = fixture();
         filesystem
-            .write(
-                Path::new("repo/tracked-dir/.gitignore"),
-                b"*.tmp\n",
-            )
+            .write(Path::new("repo/tracked-dir/.gitignore"), b"*.tmp\n")
             .unwrap();
         filesystem
             .write(Path::new("repo/tracked-dir/.gitmodules"), b"")
@@ -1055,10 +1054,7 @@ mod tests {
             .create_dir_all(Path::new("repo/tracked-dir/.gitmodules.d"))
             .unwrap();
         filesystem
-            .write(
-                Path::new("repo/tracked-dir/.gitmodules.d/keep"),
-                b"keep",
-            )
+            .write(Path::new("repo/tracked-dir/.gitmodules.d/keep"), b"keep")
             .unwrap();
         filesystem
             .write(
@@ -1094,7 +1090,11 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(!filesystem.exists(Path::new("repo/tracked-dir/.gitignore")).unwrap());
+        assert!(
+            !filesystem
+                .exists(Path::new("repo/tracked-dir/.gitignore"))
+                .unwrap()
+        );
         assert!(
             !filesystem
                 .exists(Path::new("repo/tracked-dir/.gitmodules"))
@@ -1105,7 +1105,11 @@ mod tests {
                 .exists(Path::new("repo/tracked-dir/.gitmodules.d"))
                 .unwrap()
         );
-        assert!(filesystem.exists(Path::new("repo/tracked-dir/.git")).unwrap());
+        assert!(
+            filesystem
+                .exists(Path::new("repo/tracked-dir/.git"))
+                .unwrap()
+        );
         assert!(
             filesystem
                 .exists(Path::new("repo/tracked-dir/file"))
@@ -1159,7 +1163,11 @@ mod tests {
                 .exists(Path::new("repo/tracked-dir/sub/victim.txt"))
                 .unwrap()
         );
-        assert!(!filesystem.exists(Path::new("repo/tracked-dir/other.txt")).unwrap());
+        assert!(
+            !filesystem
+                .exists(Path::new("repo/tracked-dir/other.txt"))
+                .unwrap()
+        );
         assert!(
             filesystem
                 .exists(Path::new("repo/tracked-dir/file"))
@@ -1197,7 +1205,11 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(!filesystem.exists(Path::new("repo/tracked-dir/sub")).unwrap());
+        assert!(
+            !filesystem
+                .exists(Path::new("repo/tracked-dir/sub"))
+                .unwrap()
+        );
         assert!(
             filesystem
                 .exists(Path::new("repo/tracked-dir/file"))
@@ -1221,7 +1233,11 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(!filesystem.exists(Path::new("repo/foo/bar/.git/HEAD")).unwrap());
+        assert!(
+            !filesystem
+                .exists(Path::new("repo/foo/bar/.git/HEAD"))
+                .unwrap()
+        );
         assert!(!filesystem.exists(Path::new("repo/foo/bar")).unwrap());
         assert!(!filesystem.exists(Path::new("repo/foo")).unwrap());
     }
@@ -1355,10 +1371,7 @@ mod tests {
         let (repository, filesystem) = fixture();
         filesystem.create_dir_all(Path::new("repo/foo")).unwrap();
         filesystem
-            .write(
-                Path::new("repo/foo/.git"),
-                b"gitdir: ../missing-gitdir\n",
-            )
+            .write(Path::new("repo/foo/.git"), b"gitdir: ../missing-gitdir\n")
             .unwrap();
         filesystem
             .write(Path::new("repo/foo/victim.txt"), b"victim")
@@ -1394,10 +1407,7 @@ mod tests {
             .create_dir_all(Path::new("repo/foo/.git"))
             .unwrap();
         filesystem
-            .write(
-                Path::new("repo/foo/.git/HEAD"),
-                b"ref: refs/heads/main\n",
-            )
+            .write(Path::new("repo/foo/.git/HEAD"), b"ref: refs/heads/main\n")
             .unwrap();
         filesystem
             .write(Path::new("repo/foo/victim.txt"), b"victim")
@@ -1498,9 +1508,12 @@ mod tests {
     #[test]
     fn host_untracked_subtree_preserves_absolute_symlink_git_repository() {
         let root = host_fixture_root();
-        let repository =
-            Repository::init(HostFileSystem::new(&root).unwrap(), "repo", &InitOptions::default())
-                .unwrap();
+        let repository = Repository::init(
+            HostFileSystem::new(&root).unwrap(),
+            "repo",
+            &InitOptions::default(),
+        )
+        .unwrap();
         std::fs::write(root.join("repo/base.txt"), b"base").unwrap();
         repository.add("base.txt").unwrap();
         let gitreal = root.join("outside-gitreal");
@@ -1530,9 +1543,12 @@ mod tests {
     #[test]
     fn host_untracked_subtree_preserves_absolute_gitdir_gitfile() {
         let root = host_fixture_root();
-        let repository =
-            Repository::init(HostFileSystem::new(&root).unwrap(), "repo", &InitOptions::default())
-                .unwrap();
+        let repository = Repository::init(
+            HostFileSystem::new(&root).unwrap(),
+            "repo",
+            &InitOptions::default(),
+        )
+        .unwrap();
         std::fs::write(root.join("repo/base.txt"), b"base").unwrap();
         repository.add("base.txt").unwrap();
         let gitreal = root.join("outside-gitreal");
@@ -1540,7 +1556,11 @@ mod tests {
         std::fs::create_dir_all(gitreal.join("refs")).unwrap();
         std::fs::write(gitreal.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
         std::fs::create_dir_all(root.join("repo/foo")).unwrap();
-        std::fs::write(root.join("repo/foo/.git"), b"gitdir: /abs/outside-gitreal\n").unwrap();
+        std::fs::write(
+            root.join("repo/foo/.git"),
+            b"gitdir: /abs/outside-gitreal\n",
+        )
+        .unwrap();
         std::fs::write(root.join("repo/foo/victim.txt"), b"victim").unwrap();
         repository
             .clean::<&str>(
@@ -1562,9 +1582,12 @@ mod tests {
     #[test]
     fn host_fifo_named_git_does_not_abort_clean() {
         let root = host_fixture_root();
-        let repository =
-            Repository::init(HostFileSystem::new(&root).unwrap(), "repo", &InitOptions::default())
-                .unwrap();
+        let repository = Repository::init(
+            HostFileSystem::new(&root).unwrap(),
+            "repo",
+            &InitOptions::default(),
+        )
+        .unwrap();
         std::fs::write(root.join("repo/base.txt"), b"base").unwrap();
         repository.add("base.txt").unwrap();
         std::fs::create_dir_all(root.join("repo/foo")).unwrap();
@@ -1656,10 +1679,7 @@ mod tests {
             .unwrap();
         create_git_dir(&filesystem, Path::new("repo/foo/gitreal"));
         filesystem
-            .create_symlink(
-                Path::new("repo/foo/link-to-gitdir/gitlink"),
-                b"../gitreal",
-            )
+            .create_symlink(Path::new("repo/foo/link-to-gitdir/gitlink"), b"../gitreal")
             .unwrap();
         filesystem
             .write(
@@ -1698,17 +1718,28 @@ mod tests {
     #[test]
     fn host_untracked_subtree_preserves_linked_worktree() {
         let root = host_fixture_root();
-        let repository =
-            Repository::init(HostFileSystem::new(&root).unwrap(), "repo", &InitOptions::default())
-                .unwrap();
+        let repository = Repository::init(
+            HostFileSystem::new(&root).unwrap(),
+            "repo",
+            &InitOptions::default(),
+        )
+        .unwrap();
         std::fs::write(root.join("repo/base.txt"), b"base").unwrap();
         repository.add("base.txt").unwrap();
         std::fs::create_dir_all(root.join("repo/foo/link-to-worktree")).unwrap();
         std::fs::create_dir_all(root.join("repo/foo/worktree-git")).unwrap();
         std::fs::create_dir_all(root.join("repo/foo/common-git/objects")).unwrap();
         std::fs::create_dir_all(root.join("repo/foo/common-git/refs")).unwrap();
-        std::fs::write(root.join("repo/foo/worktree-git/HEAD"), b"ref: refs/heads/main\n").unwrap();
-        std::fs::write(root.join("repo/foo/worktree-git/commondir"), b"../common-git\n").unwrap();
+        std::fs::write(
+            root.join("repo/foo/worktree-git/HEAD"),
+            b"ref: refs/heads/main\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("repo/foo/worktree-git/commondir"),
+            b"../common-git\n",
+        )
+        .unwrap();
         std::os::unix::fs::symlink(
             "../worktree-git",
             root.join("repo/foo/link-to-worktree/.git"),
@@ -1743,21 +1774,29 @@ mod tests {
     #[test]
     fn host_untracked_subtree_preserves_gitfile_to_symlinked_gitdir() {
         let root = host_fixture_root();
-        let repository =
-            Repository::init(HostFileSystem::new(&root).unwrap(), "repo", &InitOptions::default())
-                .unwrap();
+        let repository = Repository::init(
+            HostFileSystem::new(&root).unwrap(),
+            "repo",
+            &InitOptions::default(),
+        )
+        .unwrap();
         std::fs::write(root.join("repo/base.txt"), b"base").unwrap();
         repository.add("base.txt").unwrap();
         std::fs::create_dir_all(root.join("repo/foo/link-to-gitdir")).unwrap();
         std::fs::create_dir_all(root.join("repo/foo/gitreal/objects")).unwrap();
         std::fs::create_dir_all(root.join("repo/foo/gitreal/refs")).unwrap();
-        std::fs::write(root.join("repo/foo/gitreal/HEAD"), b"ref: refs/heads/main\n").unwrap();
-        std::os::unix::fs::symlink(
-            "../gitreal",
-            root.join("repo/foo/link-to-gitdir/gitlink"),
+        std::fs::write(
+            root.join("repo/foo/gitreal/HEAD"),
+            b"ref: refs/heads/main\n",
         )
         .unwrap();
-        std::fs::write(root.join("repo/foo/link-to-gitdir/.git"), b"gitdir: gitlink\n").unwrap();
+        std::os::unix::fs::symlink("../gitreal", root.join("repo/foo/link-to-gitdir/gitlink"))
+            .unwrap();
+        std::fs::write(
+            root.join("repo/foo/link-to-gitdir/.git"),
+            b"gitdir: gitlink\n",
+        )
+        .unwrap();
         std::fs::write(root.join("repo/foo/link-to-gitdir/victim.txt"), b"victim").unwrap();
         repository
             .clean::<&str>(
@@ -1781,9 +1820,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = host_fixture_root();
-        let repository =
-            Repository::init(HostFileSystem::new(&root).unwrap(), "repo", &InitOptions::default())
-                .unwrap();
+        let repository = Repository::init(
+            HostFileSystem::new(&root).unwrap(),
+            "repo",
+            &InitOptions::default(),
+        )
+        .unwrap();
         std::fs::write(root.join("repo/base.txt"), b"base").unwrap();
         repository.add("base.txt").unwrap();
         std::fs::create_dir_all(root.join("repo/foo")).unwrap();
@@ -1864,18 +1906,29 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = host_fixture_root();
-        let repository =
-            Repository::init(HostFileSystem::new(&root).unwrap(), "repo", &InitOptions::default())
-                .unwrap();
+        let repository = Repository::init(
+            HostFileSystem::new(&root).unwrap(),
+            "repo",
+            &InitOptions::default(),
+        )
+        .unwrap();
         std::fs::write(root.join("repo/base.txt"), b"base").unwrap();
         repository.add("base.txt").unwrap();
         std::fs::create_dir_all(root.join("repo/foo/link-to-worktree")).unwrap();
         std::fs::create_dir_all(root.join("repo/foo/worktree-git")).unwrap();
-        std::fs::write(root.join("repo/foo/worktree-git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            root.join("repo/foo/worktree-git/HEAD"),
+            b"ref: refs/heads/main\n",
+        )
+        .unwrap();
         let commondir = root.join("repo/foo/worktree-git/commondir");
         std::fs::write(&commondir, b"../common-git\n").unwrap();
         std::fs::set_permissions(&commondir, std::fs::Permissions::from_mode(0o000)).unwrap();
-        std::fs::write(root.join("repo/foo/link-to-worktree/.git"), b"gitdir: ../worktree-git\n").unwrap();
+        std::fs::write(
+            root.join("repo/foo/link-to-worktree/.git"),
+            b"gitdir: ../worktree-git\n",
+        )
+        .unwrap();
         std::fs::write(root.join("repo/foo/link-to-worktree/victim.txt"), b"victim").unwrap();
         repository
             .clean::<&str>(
@@ -1896,19 +1949,15 @@ mod tests {
     #[test]
     fn untracked_subtree_removes_gitfile_to_gitfile_chain() {
         let (repository, filesystem) = fixture();
-        filesystem.create_dir_all(Path::new("repo/foo/bar")).unwrap();
+        filesystem
+            .create_dir_all(Path::new("repo/foo/bar"))
+            .unwrap();
         create_git_dir(&filesystem, Path::new("repo/foo/gitreal"));
         filesystem
-            .write(
-                Path::new("repo/foo/bar/gitfile2"),
-                b"gitdir: ../gitreal\n",
-            )
+            .write(Path::new("repo/foo/bar/gitfile2"), b"gitdir: ../gitreal\n")
             .unwrap();
         filesystem
-            .write(
-                Path::new("repo/foo/bar/.git"),
-                b"gitdir: gitfile2\n",
-            )
+            .write(Path::new("repo/foo/bar/.git"), b"gitdir: gitfile2\n")
             .unwrap();
         filesystem
             .write(Path::new("repo/foo/bar/victim.txt"), b"victim")

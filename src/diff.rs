@@ -1302,8 +1302,8 @@ fn backtrack<'a>(
         } else {
             k - 1
         };
-        let previous_x = previous[usize::try_from(offset + previous_k)
-            .expect("offset covers backtrack diagonal")];
+        let previous_x = previous
+            [usize::try_from(offset + previous_k).expect("offset covers backtrack diagonal")];
         let previous_y = previous_x - previous_k;
         while x > previous_x && y > previous_y {
             x -= 1;

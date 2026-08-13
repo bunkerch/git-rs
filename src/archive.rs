@@ -1235,7 +1235,9 @@ mod tests {
     #[test]
     fn archive_rejects_dotdot_tree_entries() {
         let (repository, _commit) = fixture();
-        let blob = repository.write_object(ObjectKind::Blob, b"owned\n").unwrap();
+        let blob = repository
+            .write_object(ObjectKind::Blob, b"owned\n")
+            .unwrap();
         let empty = repository
             .write_tree(&crate::Tree::new(Vec::new()).unwrap())
             .unwrap();
@@ -1281,7 +1283,9 @@ mod tests {
     #[test]
     fn archive_rejects_single_dot_tree_entries() {
         let (repository, _commit) = fixture();
-        let blob = repository.write_object(ObjectKind::Blob, b"owned\n").unwrap();
+        let blob = repository
+            .write_object(ObjectKind::Blob, b"owned\n")
+            .unwrap();
         assert_rejected(
             &repository,
             &crate::Tree::new(vec![
@@ -1294,7 +1298,9 @@ mod tests {
     #[test]
     fn archive_fails_closed_when_paths_exclude_dotdot_entry() {
         let (repository, _commit) = fixture();
-        let blob = repository.write_object(ObjectKind::Blob, b"owned\n").unwrap();
+        let blob = repository
+            .write_object(ObjectKind::Blob, b"owned\n")
+            .unwrap();
         let tree = crate::Tree::new(vec![
             crate::TreeEntry::new(EntryMode::Blob, b"..".to_vec(), blob).unwrap(),
             crate::TreeEntry::new(EntryMode::Blob, b"ok".to_vec(), blob).unwrap(),
@@ -1317,7 +1323,9 @@ mod tests {
     #[test]
     fn archive_rejects_backslash_dotdot_tree_entries() {
         let (repository, _commit) = fixture();
-        let blob = repository.write_object(ObjectKind::Blob, b"owned\n").unwrap();
+        let blob = repository
+            .write_object(ObjectKind::Blob, b"owned\n")
+            .unwrap();
         let empty = repository
             .write_tree(&crate::Tree::new(Vec::new()).unwrap())
             .unwrap();
@@ -1449,13 +1457,18 @@ mod tests {
             if &archive[offset..offset + 4] != b"PK\x03\x04" {
                 break;
             }
-            let name_len =
-                usize::from(u16::from_le_bytes([archive[offset + 26], archive[offset + 27]]));
-            let extra_len =
-                usize::from(u16::from_le_bytes([archive[offset + 28], archive[offset + 29]]));
-            let data_len =
-                usize::try_from(u32::from_le_bytes(archive[offset + 18..offset + 22].try_into().unwrap()))
-                    .unwrap();
+            let name_len = usize::from(u16::from_le_bytes([
+                archive[offset + 26],
+                archive[offset + 27],
+            ]));
+            let extra_len = usize::from(u16::from_le_bytes([
+                archive[offset + 28],
+                archive[offset + 29],
+            ]));
+            let data_len = usize::try_from(u32::from_le_bytes(
+                archive[offset + 18..offset + 22].try_into().unwrap(),
+            ))
+            .unwrap();
             names.push(archive[offset + 30..offset + 30 + name_len].to_vec());
             offset += 30 + name_len + extra_len + data_len;
         }
@@ -1485,24 +1498,10 @@ mod tests {
             assert!(has_unsafe_path_component(path), "{path:?} should be unsafe");
         }
         let safe_paths: &[&[u8]] = &[
-            b"",
-            b"a",
-            b"a/b",
-            b"a/",
-            b"/",
-            b"a/b/",
-            b"..a",
-            b"a..",
-            b"...",
-            b"a\\b",
-            b"a\\",
-            b"\\",
+            b"", b"a", b"a/b", b"a/", b"/", b"a/b/", b"..a", b"a..", b"...", b"a\\b", b"a\\", b"\\",
         ];
         for path in safe_paths {
-            assert!(
-                !has_unsafe_path_component(path),
-                "{path:?} should be safe"
-            );
+            assert!(!has_unsafe_path_component(path), "{path:?} should be safe");
         }
     }
 

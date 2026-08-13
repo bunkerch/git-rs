@@ -1160,9 +1160,8 @@ fn parse_modules(data: &[u8], options: &SubmoduleOptions) -> Result<Vec<Submodul
 /// administration directory. Unlike git, which warns and skips suspicious
 /// entries, this library rejects the whole configuration.
 fn validate_relative_path(path: &[u8], what: &str) -> Result<()> {
-    crate::fs::path::validate_path(path).map_err(|_| {
-        Error::InvalidRepository(format!("unsafe submodule {what}"))
-    })
+    crate::fs::path::validate_path(path)
+        .map_err(|_| Error::InvalidRepository(format!("unsafe submodule {what}")))
 }
 fn subsection_value<'a>(config: &'a Config, subsection: &[u8], name: &str) -> Option<&'a [u8]> {
     config_value_in_subsection(config, "submodule", subsection, name)
@@ -1345,7 +1344,11 @@ mod tests {
             );
         }
         // Backslash separators reach the name after config unquoting (`\\` -> `\`).
-        for name in [b"foo\\\\..\\\\..".as_slice(), b"..\\\\pwned", b"a\\\\..\\\\b"] {
+        for name in [
+            b"foo\\\\..\\\\..".as_slice(),
+            b"..\\\\pwned",
+            b"a\\\\..\\\\b",
+        ] {
             let config = format!(
                 "[submodule \"{}\"]\n\tpath = deps\n\turl = x\n",
                 String::from_utf8_lossy(name)
@@ -1361,7 +1364,8 @@ mod tests {
         assert_eq!(modules.len(), 1);
         assert_eq!(modules[0].name(), b"deps/lib");
 
-        let unicode = b"[submodule \"deps/m\xC3\xBCnchen\"]\n\tpath = deps/m\xC3\xBCnchen\n\turl = x\n";
+        let unicode =
+            b"[submodule \"deps/m\xC3\xBCnchen\"]\n\tpath = deps/m\xC3\xBCnchen\n\turl = x\n";
         let modules = parse_modules(unicode, &SubmoduleOptions::default()).unwrap();
         assert_eq!(modules.len(), 1);
         assert_eq!(modules[0].name(), b"deps/m\xC3\xBCnchen");
@@ -1803,13 +1807,7 @@ mod tests {
             .write_index(
                 &Index::new(
                     IndexVersion::V2,
-                    vec![IndexEntry::new(
-                        "link/lib",
-                        0o160_000,
-                        tip,
-                        StatData::default(),
-                    )
-                    .unwrap()],
+                    vec![IndexEntry::new("link/lib", 0o160_000, tip, StatData::default()).unwrap()],
                 )
                 .unwrap(),
             )

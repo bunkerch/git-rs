@@ -500,9 +500,7 @@ impl Repository {
         let stem = bundle.stem();
         let pack_relative = Path::new("objects/pack").join(format!("{stem}.pack"));
         let index_relative = Path::new("objects/pack").join(format!("{stem}.idx"));
-        let keep_path = self.git_path(
-            Path::new("objects/pack").join(format!("{stem}.keep")),
-        );
+        let keep_path = self.git_path(Path::new("objects/pack").join(format!("{stem}.keep")));
         let owned_keep_path = match self.filesystem().write_new(&keep_path, b"") {
             Ok(()) => Some(keep_path),
             Err(Error::AlreadyExists(_)) => None,
@@ -653,12 +651,7 @@ impl Repository {
             let Some(entry) = index.find(id) else {
                 continue;
             };
-            return self.read_indexed_object_at(
-                &index_path,
-                id,
-                entry.offset,
-                max_size,
-            );
+            return self.read_indexed_object_at(&index_path, id, entry.offset, max_size);
         }
         Err(Error::NotFound(self.git_path(object_label(id))))
     }
@@ -1615,7 +1608,9 @@ fn be_u32(data: &[u8], offset: usize) -> Result<u32> {
         .get(offset..end)
         .ok_or_else(|| pack_error("truncated integer"))?;
     Ok(u32::from_be_bytes(
-        slice.try_into().map_err(|_| pack_error("invalid integer length"))?,
+        slice
+            .try_into()
+            .map_err(|_| pack_error("invalid integer length"))?,
     ))
 }
 fn be_u64(data: &[u8], offset: usize) -> Result<u64> {
@@ -1624,7 +1619,9 @@ fn be_u64(data: &[u8], offset: usize) -> Result<u64> {
         .get(offset..end)
         .ok_or_else(|| pack_error("truncated integer"))?;
     Ok(u64::from_be_bytes(
-        slice.try_into().map_err(|_| pack_error("invalid integer length"))?,
+        slice
+            .try_into()
+            .map_err(|_| pack_error("invalid integer length"))?,
     ))
 }
 fn read_hash(data: &[u8], offset: usize) -> Result<[u8; HASH_SIZE]> {
@@ -1887,24 +1884,16 @@ mod tests {
 
     #[test]
     fn quarantined_repository_reads_incoming_and_existing_objects_without_publication() {
-        let source = Repository::init(
-            MemoryFileSystem::new(),
-            "source",
-            &InitOptions::default(),
-        )
-        .unwrap();
-        let incoming = source
-            .write_object(ObjectKind::Blob, b"incoming")
-            .unwrap();
+        let source =
+            Repository::init(MemoryFileSystem::new(), "source", &InitOptions::default()).unwrap();
+        let incoming = source.write_object(ObjectKind::Blob, b"incoming").unwrap();
         let bundle = source
             .build_pack(&[incoming], &PackOptions::default())
             .unwrap();
 
         let target_fs = MemoryFileSystem::new();
         let target = Repository::init(target_fs, "target", &InitOptions::default()).unwrap();
-        let existing = target
-            .write_object(ObjectKind::Blob, b"existing")
-            .unwrap();
+        let existing = target.write_object(ObjectKind::Blob, b"existing").unwrap();
         let validated = target
             .validate_incoming_pack(bundle.pack(), &IncomingPackOptions::default())
             .unwrap();
@@ -1936,18 +1925,14 @@ mod tests {
             .validate_incoming_pack(bundle.pack(), &IncomingPackOptions::default())
             .unwrap();
 
-        let guard = repository
-            .publish_validated_pack_kept(&validated)
-            .unwrap();
+        let guard = repository.publish_validated_pack_kept(&validated).unwrap();
         let keep_path = guard.written().pack_path.with_extension("keep");
         assert!(fs.exists(&keep_path).unwrap());
         drop(guard);
         assert!(!fs.exists(&keep_path).unwrap());
 
         fs.write(&keep_path, b"external keeper").unwrap();
-        let guard = repository
-            .publish_validated_pack_kept(&validated)
-            .unwrap();
+        let guard = repository.publish_validated_pack_kept(&validated).unwrap();
         drop(guard);
         assert_eq!(fs.read(&keep_path).unwrap(), b"external keeper");
     }
@@ -2024,10 +2009,10 @@ mod tests {
     fn rejects_pack_with_bad_trailer_checksum() {
         let fs = MemoryFileSystem::new();
         let repository = Repository::init(fs.clone(), "repo", &InitOptions::default()).unwrap();
-        let id = repository
-            .write_object(ObjectKind::Blob, b"valid")
+        let id = repository.write_object(ObjectKind::Blob, b"valid").unwrap();
+        let source = repository
+            .build_pack(&[id], &PackOptions::default())
             .unwrap();
-        let source = repository.build_pack(&[id], &PackOptions::default()).unwrap();
         let mut corrupt = source.pack().to_vec();
         let len = corrupt.len();
         corrupt[len - 1] ^= 1;
@@ -2054,7 +2039,9 @@ mod tests {
         let id = repository
             .write_object(ObjectKind::Blob, b"truncated")
             .unwrap();
-        let source = repository.build_pack(&[id], &PackOptions::default()).unwrap();
+        let source = repository
+            .build_pack(&[id], &PackOptions::default())
+            .unwrap();
         let truncated = &source.pack()[..source.pack().len() - super::HASH_SIZE - 1];
         assert!(
             repository
@@ -2126,12 +2113,28 @@ mod tests {
 
     #[test]
     fn ofs_distance_encodes_and_decodes_large_offsets() {
-        for distance in [1, 127, 128, 16383, 16384, 1_000_000, 10_000_000, 1_000_000_000] {
+        for distance in [
+            1,
+            127,
+            128,
+            16383,
+            16384,
+            1_000_000,
+            10_000_000,
+            1_000_000_000,
+        ] {
             let encoded = super::encode_ofs_distance(distance);
             let mut cursor = 0;
             let decoded = super::parse_ofs_distance(&encoded, &mut cursor).unwrap();
-            assert_eq!(decoded, distance, "OFS_DELTA round-trip failed for {distance}");
-            assert_eq!(cursor, encoded.len(), "OFS_DELTA consumed all bytes for {distance}");
+            assert_eq!(
+                decoded, distance,
+                "OFS_DELTA round-trip failed for {distance}"
+            );
+            assert_eq!(
+                cursor,
+                encoded.len(),
+                "OFS_DELTA consumed all bytes for {distance}"
+            );
         }
     }
 

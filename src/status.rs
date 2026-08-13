@@ -115,9 +115,7 @@ impl Repository {
             let change = match (head.get(path), index_stage_zero.get(path)) {
                 (None, Some(_)) => Some(ChangeKind::Added),
                 (Some(_), None) => Some(ChangeKind::Deleted),
-                (Some((head_mode, _)), Some(index_entry))
-                    if *head_mode != index_entry.mode() =>
-                {
+                (Some((head_mode, _)), Some(index_entry)) if *head_mode != index_entry.mode() => {
                     Some(ChangeKind::TypeChanged)
                 }
                 (Some((_, head_id)), Some(index_entry)) if *head_id != index_entry.id() => {

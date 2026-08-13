@@ -2623,16 +2623,19 @@ mod tests {
             .unwrap();
 
         let outcome = repository
-            .expire_reflog_before(
-                name.as_str(),
-                150,
-                &ReflogRewriteOptions::default(),
-            )
+            .expire_reflog_before(name.as_str(), 150, &ReflogRewriteOptions::default())
             .unwrap();
-        assert_eq!(outcome.removed, 1, "expected 1 entry expired (timestamp=100 < 150)");
+        assert_eq!(
+            outcome.removed, 1,
+            "expected 1 entry expired (timestamp=100 < 150)"
+        );
         let entries = repository.read_reflog(name.as_str()).unwrap();
         assert_eq!(entries.len(), 1, "expected 1 entry remaining");
-        assert_eq!(entries[0].new_id(), second, "remaining entry should be the newer one");
+        assert_eq!(
+            entries[0].new_id(),
+            second,
+            "remaining entry should be the newer one"
+        );
     }
 
     #[test]

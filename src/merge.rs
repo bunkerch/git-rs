@@ -2020,9 +2020,16 @@ mod tests {
         checkout(&repository, base);
 
         // ours creates a file "path"
-        let ours = commit(&repository, &[base], &[(&b"path"[..], b"file content\n")], 2);
+        let ours = commit(
+            &repository,
+            &[base],
+            &[(&b"path"[..], b"file content\n")],
+            2,
+        );
         // theirs creates a directory with "path/file"
-        let theirs_blob = repository.write_object(ObjectKind::Blob, b"nested\n").unwrap();
+        let theirs_blob = repository
+            .write_object(ObjectKind::Blob, b"nested\n")
+            .unwrap();
         let sub_tree = repository
             .write_tree(
                 &Tree::new(vec![
@@ -2074,7 +2081,9 @@ mod tests {
         );
 
         // Create a commit that would be the merge target
-        let blob_id = repository.write_object(ObjectKind::Blob, b"first\n").unwrap();
+        let blob_id = repository
+            .write_object(ObjectKind::Blob, b"first\n")
+            .unwrap();
         let tree = repository
             .write_tree(
                 &Tree::new(vec![

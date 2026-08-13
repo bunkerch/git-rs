@@ -712,13 +712,15 @@ mod tests {
             .write_index(
                 &Index::new(
                     IndexVersion::V2,
-                    vec![IndexEntry::new(
-                        b"hooks/pre-commit".to_vec(),
-                        0o100_644,
-                        id,
-                        StatData::default(),
-                    )
-                    .unwrap()],
+                    vec![
+                        IndexEntry::new(
+                            b"hooks/pre-commit".to_vec(),
+                            0o100_644,
+                            id,
+                            StatData::default(),
+                        )
+                        .unwrap(),
+                    ],
                 )
                 .unwrap(),
             )
