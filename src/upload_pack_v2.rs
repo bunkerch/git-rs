@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use crate::{
-    Error, ObjectId, ObjectKind, PackOptions, PktLine, PktLineDecoder, ReferenceTarget, Repository,
-    Result, Sideband, UploadPackOptions,
+    Error, ObjectId, ObjectKind, PktLine, PktLineDecoder, ReferenceTarget, Repository, Result,
+    Sideband, UploadPackOptions,
 };
 
 /// Parser and response resource bounds for one protocol-v2 command.
@@ -71,6 +71,7 @@ pub struct FetchV2Request {
     haves: Vec<ObjectId>,
     done: bool,
     ofs_delta: bool,
+    thin_pack: bool,
     include_tag: bool,
     shallow: Vec<ObjectId>,
     depth: Option<usize>,
@@ -221,8 +222,14 @@ impl Repository {
                 ),
             };
             let peeled = if request.peel && reference.name().starts_with("refs/tags/") {
-                let peeled = self.peel_tag(id, limits.max_tag_depth, options.max_object_size)?;
-                (peeled.id != id).then_some(peeled.id)
+                let peeled = reference.peeled().map_or_else(
+                    || {
+                        self.peel_tag(id, limits.max_tag_depth, options.max_object_size)
+                            .map(|peeled| peeled.id)
+                    },
+                    Ok,
+                )?;
+                (peeled != id).then_some(peeled)
             } else {
                 None
             };
@@ -242,7 +249,7 @@ impl Repository {
             return protocol_error("fetch request has no wants");
         }
         for want in &request.wants {
-            self.read_object(*want, options.max_object_size)?;
+            self.read_object_for_upload(*want, options.max_object_size)?;
         }
         let mut shallow = request.shallow.iter().copied().collect::<BTreeSet<_>>();
         shallow.extend(self.shallow_commits(&crate::ShallowOptions {
@@ -261,7 +268,7 @@ impl Repository {
             let acknowledged = request
                 .haves
                 .iter()
-                .filter(|id| common.contains(id))
+                .filter(|id| common.valid_haves.contains(id))
                 .collect::<Vec<_>>();
             if acknowledged.is_empty() {
                 append_packet(&mut response, b"NAK\n")?;
@@ -299,13 +306,11 @@ impl Repository {
             }
         } else {
             (
-                self.reachable_objects_excluding(
+                self.select_upload_objects(
                     &request.wants,
-                    options.max_object_size,
-                    false,
-                    options.max_objects,
-                    &shallow,
                     &common,
+                    options.max_object_size,
+                    options.max_objects,
                 )?,
                 BTreeSet::new(),
                 BTreeSet::new(),
@@ -322,13 +327,21 @@ impl Repository {
         let pack_ids = wanted
             .iter()
             .copied()
-            .filter(|id| !common.contains(id))
+            .filter(|id| !common.commits.contains(id))
             .collect::<Vec<_>>();
-        let pack = self.build_pack(
+        let external_bases = if request.thin_pack {
+            self.upload_external_bases(&common, options.max_object_size, options.max_objects)?
+        } else {
+            std::collections::HashSet::new()
+        };
+        let pack = self.build_upload_pack(
             &pack_ids,
-            &PackOptions {
+            &crate::pack::UploadPackOptions {
                 max_object_size: options.max_object_size,
+                max_objects: options.max_objects,
                 use_deltas: options.use_deltas && request.ofs_delta,
+                use_ofs_delta: request.ofs_delta,
+                external_bases,
             },
         )?;
         let mut response = Vec::new();
@@ -343,7 +356,10 @@ impl Repository {
             response.extend(PktLine::Delimiter.encode()?);
         }
         append_packet(&mut response, b"packfile\n")?;
-        for chunk in pack.pack().chunks(crate::protocol::MAX_PACKET_DATA_LEN - 1) {
+        for chunk in pack
+            .bytes()
+            .chunks(crate::protocol::MAX_PACKET_DATA_LEN - 1)
+        {
             response.extend(Sideband::Data(chunk.to_vec()).encode()?);
         }
         response.extend(PktLine::Flush.encode()?);
@@ -368,15 +384,16 @@ impl Repository {
             if self.read_object(*tag_id, max_size)?.kind() == ObjectKind::Tag {
                 let peeled = self.peel_tag(*tag_id, max_tag_depth, max_size)?;
                 if reachable.contains(&peeled.id) {
-                    for id in
-                        self.reachable_objects_bounded(&[*tag_id], max_size, false, max_objects)?
-                    {
+                    let mut id = *tag_id;
+                    while id != peeled.id {
                         if !wanted.contains(&id) {
                             wanted.push(id);
                             if wanted.len() > max_objects {
                                 return protocol_error("fetch object count exceeds limit");
                             }
                         }
+                        id = crate::AnnotatedTag::parse(self.read_object(id, max_size)?.data())?
+                            .target();
                     }
                 }
             }
@@ -484,6 +501,7 @@ fn parse_fetch(arguments: &[PktLine]) -> Result<FetchV2Request> {
         haves: Vec::new(),
         done: false,
         ofs_delta: false,
+        thin_pack: false,
         include_tag: false,
         shallow: Vec::new(),
         depth: None,
@@ -515,7 +533,8 @@ fn parse_fetch(arguments: &[PktLine]) -> Result<FetchV2Request> {
                 b"done" => set_once(&mut request.done, "done")?,
                 b"ofs-delta" => set_once(&mut request.ofs_delta, "ofs-delta")?,
                 b"include-tag" => set_once(&mut request.include_tag, "include-tag")?,
-                b"thin-pack" | b"no-progress" => {}
+                b"thin-pack" => set_once(&mut request.thin_pack, "thin-pack")?,
+                b"no-progress" => {}
                 value => {
                     return protocol_error(format!(
                         "unsupported fetch argument `{}`",
@@ -816,6 +835,97 @@ mod tests {
         assert_eq!(sideband.first(), Some(&1));
         assert!(sideband[1..].starts_with(b"PACK"));
         assert_eq!(packets.last(), Some(&PktLine::Flush));
+    }
+
+    #[test]
+    fn fetch_pack_omits_unchanged_nested_tree_objects() {
+        let repository =
+            Repository::init(MemoryFileSystem::new(), "repo", &InitOptions::default()).unwrap();
+        let signature = Signature::new("V2", "v2@example.com", 1, 0).unwrap();
+        let stable_blob = repository
+            .write_object(ObjectKind::Blob, b"stable")
+            .unwrap();
+        let old_blob = repository.write_object(ObjectKind::Blob, b"old").unwrap();
+        let new_blob = repository.write_object(ObjectKind::Blob, b"new").unwrap();
+        let stable_tree = repository
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Blob, b"file".to_vec(), stable_blob).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let old_tree = repository
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Blob, b"file".to_vec(), old_blob).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let base_tree = repository
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Tree, b"stable".to_vec(), stable_tree).unwrap(),
+                    TreeEntry::new(EntryMode::Tree, b"work".to_vec(), old_tree).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let base = repository
+            .write_commit(
+                &CommitBuilder::new(base_tree, signature.clone(), signature.clone()).build(),
+            )
+            .unwrap();
+        let new_tree = repository
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Blob, b"file".to_vec(), new_blob).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let tip_tree = repository
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Tree, b"stable".to_vec(), stable_tree).unwrap(),
+                    TreeEntry::new(EntryMode::Tree, b"work".to_vec(), new_tree).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let tip = repository
+            .write_commit(
+                &CommitBuilder::new(tip_tree, signature.clone(), signature)
+                    .parent(base)
+                    .build(),
+            )
+            .unwrap();
+        let fetch = UploadPackV2Request::parse(
+            &command(
+                "fetch",
+                &[
+                    format!("want {tip}\n").into_bytes(),
+                    format!("have {base}\n").into_bytes(),
+                    b"done\n".to_vec(),
+                ],
+            ),
+            &UploadPackV2Limits::default(),
+        )
+        .unwrap();
+        let response = repository
+            .respond_upload_pack_v2(
+                &fetch,
+                &UploadPackOptions::default(),
+                &UploadPackV2Limits::default(),
+            )
+            .unwrap();
+        let packets = decode_request(&response).unwrap();
+        let PktLine::Data(sideband) = &packets[1] else {
+            panic!("expected sideband pack");
+        };
+
+        assert_eq!(u32::from_be_bytes(sideband[9..13].try_into().unwrap()), 4);
     }
 
     #[test]

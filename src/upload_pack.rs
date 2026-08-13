@@ -1,14 +1,14 @@
 //! Git protocol v0/v1 upload-pack advertisement and response generation.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::str::FromStr;
 
 use crate::{
-    Capability, EntryMode, Error, ObjectId, ObjectKind, PackOptions, PktLine, PktLineDecoder,
-    ReferenceTarget, Repository, Result, Sideband,
+    Capability, EntryMode, Error, ObjectId, ObjectKind, PktLine, PktLineDecoder, ReferenceTarget,
+    Repository, Result, Sideband,
 };
 
-const CAPABILITIES: &str = "side-band-64k ofs-delta no-progress shallow deepen-relative object-format=sha1 agent=git-rs/0.1";
+const CAPABILITIES: &str = "side-band-64k thin-pack ofs-delta no-progress shallow deepen-relative object-format=sha1 agent=git-rs/0.1";
 
 /// Limits and encoding choices for an upload-pack session.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -17,6 +17,13 @@ pub struct UploadPackOptions {
     pub max_objects: usize,
     pub max_tag_depth: usize,
     pub use_deltas: bool,
+}
+
+pub(crate) struct UploadPackCommon {
+    pub(crate) commits: HashSet<ObjectId>,
+    pub(crate) valid_haves: HashSet<ObjectId>,
+    trees: Vec<ObjectId>,
+    commit_trees: BTreeMap<ObjectId, ObjectId>,
 }
 
 impl Default for UploadPackOptions {
@@ -219,9 +226,15 @@ impl Repository {
             };
             advertised.push((reference.name().to_owned(), id));
             if reference.name().starts_with("refs/tags/") {
-                let peeled = self.peel_tag(id, 64, 1024 * 1024 * 1024)?;
-                if peeled.id != id {
-                    advertised.push((format!("{}^{{}}", reference.name()), peeled.id));
+                let peeled = reference.peeled().map_or_else(
+                    || {
+                        self.peel_tag(id, 64, 1024 * 1024 * 1024)
+                            .map(|peeled| peeled.id)
+                    },
+                    Ok,
+                )?;
+                if peeled != id {
+                    advertised.push((format!("{}^{{}}", reference.name()), peeled));
                 }
             }
         }
@@ -266,6 +279,7 @@ impl Repository {
     /// A negotiation round without `done` returns only ACK/NAK. Returns an
     /// error for a want outside the advertised refs, corrupt object graphs, or
     /// pack generation failures.
+    #[allow(clippy::too_many_lines)]
     pub fn respond_upload_pack(
         &self,
         request: &UploadPackRequest,
@@ -287,7 +301,11 @@ impl Repository {
             options.max_objects,
             &client_shallow,
         )?;
-        let acknowledged = request.haves.iter().rev().find(|id| common.contains(id));
+        let acknowledged = request
+            .haves
+            .iter()
+            .rev()
+            .find(|id| common.valid_haves.contains(id));
         let mut response = Vec::new();
         let wanted = if let Some(depth) = request.depth {
             let (wanted, boundaries, unshallow) = if request.deepen_relative {
@@ -336,33 +354,42 @@ impl Repository {
         let wanted = if request.depth.is_some() {
             wanted
         } else {
-            self.reachable_objects_excluding(
+            self.select_upload_objects(
                 &request.wants,
-                options.max_object_size,
-                false,
-                options.max_objects,
-                &client_shallow,
                 &common,
+                options.max_object_size,
+                options.max_objects,
             )?
         };
         let pack_ids = wanted
             .into_iter()
-            .filter(|id| !common.contains(id))
+            .filter(|id| !common.commits.contains(id))
             .collect::<Vec<_>>();
-        let pack = self.build_pack(
+        let external_bases = if request.has_capability("thin-pack") {
+            self.upload_external_bases(&common, options.max_object_size, options.max_objects)?
+        } else {
+            HashSet::new()
+        };
+        let pack = self.build_upload_pack(
             &pack_ids,
-            &PackOptions {
+            &crate::pack::UploadPackOptions {
                 max_object_size: options.max_object_size,
+                max_objects: options.max_objects,
                 use_deltas: options.use_deltas && request.has_capability("ofs-delta"),
+                use_ofs_delta: request.has_capability("ofs-delta"),
+                external_bases,
             },
         )?;
         if request.has_capability("side-band-64k") {
-            for chunk in pack.pack().chunks(crate::protocol::MAX_PACKET_DATA_LEN - 1) {
+            for chunk in pack
+                .bytes()
+                .chunks(crate::protocol::MAX_PACKET_DATA_LEN - 1)
+            {
                 response.extend(Sideband::Data(chunk.to_vec()).encode()?);
             }
             response.extend(PktLine::Flush.encode()?);
         } else {
-            response.extend_from_slice(pack.pack());
+            response.extend_from_slice(pack.bytes());
         }
         Ok(response)
     }
@@ -379,6 +406,35 @@ impl Repository {
             });
         }
         Ok(ids)
+    }
+
+    pub(crate) fn upload_external_bases(
+        &self,
+        common: &UploadPackCommon,
+        max_size: usize,
+        max_objects: usize,
+    ) -> Result<HashSet<ObjectId>> {
+        let mut known = common.commits.clone();
+        let mut trees = common.trees.clone();
+        while let Some(id) = trees.pop() {
+            if !known.insert(id) {
+                continue;
+            }
+            ensure_object_limit(known.len(), max_objects)?;
+            let object = self.read_object_for_upload(id, max_size)?;
+            if object.kind() != ObjectKind::Tree {
+                return Err(Error::InvalidTree(format!("object {id} is not a tree")));
+            }
+            for entry in crate::Tree::parse(object.data())?.entries() {
+                if entry.mode() == EntryMode::Tree {
+                    trees.push(entry.id());
+                } else if entry.mode() != EntryMode::Gitlink {
+                    known.insert(entry.id());
+                    ensure_object_limit(known.len(), max_objects)?;
+                }
+            }
+        }
+        Ok(known)
     }
 
     pub(crate) fn reachable_objects(
@@ -434,9 +490,25 @@ impl Repository {
         max_size: usize,
         max_objects: usize,
         shallow: &BTreeSet<ObjectId>,
-    ) -> Result<HashSet<ObjectId>> {
+    ) -> Result<UploadPackCommon> {
+        let has_replacements = self.has_active_replacements()?;
+        let graph = if has_replacements {
+            None
+        } else {
+            match self.read_commit_graph(max_size, max_objects) {
+                Ok(graph) => Some(graph),
+                Err(Error::NotFound(_)) => None,
+                Err(error) => return Err(error),
+            }
+        };
+        let roots = roots.iter().copied().collect::<HashSet<_>>();
         let mut seen = HashSet::new();
-        let mut stack = roots.to_vec();
+        let mut trees = Vec::new();
+        let mut commit_trees = BTreeMap::new();
+        let mut stack = roots.iter().copied().collect::<Vec<_>>();
+        let mut packed = (!has_replacements)
+            .then(|| self.trusted_packed_reader())
+            .transpose()?;
         while let Some(id) = stack.pop() {
             if !seen.insert(id) {
                 continue;
@@ -446,11 +518,48 @@ impl Repository {
                     "reachable commit traversal exceeds limit".into(),
                 ));
             }
-            match self.read_object(id, max_size) {
-                Ok(object) if object.kind() == ObjectKind::Commit => {
-                    if !shallow.contains(&id) {
-                        let (_, parents) = crate::commit::parse_commit_links(object.data())?;
-                        stack.extend(parents);
+            if !roots.contains(&id)
+                && let Some(entry) = graph.as_ref().and_then(|graph| graph.get(id))
+            {
+                commit_trees.insert(id, entry.tree());
+                if !shallow.contains(&id) {
+                    stack.extend(entry.parents());
+                }
+                continue;
+            }
+            let object = packed.as_mut().map_or_else(
+                || {
+                    self.read_object_for_upload(id, max_size)
+                        .map(|object| (object.kind(), object.into_data()))
+                },
+                |packed| {
+                    packed.read(id, max_size).or_else(|error| match error {
+                        Error::NotFound(_) => self
+                            .read_object_for_upload(id, max_size)
+                            .map(|object| (object.kind(), object.into_data())),
+                        error => Err(error),
+                    })
+                },
+            );
+            match object {
+                Ok((ObjectKind::Commit, data)) => {
+                    if let Some(entry) = graph.as_ref().and_then(|graph| graph.get(id)) {
+                        commit_trees.insert(id, entry.tree());
+                        if roots.contains(&id) {
+                            trees.push(entry.tree());
+                        }
+                        if !shallow.contains(&id) {
+                            stack.extend(entry.parents());
+                        }
+                    } else {
+                        let (tree, parents) = crate::commit::parse_commit_links(&data)?;
+                        commit_trees.insert(id, tree);
+                        if roots.contains(&id) {
+                            trees.push(tree);
+                        }
+                        if !shallow.contains(&id) {
+                            stack.extend(parents);
+                        }
                     }
                 }
                 Ok(_) => {}
@@ -460,7 +569,150 @@ impl Repository {
                 Err(error) => return Err(error),
             }
         }
-        Ok(seen)
+        let valid_haves = roots.into_iter().filter(|id| seen.contains(id)).collect();
+        Ok(UploadPackCommon {
+            commits: seen,
+            valid_haves,
+            trees,
+            commit_trees,
+        })
+    }
+
+    pub(crate) fn select_upload_objects(
+        &self,
+        roots: &[ObjectId],
+        common: &UploadPackCommon,
+        max_size: usize,
+        max_objects: usize,
+    ) -> Result<Vec<ObjectId>> {
+        let mut selected = HashSet::new();
+        let mut ordered = Vec::new();
+        let mut wanted_trees = Vec::new();
+        let mut boundary_trees = common.trees.clone();
+        let mut stack = roots.iter().rev().copied().collect::<Vec<_>>();
+        while let Some(id) = stack.pop() {
+            if common.commits.contains(&id) {
+                if let Some(tree) = common.commit_trees.get(&id) {
+                    boundary_trees.push(*tree);
+                }
+                continue;
+            }
+            if selected.contains(&id) {
+                continue;
+            }
+            let object = self.read_object_for_upload(id, max_size)?;
+            match object.kind() {
+                ObjectKind::Commit => {
+                    insert_upload_object(id, &mut selected, &mut ordered, max_objects)?;
+                    let (tree, parents) = crate::commit::parse_commit_links(object.data())?;
+                    wanted_trees.push(tree);
+                    for parent in parents.iter().rev() {
+                        stack.push(*parent);
+                    }
+                }
+                ObjectKind::Tag => {
+                    insert_upload_object(id, &mut selected, &mut ordered, max_objects)?;
+                    stack.push(crate::AnnotatedTag::parse(object.data())?.target());
+                }
+                ObjectKind::Tree => wanted_trees.push(id),
+                ObjectKind::Blob => {
+                    insert_upload_object(id, &mut selected, &mut ordered, max_objects)?;
+                }
+            }
+        }
+
+        self.collect_changed_trees(
+            wanted_trees,
+            boundary_trees,
+            max_size,
+            max_objects,
+            &mut selected,
+            &mut ordered,
+        )?;
+        Ok(ordered)
+    }
+
+    fn collect_changed_trees(
+        &self,
+        wanted_roots: Vec<ObjectId>,
+        have_roots: Vec<ObjectId>,
+        max_size: usize,
+        max_objects: usize,
+        selected: &mut HashSet<ObjectId>,
+        ordered: &mut Vec<ObjectId>,
+    ) -> Result<()> {
+        let mut stack = vec![(wanted_roots, have_roots)];
+        while let Some((wanted_ids, have_ids)) = stack.pop() {
+            let have_ids = have_ids.into_iter().collect::<HashSet<_>>();
+            let wanted_ids = wanted_ids
+                .into_iter()
+                .filter(|id| !have_ids.contains(id))
+                .collect::<BTreeSet<_>>();
+            if wanted_ids.is_empty() {
+                continue;
+            }
+
+            let mut entries = BTreeMap::<Vec<u8>, (Vec<_>, Vec<_>)>::new();
+            for id in wanted_ids {
+                if selected.insert(id) {
+                    ordered.push(id);
+                    ensure_object_limit(selected.len(), max_objects)?;
+                }
+                let object = self.read_object_for_upload(id, max_size)?;
+                if object.kind() != ObjectKind::Tree {
+                    return Err(Error::InvalidTree(format!("object {id} is not a tree")));
+                }
+                for entry in crate::Tree::parse(object.data())?.entries() {
+                    entries
+                        .entry(entry.name().to_vec())
+                        .or_default()
+                        .0
+                        .push(entry.clone());
+                }
+            }
+            for id in have_ids {
+                let object = self.read_object_for_upload(id, max_size)?;
+                if object.kind() != ObjectKind::Tree {
+                    return Err(Error::InvalidTree(format!("object {id} is not a tree")));
+                }
+                for entry in crate::Tree::parse(object.data())?.entries() {
+                    entries
+                        .entry(entry.name().to_vec())
+                        .or_default()
+                        .1
+                        .push(entry.clone());
+                }
+            }
+            let have_objects = entries
+                .values()
+                .flat_map(|(_, have)| have.iter().map(crate::TreeEntry::id))
+                .collect::<HashSet<_>>();
+
+            for (_, (wanted, have)) in entries.into_iter().rev() {
+                let wanted_subtrees = wanted
+                    .iter()
+                    .filter(|entry| entry.mode() == EntryMode::Tree)
+                    .map(crate::TreeEntry::id)
+                    .collect::<Vec<_>>();
+                if !wanted_subtrees.is_empty() {
+                    let have_subtrees = have
+                        .iter()
+                        .filter(|entry| entry.mode() == EntryMode::Tree)
+                        .map(crate::TreeEntry::id)
+                        .collect();
+                    stack.push((wanted_subtrees, have_subtrees));
+                }
+                for entry in wanted {
+                    if entry.mode() != EntryMode::Tree
+                        && entry.mode() != EntryMode::Gitlink
+                        && !have_objects.contains(&entry.id())
+                    {
+                        insert_upload_object(entry.id(), selected, ordered, max_objects)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn reachable_objects_excluding(
@@ -714,6 +966,19 @@ fn ensure_object_limit(count: usize, max_objects: usize) -> Result<()> {
     Ok(())
 }
 
+fn insert_upload_object(
+    id: ObjectId,
+    selected: &mut HashSet<ObjectId>,
+    ordered: &mut Vec<ObjectId>,
+    max_objects: usize,
+) -> Result<()> {
+    if selected.insert(id) {
+        ordered.push(id);
+        ensure_object_limit(selected.len(), max_objects)?;
+    }
+    Ok(())
+}
+
 fn parse_want(line: &[u8], first: bool) -> Result<(ObjectId, Vec<Capability>)> {
     let value = line
         .strip_prefix(b"want ")
@@ -745,9 +1010,8 @@ fn parse_exact_id(value: &[u8], command: &str) -> Result<ObjectId> {
 fn validate_capabilities(capabilities: &[Capability]) -> Result<()> {
     for capability in capabilities {
         let valid = match capability.name() {
-            "side-band-64k" | "ofs-delta" | "no-progress" | "shallow" | "deepen-relative" => {
-                capability.value().is_none()
-            }
+            "side-band-64k" | "thin-pack" | "ofs-delta" | "no-progress" | "shallow"
+            | "deepen-relative" => capability.value().is_none(),
             "object-format" => capability.value() == Some("sha1"),
             "agent" => capability.value().is_some(),
             _ => false,
@@ -773,12 +1037,14 @@ fn protocol_error<T>(message: impl Into<String>) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{UploadPackOptions, UploadPackRequest};
     use crate::object::sha1;
     use crate::{
-        CommitBuilder, EntryMode, InitOptions, MemoryFileSystem, ObjectKind, PktLine,
-        PktLineDecoder, PreviousValue, ReferenceName, Repository, Sideband, Signature, Tree,
-        TreeEntry,
+        CommitBuilder, CommitGraphOptions, EntryMode, InitOptions, MemoryFileSystem, ObjectId,
+        ObjectKind, PktLine, PktLineDecoder, PreviousValue, ReferenceName, Repository, Sideband,
+        Signature, Tree, TreeEntry,
     };
 
     #[test]
@@ -810,8 +1076,15 @@ mod tests {
         assert_eq!(parsed.wants(), &[id]);
         assert!(parsed.is_done());
 
-        let invalid = request_bytes(&[
+        let thin = request_bytes(&[
             PktLine::Data(format!("want {id} thin-pack\n").into_bytes()),
+            PktLine::Flush,
+            PktLine::Data(b"done\n".to_vec()),
+        ]);
+        assert!(UploadPackRequest::parse(&thin).is_ok());
+
+        let invalid = request_bytes(&[
+            PktLine::Data(format!("want {id} unsupported\n").into_bytes()),
             PktLine::Flush,
             PktLine::Data(b"done\n".to_vec()),
         ]);
@@ -904,6 +1177,231 @@ mod tests {
     }
 
     #[test]
+    fn commit_graph_reachability_uses_covered_parents_and_stops_at_shallows() {
+        let repository =
+            Repository::init(MemoryFileSystem::new(), "repo", &InitOptions::default()).unwrap();
+        let root = commit(&repository, &[], 1);
+        let middle = commit(&repository, &[root], 2);
+        let tip = commit(&repository, &[middle], 3);
+        repository
+            .write_commit_graph(&[tip], &CommitGraphOptions::default())
+            .unwrap();
+        remove_loose_object(&repository, middle);
+
+        let common = repository
+            .reachable_commits(&[tip], 4096, 10, &BTreeSet::default())
+            .unwrap();
+        assert_eq!(common.commits, [tip, middle, root].into_iter().collect());
+
+        let shallow = [middle].into_iter().collect();
+        let common = repository
+            .reachable_commits(&[tip], 4096, 10, &shallow)
+            .unwrap();
+        assert_eq!(common.commits, [tip, middle].into_iter().collect());
+    }
+
+    #[test]
+    fn commit_graph_reachability_ignores_replacements_for_uploads() {
+        let repository =
+            Repository::init(MemoryFileSystem::new(), "repo", &InitOptions::default()).unwrap();
+        let root = commit(&repository, &[], 1);
+        let tip = commit(&repository, &[root], 2);
+        repository
+            .write_commit_graph(&[tip], &CommitGraphOptions::default())
+            .unwrap();
+        remove_loose_object(&repository, tip);
+        assert!(
+            repository
+                .reachable_commits(&[tip], 4096, 10, &BTreeSet::default())
+                .unwrap()
+                .commits
+                .is_empty()
+        );
+
+        let replacement_repository = Repository::init(
+            MemoryFileSystem::new(),
+            "replacement",
+            &InitOptions::default(),
+        )
+        .unwrap();
+        let root = commit(&replacement_repository, &[], 1);
+        let tip = commit(&replacement_repository, &[root], 2);
+        replacement_repository
+            .write_commit_graph(&[tip], &CommitGraphOptions::default())
+            .unwrap();
+        let unrelated = commit(&replacement_repository, &[], 3);
+        replacement_repository
+            .create_replacement(tip, unrelated, false, 4096)
+            .unwrap();
+        let common = replacement_repository
+            .reachable_commits(&[tip], 4096, 10, &BTreeSet::default())
+            .unwrap();
+        assert_eq!(common.commits, [tip, root].into_iter().collect());
+    }
+
+    #[test]
+    fn tree_aware_selection_prunes_unchanged_trees_without_reading_blobs() {
+        let repository =
+            Repository::init(MemoryFileSystem::new(), "repo", &InitOptions::default()).unwrap();
+        let identity = Signature::new("A", "a@example.com", 1, 0).unwrap();
+        let unchanged_blob = repository
+            .write_object(ObjectKind::Blob, &[b'x'; 4096])
+            .unwrap();
+        let changed_blob = repository
+            .write_object(ObjectKind::Blob, b"changed")
+            .unwrap();
+        let unchanged_tree = repository
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Blob, b"large".to_vec(), unchanged_blob).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let old_changed_tree = repository
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Blob, b"file".to_vec(), unchanged_blob).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let base_tree = repository
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Tree, b"stable".to_vec(), unchanged_tree).unwrap(),
+                    TreeEntry::new(EntryMode::Tree, b"work".to_vec(), old_changed_tree).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let base_commit = repository
+            .write_commit(
+                &CommitBuilder::new(base_tree, identity.clone(), identity.clone())
+                    .message(b"base\n".to_vec())
+                    .build(),
+            )
+            .unwrap();
+        let changed_tree = repository
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Blob, b"file".to_vec(), changed_blob).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let tip_tree = repository
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Tree, b"stable".to_vec(), unchanged_tree).unwrap(),
+                    TreeEntry::new(EntryMode::Tree, b"work".to_vec(), changed_tree).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let tip_commit = repository
+            .write_commit(
+                &CommitBuilder::new(tip_tree, identity.clone(), identity)
+                    .parent(base_commit)
+                    .message(b"tip\n".to_vec())
+                    .build(),
+            )
+            .unwrap();
+
+        let common = repository
+            .reachable_commits(&[base_commit], 1024, 100, &BTreeSet::new())
+            .unwrap();
+        let selected = repository
+            .select_upload_objects(&[tip_commit], &common, 1024, 100)
+            .unwrap();
+
+        assert_eq!(
+            selected.into_iter().collect::<BTreeSet<_>>(),
+            [tip_commit, tip_tree, changed_tree, changed_blob]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn tree_aware_selection_conservatively_resends_cross_path_objects() {
+        let repository =
+            Repository::init(MemoryFileSystem::new(), "repo", &InitOptions::default()).unwrap();
+        let identity = Signature::new("A", "a@example.com", 1, 0).unwrap();
+        let reused_blob = repository
+            .write_object(ObjectKind::Blob, b"reused")
+            .unwrap();
+        let old_tree = repository
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Blob, b"old-name".to_vec(), reused_blob).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let old_commit = repository
+            .write_commit(&CommitBuilder::new(old_tree, identity.clone(), identity.clone()).build())
+            .unwrap();
+        let empty_tree = repository.write_object(ObjectKind::Tree, b"").unwrap();
+        let have = repository
+            .write_commit(
+                &CommitBuilder::new(empty_tree, identity.clone(), identity.clone())
+                    .parent(old_commit)
+                    .build(),
+            )
+            .unwrap();
+        let wanted_tree = repository
+            .write_tree(
+                &Tree::new(vec![
+                    TreeEntry::new(EntryMode::Blob, b"new-name".to_vec(), reused_blob).unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let want = repository
+            .write_commit(
+                &CommitBuilder::new(wanted_tree, identity.clone(), identity)
+                    .parent(have)
+                    .build(),
+            )
+            .unwrap();
+
+        let common = repository
+            .reachable_commits(&[have], 1024, 100, &BTreeSet::new())
+            .unwrap();
+        let selected = repository
+            .select_upload_objects(&[want], &common, 1024, 100)
+            .unwrap();
+
+        assert_eq!(
+            selected.into_iter().collect::<BTreeSet<_>>(),
+            [want, wanted_tree, reused_blob].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn tree_aware_selection_preserves_multiple_wants_and_haves() {
+        let repository =
+            Repository::init(MemoryFileSystem::new(), "repo", &InitOptions::default()).unwrap();
+        let have_one = commit(&repository, &[], 1);
+        let have_two = commit(&repository, &[], 2);
+        let want_one = commit(&repository, &[have_one], 3);
+        let want_two = commit(&repository, &[have_two], 4);
+
+        let common = repository
+            .reachable_commits(&[have_one, have_two], 1024, 100, &BTreeSet::new())
+            .unwrap();
+        let selected = repository
+            .select_upload_objects(&[want_one, want_two], &common, 1024, 100)
+            .unwrap();
+
+        assert_eq!(
+            selected.into_iter().collect::<BTreeSet<_>>(),
+            [want_one, want_two].into_iter().collect()
+        );
+    }
+
+    #[test]
     fn rejects_wants_that_are_not_advertised_tips() {
         let repository =
             Repository::init(MemoryFileSystem::new(), "repo", &InitOptions::default()).unwrap();
@@ -963,6 +1461,24 @@ mod tests {
             .respond_upload_pack(&final_request, &UploadPackOptions::default())
             .unwrap();
         assert!(response.starts_with(b"0008NAK\nPACK"));
+    }
+
+    fn commit(repository: &Repository, parents: &[ObjectId], timestamp: i64) -> ObjectId {
+        let tree = repository.write_object(ObjectKind::Tree, b"").unwrap();
+        let signature = Signature::new("A", "a@example.com", timestamp, 0).unwrap();
+        let mut builder = CommitBuilder::new(tree, signature.clone(), signature);
+        for parent in parents {
+            builder = builder.parent(*parent);
+        }
+        repository.write_commit(&builder.build()).unwrap()
+    }
+
+    fn remove_loose_object(repository: &Repository, id: ObjectId) {
+        let hex = id.to_string();
+        repository
+            .filesystem()
+            .remove_file(&repository.git_path(format!("objects/{}/{}", &hex[..2], &hex[2..])))
+            .unwrap();
     }
 
     fn request_bytes(packets: &[PktLine]) -> Vec<u8> {

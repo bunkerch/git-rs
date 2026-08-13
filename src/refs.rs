@@ -55,6 +55,7 @@ pub enum ReferenceTarget {
 pub struct Reference {
     name: String,
     target: ReferenceTarget,
+    peeled: Option<ObjectId>,
 }
 
 impl Reference {
@@ -66,6 +67,11 @@ impl Reference {
     #[must_use]
     pub const fn target(&self) -> &ReferenceTarget {
         &self.target
+    }
+
+    #[must_use]
+    pub const fn peeled(&self) -> Option<ObjectId> {
+        self.peeled
     }
 }
 
@@ -267,6 +273,7 @@ impl Repository {
         Ok(Reference {
             name: name.0,
             target: ReferenceTarget::Direct(target),
+            peeled: None,
         })
     }
 
@@ -1631,6 +1638,7 @@ impl Repository {
         Ok(Reference {
             name: name.to_owned(),
             target,
+            peeled: None,
         })
     }
 
@@ -1654,11 +1662,33 @@ impl Repository {
             Err(Error::NotFound(_)) => return Ok(BTreeMap::new()),
             Err(error) => return Err(error),
         };
-        let mut references = BTreeMap::new();
+        let mut references: BTreeMap<String, Reference> = BTreeMap::new();
+        let mut previous = None;
+        let mut previous_record = false;
         for line in contents.split(|byte| *byte == b'\n') {
-            if line.is_empty() || matches!(line[0], b'#' | b'^') {
+            if line.is_empty() || line[0] == b'#' {
+                previous = None;
+                previous_record = false;
                 continue;
             }
+            if let Some(hex) = line.strip_prefix(b"^") {
+                if !previous_record {
+                    return Err(Error::InvalidReference("orphan packed peeled line".into()));
+                }
+                if let Some(name) = previous.take() {
+                    let reference = references.get_mut(name).ok_or_else(|| {
+                        Error::InvalidReference("packed peeled ref is absent".into())
+                    })?;
+                    let hex = std::str::from_utf8(hex).map_err(|_| {
+                        Error::InvalidReference("non-UTF-8 packed peeled object ID".into())
+                    })?;
+                    reference.peeled = Some(ObjectId::from_str(hex)?);
+                }
+                previous_record = false;
+                continue;
+            }
+            previous = None;
+            previous_record = true;
             let Some(separator) = line.iter().position(|byte| *byte == b' ') else {
                 return Err(Error::InvalidReference(
                     "malformed packed-refs entry".into(),
@@ -1675,8 +1705,10 @@ impl Repository {
                     Reference {
                         name: packed_name.to_owned(),
                         target: ReferenceTarget::Direct(ObjectId::from_str(hex)?),
+                        peeled: None,
                     },
                 );
+                previous = Some(packed_name);
                 if references.len() > max_references {
                     return Err(Error::InvalidRepository(
                         "packed reference enumeration exceeds limit".into(),

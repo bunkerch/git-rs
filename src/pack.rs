@@ -20,6 +20,24 @@ pub struct PackOptions {
     pub use_deltas: bool,
 }
 
+pub(crate) struct UploadPackOptions {
+    pub max_object_size: usize,
+    pub max_objects: usize,
+    pub use_deltas: bool,
+    pub use_ofs_delta: bool,
+    pub external_bases: std::collections::HashSet<ObjectId>,
+}
+
+pub(crate) struct UploadPackData {
+    bytes: Vec<u8>,
+}
+
+impl UploadPackData {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 impl Default for PackOptions {
     fn default() -> Self {
         Self {
@@ -215,6 +233,135 @@ pub struct PackIndex {
     pack_checksum: [u8; HASH_SIZE],
 }
 
+#[derive(Clone)]
+struct ReusedEntry {
+    pack: Arc<Vec<u8>>,
+    stream: std::ops::Range<usize>,
+    declared: u64,
+    kind: ReusedKind,
+}
+
+#[derive(Clone, Copy)]
+enum ReusedKind {
+    Direct(ObjectKind),
+    Delta { base: ObjectId },
+}
+
+pub(crate) struct TrustedPackedReader {
+    packs: Vec<TrustedPack>,
+    delta_bases: std::collections::HashMap<ObjectId, (ObjectKind, Vec<u8>)>,
+    delta_base_bytes: usize,
+}
+
+struct TrustedPack {
+    index: Arc<PackIndex>,
+    data: Arc<Vec<u8>>,
+    ends: Vec<usize>,
+}
+
+impl TrustedPackedReader {
+    pub(crate) fn read(&mut self, id: ObjectId, max_size: usize) -> Result<(ObjectKind, Vec<u8>)> {
+        for pack_index in 0..self.packs.len() {
+            if let Ok(position) = self.packs[pack_index]
+                .index
+                .entries
+                .binary_search_by_key(&id, |entry| entry.id)
+            {
+                return self.resolve(pack_index, position, max_size, 0, false);
+            }
+        }
+        Err(Error::NotFound(PathBuf::from(format!("object {id}"))))
+    }
+
+    fn resolve(
+        &mut self,
+        pack_index: usize,
+        position: usize,
+        max_size: usize,
+        depth: usize,
+        cache: bool,
+    ) -> Result<(ObjectKind, Vec<u8>)> {
+        if depth >= MAX_DELTA_DEPTH {
+            return invalid("delta chain is too deep");
+        }
+        let id = self.packs[pack_index].index.entries[position].id;
+        if let Some((kind, data)) = self.delta_bases.get(&id) {
+            if data.len() > max_size {
+                return Err(Error::ObjectTooLarge {
+                    declared: data.len() as u64,
+                    limit: max_size,
+                });
+            }
+            return Ok((*kind, data.clone()));
+        }
+        let index = Arc::clone(&self.packs[pack_index].index);
+        let pack = Arc::clone(&self.packs[pack_index].data);
+        let entry = index.entries[position];
+        let start = usize::try_from(entry.offset).map_err(|_| pack_error("offset overflow"))?;
+        let end = self.packs[pack_index].ends[position];
+        let encoded = pack
+            .get(start..end)
+            .ok_or_else(|| pack_error("object bounds outside pack"))?;
+        let (object_type, declared, mut cursor) = parse_object_header(encoded)?;
+        let resolved = match object_type {
+            1..=4 => {
+                if declared > max_size as u64 {
+                    return Err(Error::ObjectTooLarge {
+                        declared,
+                        limit: max_size,
+                    });
+                }
+                let data = inflate(&encoded[cursor..], max_size)?;
+                if data.len() as u64 != declared {
+                    return invalid("inflated size differs from packed header");
+                }
+                (kind_from_type(object_type)?, data)
+            }
+            6 | 7 => {
+                let base = if object_type == 6 {
+                    let distance = parse_ofs_distance(encoded, &mut cursor)?;
+                    let base_offset = entry
+                        .offset
+                        .checked_sub(distance)
+                        .ok_or_else(|| pack_error("invalid OFS_DELTA base"))?;
+                    index
+                        .find_by_offset(base_offset)
+                        .ok_or_else(|| pack_error("OFS_DELTA base is absent"))?
+                        .id
+                } else {
+                    let end = checked_add(cursor, HASH_SIZE)?;
+                    let bytes = encoded
+                        .get(cursor..end)
+                        .ok_or_else(|| pack_error("truncated REF_DELTA"))?;
+                    cursor = end;
+                    ObjectId::from_bytes(
+                        bytes
+                            .try_into()
+                            .map_err(|_| pack_error("invalid REF_DELTA base length"))?,
+                    )
+                };
+                let base_position = index
+                    .entries
+                    .binary_search_by_key(&base, |entry| entry.id)
+                    .map_err(|_| pack_error("delta base is absent"))?;
+                let (kind, base) =
+                    self.resolve(pack_index, base_position, max_size, depth + 1, true)?;
+                let delta = inflate(&encoded[cursor..], max_size.saturating_mul(2).max(32))?;
+                if delta.len() as u64 != declared {
+                    return invalid("delta instruction size differs from packed header");
+                }
+                (kind, apply_delta(&base, &delta, max_size)?)
+            }
+            _ => return invalid("reserved packed object type"),
+        };
+        if cache && self.delta_base_bytes.saturating_add(resolved.1.len()) <= 96 * 1024 * 1024 {
+            self.delta_base_bytes += resolved.1.len();
+            self.delta_bases.insert(id, resolved.clone());
+        }
+        Ok(resolved)
+    }
+}
+
 impl PackIndex {
     /// Parse an index, validating its checksum, fanout, ordering, and offsets.
     ///
@@ -344,6 +491,29 @@ impl PackIndex {
 }
 
 impl Repository {
+    pub(crate) fn trusted_packed_reader(&self) -> Result<TrustedPackedReader> {
+        let mut packs = Vec::new();
+        for index_path in self.pack_index_paths()? {
+            let index = self.cached_pack_index(&index_path)?;
+            let pack = self.cached_pack_data_trusted(&index_path.with_extension("pack"))?;
+            let mut ends = vec![pack.len().saturating_sub(HASH_SIZE); index.entries.len()];
+            for pair in index.offset_order.windows(2) {
+                ends[pair[0]] = usize::try_from(index.entries[pair[1]].offset)
+                    .map_err(|_| pack_error("pack offset overflow"))?;
+            }
+            packs.push(TrustedPack {
+                index,
+                data: pack,
+                ends,
+            });
+        }
+        Ok(TrustedPackedReader {
+            packs,
+            delta_bases: std::collections::HashMap::new(),
+            delta_base_bytes: 0,
+        })
+    }
+
     /// Create an isolated repository view containing a validated incoming pack.
     ///
     /// Existing repository data remains visible, while the pack and every
@@ -460,6 +630,206 @@ impl Repository {
         build_pack(&objects, options)
     }
 
+    pub(crate) fn build_upload_pack(
+        &self,
+        ids: &[ObjectId],
+        options: &UploadPackOptions,
+    ) -> Result<UploadPackData> {
+        let mut unique = Vec::with_capacity(ids.len());
+        let mut selected = std::collections::HashSet::with_capacity(ids.len());
+        for id in ids {
+            if selected.insert(*id) {
+                unique.push(*id);
+            }
+        }
+        let mut packs = std::collections::BTreeMap::new();
+        let mut planned = std::collections::BTreeMap::new();
+        let mut position = 0;
+        while position < unique.len() {
+            let id = unique[position];
+            position += 1;
+            let mut representation =
+                self.reusable_packed_entry(id, options.max_object_size, &mut packs)?;
+            if let Some(ReusedEntry {
+                kind: ReusedKind::Delta { base },
+                ..
+            }) = representation.as_ref()
+            {
+                if options.use_deltas {
+                    if !options.external_bases.contains(base) && selected.insert(*base) {
+                        unique.push(*base);
+                    }
+                } else {
+                    representation = None;
+                }
+            }
+            planned.insert(id, representation);
+        }
+
+        if unique.len() > options.max_objects {
+            return Err(Error::InvalidObject(
+                "upload pack object count exceeds limit".into(),
+            ));
+        }
+        let count = u32::try_from(unique.len())
+            .map_err(|_| pack_error("pack contains more than u32::MAX objects"))?;
+        let mut output = Vec::new();
+        output.extend_from_slice(b"PACK");
+        output.extend_from_slice(&2_u32.to_be_bytes());
+        output.extend_from_slice(&count.to_be_bytes());
+        let mut states = std::collections::HashSet::new();
+        let mut offsets = std::collections::HashMap::new();
+        for id in unique {
+            self.write_upload_object(
+                id,
+                options,
+                &planned,
+                &mut states,
+                &mut offsets,
+                &mut output,
+            )?;
+        }
+        output.extend_from_slice(&sha1::digest(&output));
+        Ok(UploadPackData { bytes: output })
+    }
+
+    fn reusable_packed_entry(
+        &self,
+        id: ObjectId,
+        max_object_size: usize,
+        packs: &mut std::collections::BTreeMap<PathBuf, Arc<Vec<u8>>>,
+    ) -> Result<Option<ReusedEntry>> {
+        for index_path in self.pack_index_paths()? {
+            let index = self.cached_pack_index(&index_path)?;
+            let Some(entry) = index.find(id) else {
+                continue;
+            };
+            let pack_path = index_path.with_extension("pack");
+            let pack = if let Some(pack) = packs.get(&pack_path) {
+                Arc::clone(pack)
+            } else {
+                let pack = self.cached_pack_data_trusted(&pack_path)?;
+                if pack.len() < PACK_HEADER_SIZE + HASH_SIZE || &pack[..4] != b"PACK" {
+                    return invalid("invalid trusted pack header");
+                }
+                packs.insert(pack_path, Arc::clone(&pack));
+                pack
+            };
+            let start = usize::try_from(entry.offset).map_err(|_| pack_error("offset overflow"))?;
+            let end = index.object_end(entry.offset, pack.len().saturating_sub(HASH_SIZE))?;
+            let encoded = pack
+                .get(start..end)
+                .ok_or_else(|| pack_error("object bounds outside pack"))?;
+            let (object_type, declared, mut cursor) = parse_object_header(encoded)?;
+            let kind = match object_type {
+                1..=4 => {
+                    if declared > max_object_size as u64 {
+                        return Err(Error::ObjectTooLarge {
+                            declared,
+                            limit: max_object_size,
+                        });
+                    }
+                    ReusedKind::Direct(kind_from_type(object_type)?)
+                }
+                6 => {
+                    let distance = parse_ofs_distance(encoded, &mut cursor)?;
+                    let base_offset = entry
+                        .offset
+                        .checked_sub(distance)
+                        .ok_or_else(|| pack_error("invalid OFS_DELTA base"))?;
+                    let base = index
+                        .find_by_offset(base_offset)
+                        .ok_or_else(|| pack_error("OFS_DELTA base is absent"))?;
+                    validate_reused_delta_size(&encoded[cursor..], declared, max_object_size)?;
+                    ReusedKind::Delta { base: base.id }
+                }
+                7 => {
+                    let bytes = encoded
+                        .get(cursor..cursor + HASH_SIZE)
+                        .ok_or_else(|| pack_error("truncated REF_DELTA"))?;
+                    cursor += HASH_SIZE;
+                    validate_reused_delta_size(&encoded[cursor..], declared, max_object_size)?;
+                    ReusedKind::Delta {
+                        base: ObjectId::from_bytes(
+                            bytes
+                                .try_into()
+                                .map_err(|_| pack_error("invalid REF_DELTA base length"))?,
+                        ),
+                    }
+                }
+                _ => return invalid("reserved packed object type"),
+            };
+            return Ok(Some(ReusedEntry {
+                pack,
+                stream: start + cursor..end,
+                declared,
+                kind,
+            }));
+        }
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_upload_object(
+        &self,
+        id: ObjectId,
+        options: &UploadPackOptions,
+        planned: &std::collections::BTreeMap<ObjectId, Option<ReusedEntry>>,
+        states: &mut std::collections::HashSet<ObjectId>,
+        offsets: &mut std::collections::HashMap<ObjectId, u64>,
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
+        if offsets.contains_key(&id) {
+            return Ok(());
+        }
+        if !states.insert(id) {
+            return invalid("packed delta cycle");
+        }
+        let reused = planned.get(&id).and_then(Option::as_ref);
+        if let Some(ReusedEntry {
+            kind: ReusedKind::Delta { base },
+            ..
+        }) = reused
+            && planned.contains_key(base)
+        {
+            self.write_upload_object(*base, options, planned, states, offsets, output)?;
+        }
+        let offset = u64::try_from(output.len()).map_err(|_| pack_error("pack offset overflow"))?;
+        if let Some(entry) = reused {
+            match entry.kind {
+                ReusedKind::Direct(kind) => {
+                    output.extend(encode_object_header(kind_type(kind), entry.declared));
+                }
+                ReusedKind::Delta { base } => {
+                    if options.use_ofs_delta && offsets.contains_key(&base) {
+                        let base_offset = offsets
+                            .get(&base)
+                            .copied()
+                            .ok_or_else(|| pack_error("delta base was not written"))?;
+                        let distance = offset
+                            .checked_sub(base_offset)
+                            .ok_or_else(|| pack_error("delta base follows dependent"))?;
+                        output.extend(encode_object_header(6, entry.declared));
+                        output.extend(encode_ofs_distance(distance));
+                    } else {
+                        if !offsets.contains_key(&base) && !options.external_bases.contains(&base) {
+                            return Err(pack_error("delta base is not available to the client"));
+                        }
+                        output.extend(encode_object_header(7, entry.declared));
+                        output.extend_from_slice(base.as_bytes());
+                    }
+                }
+            }
+            output.extend_from_slice(&entry.pack[entry.stream.clone()]);
+        } else {
+            let object = self.read_object_for_upload(id, options.max_object_size)?;
+            output.extend(direct_entry(object.kind(), object.data()));
+        }
+        offsets.insert(id, offset);
+        states.remove(&id);
+        Ok(())
+    }
+
     /// Build and publish a pack under `objects/pack`.
     ///
     /// The pack is published before its index, so concurrent readers never
@@ -537,6 +907,7 @@ impl Repository {
             drop(guard);
             return Err(error);
         }
+        self.invalidate_pack_inventory();
         Ok(guard)
     }
 
@@ -564,6 +935,7 @@ impl Repository {
             )?;
         }
         self.publish_pack_file(&index_relative, bundle.index())?;
+        self.invalidate_pack_inventory();
         Ok(WrittenPack {
             pack_path: self.git_path(&pack_relative),
             index_path: self.git_path(&index_relative),
@@ -578,6 +950,7 @@ impl Repository {
         let index_relative = Path::new("objects/pack").join(format!("{stem}.idx"));
         self.publish_pack_file(&pack_relative, bundle.pack())?;
         self.publish_pack_file(&index_relative, bundle.index())?;
+        self.invalidate_pack_inventory();
         Ok(WrittenPack {
             pack_path: self.git_path(&pack_relative),
             index_path: self.git_path(&index_relative),
@@ -669,6 +1042,23 @@ impl Repository {
         Err(Error::NotFound(self.git_path(object_label(id))))
     }
 
+    pub(crate) fn read_packed_object_trusted(
+        &self,
+        id: ObjectId,
+        max_size: usize,
+    ) -> Result<Object> {
+        for index_path in self.pack_index_paths()? {
+            let index = self.cached_pack_index(&index_path)?;
+            if index.find(id).is_none() {
+                continue;
+            }
+            let pack = self.cached_pack_data_trusted(&index_path.with_extension("pack"))?;
+            let (kind, data) = resolve_trusted(&pack, &index, id, max_size, 0)?;
+            return Ok(Object::from_parts(kind, data));
+        }
+        Err(Error::NotFound(self.git_path(object_label(id))))
+    }
+
     fn read_indexed_object_at(
         &self,
         index_path: &Path,
@@ -737,6 +1127,28 @@ impl Repository {
             .clone())
     }
 
+    fn pack_index_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut cached = self
+            .pack_index_paths
+            .write()
+            .map_err(|_| pack_error("pack inventory cache lock poisoned"))?;
+        if let Some(paths) = cached.clone() {
+            return Ok(paths);
+        }
+        let directory = self.git_path("objects/pack");
+        let paths = match self.filesystem().read_dir(&directory) {
+            Ok(paths) => paths
+                .into_iter()
+                .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("idx"))
+                .map(|path| directory.join(path))
+                .collect(),
+            Err(Error::NotFound(_)) => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        *cached = Some(paths.clone());
+        Ok(paths)
+    }
+
     fn cached_pack_data(&self, path: &Path, index: &PackIndex) -> Result<Arc<Vec<u8>>> {
         if let Some(pack) = self
             .pack_data
@@ -751,6 +1163,30 @@ impl Repository {
         validate_pack(&bytes, index)?;
         let mut cache = self
             .pack_data
+            .write()
+            .map_err(|_| pack_error("pack data cache lock poisoned"))?;
+        Ok(cache
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::clone(&bytes))
+            .clone())
+    }
+
+    fn cached_pack_data_trusted(&self, path: &Path) -> Result<Arc<Vec<u8>>> {
+        if let Some(pack) = self
+            .trusted_pack_data
+            .read()
+            .map_err(|_| pack_error("pack data cache lock poisoned"))?
+            .get(path)
+            .cloned()
+        {
+            return Ok(pack);
+        }
+        let bytes = Arc::new(self.filesystem().read(path)?);
+        if bytes.len() < PACK_HEADER_SIZE + HASH_SIZE || &bytes[..4] != b"PACK" {
+            return invalid("invalid trusted pack header");
+        }
+        let mut cache = self
+            .trusted_pack_data
             .write()
             .map_err(|_| pack_error("pack data cache lock poisoned"))?;
         Ok(cache
@@ -1081,6 +1517,26 @@ fn inflate_one(input: &[u8], declared: usize) -> Result<(Vec<u8>, usize)> {
     Ok((output, result.bytes_consumed))
 }
 
+fn validate_reused_delta_size(
+    compressed: &[u8],
+    declared: u64,
+    max_object_size: usize,
+) -> Result<()> {
+    let declared = usize::try_from(declared)
+        .map_err(|_| pack_error("delta instruction size overflows usize"))?;
+    let (delta, _) = inflate_one(compressed, declared)?;
+    let mut cursor = 0;
+    let _ = delta_varint(&delta, &mut cursor)?;
+    let result_size = delta_varint(&delta, &mut cursor)?;
+    if result_size > max_object_size as u64 {
+        return Err(Error::ObjectTooLarge {
+            declared: result_size,
+            limit: max_object_size,
+        });
+    }
+    Ok(())
+}
+
 fn build_pack(objects: &[PackSource], options: &PackOptions) -> Result<PackBundle> {
     let object_count = u32::try_from(objects.len())
         .map_err(|_| pack_error("pack contains more than u32::MAX objects"))?;
@@ -1403,6 +1859,84 @@ fn resolve(
     }
 }
 
+fn resolve_trusted(
+    pack: &[u8],
+    index: &PackIndex,
+    id: ObjectId,
+    max_size: usize,
+    depth: usize,
+) -> Result<(ObjectKind, Vec<u8>)> {
+    if depth >= MAX_DELTA_DEPTH {
+        return invalid("delta chain is too deep");
+    }
+    let entry = index
+        .find(id)
+        .ok_or_else(|| pack_error("object absent from index"))?;
+    let start = usize::try_from(entry.offset).map_err(|_| pack_error("offset overflow"))?;
+    let end = index.object_end(entry.offset, pack.len().saturating_sub(HASH_SIZE))?;
+    let encoded = pack
+        .get(start..end)
+        .ok_or_else(|| pack_error("object bounds outside pack"))?;
+    let (object_type, declared, mut cursor) = parse_object_header(encoded)?;
+    match object_type {
+        1..=4 => {
+            if declared > max_size as u64 {
+                return Err(Error::ObjectTooLarge {
+                    declared,
+                    limit: max_size,
+                });
+            }
+            let data = inflate(&encoded[cursor..], max_size)?;
+            Ok((kind_from_type(object_type)?, data))
+        }
+        6 => {
+            let distance = parse_ofs_distance(encoded, &mut cursor)?;
+            let base_offset = entry
+                .offset
+                .checked_sub(distance)
+                .ok_or_else(|| pack_error("invalid OFS_DELTA base"))?;
+            let base = index
+                .find_by_offset(base_offset)
+                .ok_or_else(|| pack_error("OFS_DELTA base is absent"))?;
+            resolve_delta_trusted(
+                pack, index, base.id, encoded, cursor, declared, max_size, depth,
+            )
+        }
+        7 => {
+            let end = checked_add(cursor, HASH_SIZE)?;
+            let bytes = encoded
+                .get(cursor..end)
+                .ok_or_else(|| pack_error("truncated REF_DELTA"))?;
+            let base = ObjectId::from_bytes(
+                bytes
+                    .try_into()
+                    .map_err(|_| pack_error("invalid REF_DELTA base length"))?,
+            );
+            resolve_delta_trusted(pack, index, base, encoded, end, declared, max_size, depth)
+        }
+        _ => invalid("reserved packed object type"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_delta_trusted(
+    pack: &[u8],
+    index: &PackIndex,
+    base_id: ObjectId,
+    encoded: &[u8],
+    cursor: usize,
+    declared: u64,
+    max_size: usize,
+    depth: usize,
+) -> Result<(ObjectKind, Vec<u8>)> {
+    let (kind, base) = resolve_trusted(pack, index, base_id, max_size, depth + 1)?;
+    let delta = inflate(&encoded[cursor..], max_size.saturating_mul(2).max(32))?;
+    if delta.len() as u64 != declared {
+        return invalid("delta instruction size differs from packed header");
+    }
+    Ok((kind, apply_delta(&base, &delta, max_size)?))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_delta(
     pack: &[u8],
@@ -1668,7 +2202,7 @@ fn invalid<T>(message: &str) -> Result<T> {
 mod tests {
     use std::path::Path;
 
-    use super::{PackIndex, apply_delta, crc32};
+    use super::{PackIndex, apply_delta, crc32, validate_reused_delta_size};
     use crate::object::sha1;
     use crate::{
         Error, FileSystem, IncomingPackOptions, InitOptions, MemoryFileSystem, ObjectId,
@@ -1692,6 +2226,20 @@ mod tests {
     #[test]
     fn rejects_delta_writes_past_declared_result() {
         assert!(apply_delta(b"abc", &[3, 1, 2, b'x', b'y'], 10).is_err());
+    }
+
+    #[test]
+    fn reused_delta_enforces_reconstructed_size_limit() {
+        let delta = [1, 100, 1, b'x'];
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&delta, 6);
+        assert!(matches!(
+            validate_reused_delta_size(&compressed, delta.len() as u64, 99),
+            Err(Error::ObjectTooLarge {
+                declared: 100,
+                limit: 99
+            })
+        ));
+        validate_reused_delta_size(&compressed, delta.len() as u64, 100).unwrap();
     }
 
     #[test]
@@ -1761,6 +2309,15 @@ mod tests {
         let object = repository.read_object(target, 8192).unwrap();
         assert_eq!(object.kind(), ObjectKind::Blob);
         assert_eq!(object.data(), target_data);
+
+        let mut trusted = repository.trusted_packed_reader().unwrap();
+        let (kind, data) = trusted.read(target, 8192).unwrap();
+        assert_eq!(kind, ObjectKind::Blob);
+        assert_eq!(data, target_data);
+        assert!(matches!(
+            trusted.read(target, 1024),
+            Err(Error::ObjectTooLarge { .. })
+        ));
     }
 
     #[test]

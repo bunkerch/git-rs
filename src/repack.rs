@@ -441,6 +441,9 @@ impl Repository {
                 }
             }
         }
+        if removed != 0 {
+            self.invalidate_pack_inventory();
+        }
         Ok(removed)
     }
 

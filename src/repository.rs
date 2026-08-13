@@ -27,6 +27,8 @@ pub struct Repository {
     work_tree: Option<PathBuf>,
     pub(crate) pack_indexes: Arc<RwLock<BTreeMap<PathBuf, Arc<crate::PackIndex>>>>,
     pub(crate) pack_data: Arc<RwLock<BTreeMap<PathBuf, Arc<Vec<u8>>>>>,
+    pub(crate) trusted_pack_data: Arc<RwLock<BTreeMap<PathBuf, Arc<Vec<u8>>>>>,
+    pub(crate) pack_index_paths: Arc<RwLock<Option<Vec<PathBuf>>>>,
     pub(crate) multi_pack_index: Arc<RwLock<Option<Arc<crate::MultiPackIndex>>>>,
     pub(crate) replacements: Arc<RwLock<Option<BTreeMap<crate::ObjectId, crate::ObjectId>>>>,
 }
@@ -45,6 +47,8 @@ impl Repository {
             work_tree: Some(work_tree),
             pack_indexes: Arc::new(RwLock::new(BTreeMap::new())),
             pack_data: Arc::new(RwLock::new(BTreeMap::new())),
+            trusted_pack_data: Arc::new(RwLock::new(BTreeMap::new())),
+            pack_index_paths: Arc::new(RwLock::new(None)),
             multi_pack_index: Arc::new(RwLock::new(None)),
             replacements: Arc::new(RwLock::new(None)),
         }
@@ -62,6 +66,8 @@ impl Repository {
             work_tree: self.work_tree.clone(),
             pack_indexes: Arc::new(RwLock::new(BTreeMap::new())),
             pack_data: Arc::new(RwLock::new(BTreeMap::new())),
+            trusted_pack_data: Arc::new(RwLock::new(BTreeMap::new())),
+            pack_index_paths: Arc::new(RwLock::new(None)),
             multi_pack_index: Arc::new(RwLock::new(None)),
             replacements: Arc::new(RwLock::new(None)),
         }
@@ -119,6 +125,8 @@ impl Repository {
             work_tree,
             pack_indexes: Arc::new(RwLock::new(BTreeMap::new())),
             pack_data: Arc::new(RwLock::new(BTreeMap::new())),
+            trusted_pack_data: Arc::new(RwLock::new(BTreeMap::new())),
+            pack_index_paths: Arc::new(RwLock::new(None)),
             multi_pack_index: Arc::new(RwLock::new(None)),
             replacements: Arc::new(RwLock::new(None)),
         };
@@ -174,6 +182,8 @@ impl Repository {
             work_tree,
             pack_indexes: Arc::new(RwLock::new(BTreeMap::new())),
             pack_data: Arc::new(RwLock::new(BTreeMap::new())),
+            trusted_pack_data: Arc::new(RwLock::new(BTreeMap::new())),
+            pack_index_paths: Arc::new(RwLock::new(None)),
             multi_pack_index: Arc::new(RwLock::new(None)),
             replacements: Arc::new(RwLock::new(None)),
         };
@@ -228,6 +238,12 @@ impl Repository {
             self.common_dir.join(path)
         } else {
             self.git_dir.join(path)
+        }
+    }
+
+    pub(crate) fn invalidate_pack_inventory(&self) {
+        if let Ok(mut paths) = self.pack_index_paths.write() {
+            *paths = None;
         }
     }
 

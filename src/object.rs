@@ -214,6 +214,28 @@ impl Repository {
         decode_object(encoded, max_size)
     }
 
+    pub(crate) fn read_object_for_upload(&self, id: ObjectId, max_size: usize) -> Result<Object> {
+        match self.read_packed_object_trusted(id, max_size) {
+            Ok(object) => return Ok(object),
+            Err(Error::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        let compressed = match self.filesystem().read(&self.git_path(object_path(id))) {
+            Ok(compressed) => compressed,
+            Err(Error::NotFound(_)) => {
+                return Err(Error::NotFound(self.git_path(object_path(id))));
+            }
+            Err(error) => return Err(error),
+        };
+        let framing = 6 + 1 + 20 + 1;
+        let encoded = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
+            &compressed,
+            max_size.saturating_add(framing),
+        )
+        .map_err(|error| Error::Compression(format!("{error:?}")))?;
+        decode_object(encoded, max_size)
+    }
+
     /// Test whether a loose object file exists.
     ///
     /// # Errors
