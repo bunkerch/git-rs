@@ -281,10 +281,9 @@ impl Repository {
             max_commits: options.max_objects,
             max_object_size: options.max_object_size,
         })?);
-        let common = self.reachable_objects_stopping_at(
+        let common = self.reachable_commits(
             &request.haves,
             options.max_object_size,
-            true,
             options.max_objects,
             &client_shallow,
         )?;
@@ -337,11 +336,13 @@ impl Repository {
         let wanted = if request.depth.is_some() {
             wanted
         } else {
-            self.reachable_objects_bounded(
+            self.reachable_objects_excluding(
                 &request.wants,
                 options.max_object_size,
                 false,
                 options.max_objects,
+                &client_shallow,
+                &common,
             )?
         };
         let pack_ids = wanted
@@ -417,11 +418,65 @@ impl Repository {
         max_objects: usize,
         shallow: &BTreeSet<ObjectId>,
     ) -> Result<Vec<ObjectId>> {
-        let mut seen = BTreeSet::new();
+        self.reachable_objects_excluding(
+            roots,
+            max_size,
+            ignore_missing_roots,
+            max_objects,
+            shallow,
+            &HashSet::new(),
+        )
+    }
+
+    pub(crate) fn reachable_commits(
+        &self,
+        roots: &[ObjectId],
+        max_size: usize,
+        max_objects: usize,
+        shallow: &BTreeSet<ObjectId>,
+    ) -> Result<HashSet<ObjectId>> {
+        let mut seen = HashSet::new();
+        let mut stack = roots.to_vec();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if seen.len() > max_objects {
+                return Err(Error::InvalidObject(
+                    "reachable commit traversal exceeds limit".into(),
+                ));
+            }
+            match self.read_object(id, max_size) {
+                Ok(object) if object.kind() == ObjectKind::Commit => {
+                    if !shallow.contains(&id) {
+                        let (_, parents) = crate::commit::parse_commit_links(object.data())?;
+                        stack.extend(parents);
+                    }
+                }
+                Ok(_) => {}
+                Err(Error::NotFound(_)) => {
+                    seen.remove(&id);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(seen)
+    }
+
+    pub(crate) fn reachable_objects_excluding(
+        &self,
+        roots: &[ObjectId],
+        max_size: usize,
+        ignore_missing_roots: bool,
+        max_objects: usize,
+        shallow: &BTreeSet<ObjectId>,
+        excluded: &HashSet<ObjectId>,
+    ) -> Result<Vec<ObjectId>> {
+        let mut seen = HashSet::new();
         let mut ordered = Vec::new();
         let mut stack = roots.iter().rev().copied().collect::<Vec<_>>();
         while let Some(id) = stack.pop() {
-            if seen.contains(&id) {
+            if excluded.contains(&id) || seen.contains(&id) {
                 continue;
             }
             let object = match self.read_object(id, max_size) {
@@ -438,13 +493,13 @@ impl Repository {
             ordered.push(id);
             match object.kind() {
                 ObjectKind::Commit => {
-                    let commit = crate::Commit::parse(object.data())?;
+                    let (tree, parents) = crate::commit::parse_commit_links(object.data())?;
                     if !shallow.contains(&id) {
-                        for parent in commit.parents().iter().rev() {
+                        for parent in parents.iter().rev() {
                             stack.push(*parent);
                         }
                     }
-                    stack.push(commit.tree());
+                    stack.push(tree);
                 }
                 ObjectKind::Tree => {
                     let tree = crate::Tree::parse(object.data())?;

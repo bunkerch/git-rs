@@ -259,6 +259,7 @@ impl Repository {
         };
 
         let mut statuses = Vec::with_capacity(request.commands.len());
+        let mut connected = HashSet::new();
         for command in &request.commands {
             let error = if checked_out.as_ref().is_some_and(|checked_out| {
                 matches_checked_out(checked_out, &command.name, ignore_case)
@@ -271,6 +272,7 @@ impl Repository {
                     command.new,
                     validated.as_ref(),
                     options.max_object_size,
+                    &mut connected,
                 )
             {
                 Some(format!("missing necessary objects: {error}"))
@@ -362,6 +364,7 @@ impl Repository {
         root: ObjectId,
         incoming: Option<&ValidatedPack>,
         max_size: usize,
+        connected: &mut HashSet<ObjectId>,
     ) -> Result<()> {
         let shallow = self.shallow_commits(&crate::ShallowOptions {
             max_commits: usize::MAX,
@@ -370,7 +373,7 @@ impl Repository {
         let mut seen = HashSet::new();
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
-            if !seen.insert(id) {
+            if connected.contains(&id) || !seen.insert(id) {
                 continue;
             }
             let owned;
@@ -382,10 +385,10 @@ impl Repository {
             };
             match kind {
                 ObjectKind::Commit => {
-                    let commit = crate::Commit::parse(data)?;
-                    stack.push(commit.tree());
+                    let (tree, parents) = crate::commit::parse_commit_links(data)?;
+                    stack.push(tree);
                     if !shallow.contains(&id) {
-                        stack.extend(commit.parents().iter().copied());
+                        stack.extend(parents);
                     }
                 }
                 ObjectKind::Tree => {
@@ -401,6 +404,7 @@ impl Repository {
                 ObjectKind::Blob => {}
             }
         }
+        connected.extend(seen);
         Ok(())
     }
 }

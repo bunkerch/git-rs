@@ -249,10 +249,9 @@ impl Repository {
             max_commits: options.max_objects,
             max_object_size: options.max_object_size,
         })?);
-        let common = self.reachable_objects_stopping_at(
+        let common = self.reachable_commits(
             &request.haves,
             options.max_object_size,
-            true,
             options.max_objects,
             &shallow,
         )?;
@@ -300,11 +299,13 @@ impl Repository {
             }
         } else {
             (
-                self.reachable_objects_bounded(
+                self.reachable_objects_excluding(
                     &request.wants,
                     options.max_object_size,
                     false,
                     options.max_objects,
+                    &shallow,
+                    &common,
                 )?,
                 BTreeSet::new(),
                 BTreeSet::new(),

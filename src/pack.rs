@@ -211,7 +211,7 @@ pub struct PackIndexEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackIndex {
     entries: Vec<PackIndexEntry>,
-    offsets: Vec<u64>,
+    offset_order: Vec<usize>,
     pack_checksum: [u8; HASH_SIZE],
 }
 
@@ -288,14 +288,17 @@ impl PackIndex {
                 return invalid("fanout does not match object IDs");
             }
         }
-        let mut offsets = entries.iter().map(|entry| entry.offset).collect::<Vec<_>>();
-        offsets.sort_unstable();
-        if offsets.windows(2).any(|pair| pair[0] == pair[1]) {
+        let mut offset_order = (0..entries.len()).collect::<Vec<_>>();
+        offset_order.sort_unstable_by_key(|index| entries[*index].offset);
+        if offset_order
+            .windows(2)
+            .any(|pair| entries[pair[0]].offset == entries[pair[1]].offset)
+        {
             return invalid("multiple objects have the same pack offset");
         }
         Ok(Self {
             entries,
-            offsets,
+            offset_order,
             pack_checksum: read_hash(data, trailer_start)?,
         })
     }
@@ -320,13 +323,23 @@ impl PackIndex {
 
     fn object_end(&self, offset: u64, pack_end: usize) -> Result<usize> {
         let position = self
-            .offsets
-            .binary_search(&offset)
+            .offset_order
+            .binary_search_by_key(&offset, |index| self.entries[*index].offset)
             .map_err(|_| pack_error("object offset absent from index"))?;
-        self.offsets.get(position + 1).copied().map_or_else(
+        self.offset_order.get(position + 1).map_or_else(
             || Ok(pack_end),
-            |next| usize::try_from(next).map_err(|_| pack_error("pack offset overflow")),
+            |next| {
+                usize::try_from(self.entries[*next].offset)
+                    .map_err(|_| pack_error("pack offset overflow"))
+            },
         )
+    }
+
+    fn find_by_offset(&self, offset: u64) -> Option<PackIndexEntry> {
+        self.offset_order
+            .binary_search_by_key(&offset, |index| self.entries[*index].offset)
+            .ok()
+            .map(|position| self.entries[self.offset_order[position]])
     }
 }
 
@@ -773,10 +786,7 @@ fn delta_metadata(
                     .checked_sub(distance)
                     .ok_or_else(|| pack_error("invalid OFS_DELTA base"))?;
                 index
-                    .entries()
-                    .iter()
-                    .find(|candidate| candidate.offset == base_offset)
-                    .copied()
+                    .find_by_offset(base_offset)
                     .ok_or_else(|| pack_error("OFS_DELTA base is absent"))?
             }
             7 => {
@@ -1371,9 +1381,7 @@ fn resolve(
                 .and_then(|offset| offset.checked_sub(distance))
                 .ok_or_else(|| pack_error("invalid OFS_DELTA base"))?;
             let base = index
-                .entries
-                .iter()
-                .find(|candidate| candidate.offset == base_offset)
+                .find_by_offset(base_offset)
                 .ok_or_else(|| pack_error("OFS_DELTA base is absent"))?;
             resolve_delta(
                 pack, index, base.id, encoded, cursor, declared, max_size, depth,

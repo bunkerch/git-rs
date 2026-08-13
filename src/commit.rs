@@ -314,6 +314,28 @@ impl Commit {
     }
 }
 
+pub(crate) fn parse_commit_links(data: &[u8]) -> Result<(ObjectId, Vec<ObjectId>)> {
+    let headers = data
+        .split(|byte| *byte == b'\n')
+        .take_while(|line| !line.is_empty());
+    let mut tree = None;
+    let mut parents = Vec::new();
+    for line in headers {
+        if let Some(value) = line.strip_prefix(b"tree ") {
+            if tree.is_some() {
+                return Err(Error::InvalidCommit("duplicate tree header".into()));
+            }
+            tree = Some(parse_id(value, "tree")?);
+        } else if let Some(value) = line.strip_prefix(b"parent ") {
+            parents.push(parse_id(value, "parent")?);
+        }
+    }
+    Ok((
+        tree.ok_or_else(|| Error::InvalidCommit("missing tree header".into()))?,
+        parents,
+    ))
+}
+
 #[derive(Clone, Debug)]
 pub struct CommitBuilder {
     commit: Commit,
@@ -444,6 +466,22 @@ mod tests {
             Signature::parse(unknown.encode().as_bytes()).unwrap(),
             unknown
         );
+    }
+
+    #[test]
+    fn commit_links_do_not_require_utf8_identities() {
+        let tree = ObjectId::compute(ObjectKind::Tree, b"");
+        let parent = ObjectId::compute(ObjectKind::Commit, b"parent");
+        let data = format!("tree {tree}\nparent {parent}\nauthor ").into_bytes();
+        let data = [
+            data,
+            vec![0xff],
+            b" <a@example.com> 1 +0000\ncommitter A <a@example.com> 1 +0000\n\nmessage".to_vec(),
+        ]
+        .concat();
+
+        assert!(Commit::parse(&data).is_err());
+        assert_eq!(parse_commit_links(&data).unwrap(), (tree, vec![parent]));
     }
 
     #[test]
